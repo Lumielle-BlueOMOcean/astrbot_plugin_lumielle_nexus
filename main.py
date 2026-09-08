@@ -13,10 +13,16 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.star import Context, Star, StarTools
 
-from core import TaskManager
-from exporter import export_collection
-from qq_adapter import QQAdapter, QQAdapterError
-from storage import Storage
+if __package__:
+    from .core import TaskManager, collection_member_stats, format_local_time
+    from .exporter import export_collection
+    from .qq_adapter import QQAdapter, QQAdapterError
+    from .storage import Storage
+else:
+    from core import TaskManager, collection_member_stats, format_local_time
+    from exporter import export_collection
+    from qq_adapter import QQAdapter, QQAdapterError
+    from storage import Storage
 
 PLUGIN_NAME = "astrbot_plugin_lumielle_nexus"
 
@@ -170,7 +176,8 @@ class LumielleNexus(Star):
                 else:
                     await self._adapter(event).send_group_text(task["group_id"], notice)
             except QQAdapterError as exc:
-                return f"收集任务 {task['id']} 已创建，但群公告发送失败：{exc}"
+                await self.manager.fail_collection(task["id"], f"群启动通知发送失败：{exc}")
+                return f"创建统计失败：群启动通知发送失败：{exc}"
             return f"已开始收集：{task['id']}（{task['group_alias']}）。"
         except (KeyError, ValueError) as exc:
             return f"创建收集任务失败：{exc}"
@@ -185,7 +192,16 @@ class LumielleNexus(Star):
                 members = await self._adapter(event).get_group_member_list(task["group_id"])
             except QQAdapterError as exc:
                 member_error = str(exc)
-            submitted = status["submitted_count"]
+            if members is not None:
+                member_stats = collection_member_stats(
+                    members,
+                    status["entries"],
+                    self_id=str(event.get_self_id()),
+                )
+                submitted = len(member_stats["submitted_ids"])
+            else:
+                member_stats = None
+                submitted = status["submitted_count"]
             lines = [
                 f"{task['id']}：{self._payload(task).get('title', task['group_alias'])}",
                 f"状态：{task['status']}",
@@ -194,8 +210,8 @@ class LumielleNexus(Star):
             if members is not None:
                 lines.extend(
                     [
-                        f"群成员：{len(members)} 人",
-                        f"未提交：{max(0, len(members) - submitted)} 人",
+                        f"群成员：{len(member_stats['eligible_ids'])} 人",
+                        f"未提交：{len(member_stats['missing_ids'])} 人",
                     ],
                 )
             else:
@@ -225,6 +241,8 @@ class LumielleNexus(Star):
                     export_task,
                     snapshot["entries"],
                     members,
+                    self_id=str(event.get_self_id()),
+                    timezone_name=self.manager.timezone_name,
                 )
             except Exception as exc:
                 await self.manager.fail_collection(task["id"], f"Excel 导出失败：{exc}")
@@ -238,12 +256,19 @@ class LumielleNexus(Star):
             result = {
                 "export_path": str(output),
                 "submitted_count": len(snapshot["entries"]),
-                "member_count": len(members) if members is not None else None,
+                "member_count": (
+                    len(collection_member_stats(
+                        members,
+                        snapshot["entries"],
+                        self_id=str(event.get_self_id()),
+                    )["eligible_ids"])
+                    if members is not None else None
+                ),
                 "member_error": member_error or None,
                 "upload_error": upload_error or None,
             }
             await self.manager.complete_collection(task["id"], result)
-            summary = f"统计已结束：{task['id']}，提交 {len(snapshot['entries'])} 人。Excel 已保存：{output}"
+            summary = f"统计已结束：{task['id']}，提交 {len(snapshot['entries'])} 人。Excel 已生成：{output.name}"
             if upload_error:
                 summary += f"\n但 QQ 文件回传失败：{upload_error}"
             return summary
@@ -289,7 +314,7 @@ class LumielleNexus(Star):
             "/nexus bind <别名> <群号>\n"
             "/nexus groups\n"
             "/nexus tasks [群别名]\n"
-            "/nexus cancel <任务ID>\n"
+            "/nexus cancel <提醒任务ID>（仅限尚未执行的一次性提醒）\n"
             "/nexus collect-start 群别名|标题|字段1,字段2[,公告][,all]\n"
             "/nexus collect-status <任务ID>\n"
             "/nexus collect-stop <任务ID>\n"
@@ -379,7 +404,6 @@ class LumielleNexus(Star):
         )
         if result is None:
             return
-        event.stop_event()
         if self.collection_ack:
             missing = result["missing"]
             text = "已记录。" if not missing else f"已记录，目前还缺少：{'、'.join(missing)}"
@@ -431,7 +455,13 @@ class LumielleNexus(Star):
                 event.get_sender_id(),
                 event.unified_msg_origin,
             )
-            return f"已创建提醒任务 {task['id']}，计划时间：{task['run_at']}。"
+            local_run_at = format_local_time(
+                task["run_at"], self.manager.timezone_name, "minutes",
+            )
+            return (
+                f"已创建提醒任务 {task['id']}，计划时间：{local_run_at} "
+                f"（{self.manager.timezone_name}）。"
+            )
         except (KeyError, ValueError) as exc:
             return f"创建提醒失败：{exc}"
 
@@ -447,7 +477,7 @@ class LumielleNexus(Star):
 
     @filter.llm_tool(name="nexus_cancel_task")
     async def nexus_cancel_task(self, event: AstrMessageEvent, task_id: str) -> str:
-        """取消一个尚未执行的一次性提醒或仍在进行的收集任务。只能在私聊 operator 中调用。
+        """取消一个尚未执行的一次性提醒。信息收集必须使用 nexus_stop_collection 结束；只能在私聊 operator 中调用。
 
         Args:
             task_id(string): 要取消的任务 ID，例如 R-20260909-001。

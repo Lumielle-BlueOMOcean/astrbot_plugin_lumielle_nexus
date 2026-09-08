@@ -1,11 +1,13 @@
 import json
+import importlib.util
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-from core import TaskManager
+from core import TaskManager, collection_member_stats, format_local_time
 from exporter import export_collection
 from storage import Storage
 
@@ -123,6 +125,61 @@ class CoreSmokeTests(unittest.IsolatedAsyncioTestCase):
                 creator_private_origin="origin",
             )
 
+    async def test_single_field_collection_requires_structured_submission(self):
+        await self.manager.bind_group("班群", "123456789", "qq-main", "10001")
+        task = await self.manager.start_collection(
+            "班群", "是否参加", ["是否参加"], "", False,
+            "qq-main", "10001", "origin",
+        )
+
+        self.assertIsNone(
+            await self.manager.process_collection_message(
+                "qq-main", "123456789", "20001", "张三", "今天作业好多",
+            ),
+        )
+        self.assertEqual(self.storage.list_entries(task["id"]), [])
+
+        result = await self.manager.process_collection_message(
+            "qq-main", "123456789", "20001", "张三", "是否参加：是",
+        )
+        self.assertEqual(result["entry"]["parsed_data"], {"是否参加": "是"})
+
+    async def test_collection_announcement_failure_can_be_marked_failed_and_retried(self):
+        await self.manager.bind_group("班群", "123456789", "qq-main", "10001")
+        task = await self.manager.start_collection(
+            "班群", "启动公告失败", ["内容"], "", False,
+            "qq-main", "10001", "origin",
+        )
+        failed = await self.manager.fail_collection(task["id"], "群启动通知发送失败：网络错误")
+        self.assertEqual(failed["status"], "FAILED")
+        self.assertEqual(failed["last_error"], "群启动通知发送失败：网络错误")
+        self.assertIsNotNone(failed["finished_at"])
+
+        retry = await self.manager.start_collection(
+            "班群", "重新启动", ["内容"], "", False,
+            "qq-main", "10001", "origin",
+        )
+        self.assertEqual(retry["status"], "ACTIVE")
+
+    async def test_cancel_active_collection_is_rejected(self):
+        await self.manager.bind_group("班群", "123456789", "qq-main", "10001")
+        task = await self.manager.start_collection(
+            "班群", "不能取消", ["内容"], "", False,
+            "qq-main", "10001", "origin",
+        )
+        with self.assertRaisesRegex(ValueError, "不能通过 cancel 结束"):
+            await self.manager.cancel_task(task["id"], "qq-main")
+        self.assertEqual(self.storage.get_task(task["id"])["status"], "ACTIVE")
+
+    async def test_collection_status_rejects_reminder_task(self):
+        await self.manager.bind_group("班群", "123456789", "qq-main", "10001")
+        task = await self.manager.create_reminder(
+            "班群", datetime.now(timezone.utc) + timedelta(minutes=5), "提醒", False,
+            "qq-main", "10001", "origin",
+        )
+        with self.assertRaisesRegex(ValueError, "不是信息收集任务"):
+            await self.manager.collection_status(task["id"], "qq-main")
+
     async def test_collection_stop_transitions_and_summary(self):
         await self.manager.bind_group("班群", "123456789", "qq-main", "10001")
         task = await self.manager.start_collection(
@@ -136,7 +193,7 @@ class CoreSmokeTests(unittest.IsolatedAsyncioTestCase):
             creator_private_origin="origin",
         )
         result = await self.manager.process_collection_message(
-            "qq-main", "123456789", "20001", "李四", "已完成",
+            "qq-main", "123456789", "20001", "李四", "内容：已完成",
         )
         self.assertEqual(result["entry"]["parsed_data"], {"内容": "已完成"})
         snapshot = await self.manager.stop_collection(task["id"], "qq-main")
@@ -180,6 +237,108 @@ class CollectionExportTests(unittest.TestCase):
             self.assertEqual(workbook["统计结果"].cell(1, 1).value, "QQ")
             self.assertIn("无法获取完整群成员名单", workbook["未提交成员"].cell(1, 1).value)
 
+    def test_export_filters_bots_and_uses_configured_timezone(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = {
+                "id": "C-20260909-002",
+                "group_alias": "班群",
+                "group_id": "123456789",
+                "creator_id": "10001",
+                "created_at": "2026-09-09T07:00:00+00:00",
+                "finished_at": "2026-09-09T08:00:00+00:00",
+                "payload": json.dumps({"title": "时区统计", "fields": ["内容"]}),
+            }
+            entries = [
+                {
+                    "sender_id": "20001",
+                    "sender_name": "张三",
+                    "raw_message": "内容：已提交",
+                    "parsed_data": json.dumps({"内容": "已提交"}),
+                    "submitted_at": "2026-09-09T07:30:00+00:00",
+                    "updated_at": "2026-09-09T07:31:00+00:00",
+                },
+            ]
+            members = [
+                {"user_id": "99999", "nickname": "机器人自身", "is_robot": False},
+                {"user_id": "88888", "nickname": "NapCat机器人", "is_robot": True},
+                {"user_id": "20001", "nickname": "张三"},
+                {"user_id": "20002", "nickname": "李四"},
+            ]
+            output = export_collection(
+                Path(temp_dir), task, entries, members,
+                self_id="99999", timezone_name="Asia/Shanghai",
+            )
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(output, read_only=True, data_only=False)
+            result_sheet = workbook["统计结果"]
+            self.assertEqual(result_sheet.cell(2, 4).value, "2026-09-09 15:30:00")
+            self.assertEqual(result_sheet.cell(2, 5).value, "2026-09-09 15:31:00")
+            missing_sheet = workbook["未提交成员"]
+            missing_rows = list(missing_sheet.iter_rows(min_row=2, values_only=True))
+            self.assertEqual(missing_rows, [("20002", "李四")])
+            info_sheet = workbook["任务信息"]
+            info_values = [row[1] for row in info_sheet.iter_rows(min_row=2, values_only=True)]
+            self.assertIn("2026-09-09 15:00:00", info_values)
+            self.assertIn("2026-09-09 16:00:00", info_values)
+
+    def test_export_keeps_formula_like_inputs_as_text(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = {
+                "id": "C-20260909-003",
+                "group_alias": "=1+1",
+                "group_id": "123456789",
+                "creator_id": "10001",
+                "created_at": "2026-09-09T07:00:00+00:00",
+                "payload": json.dumps({"title": "@SUM(1,1)", "fields": ["+1+1"]}),
+            }
+            entries = [
+                {
+                    "sender_id": "20001",
+                    "sender_name": "-1+1",
+                    "raw_message": "=1+1",
+                    "parsed_data": json.dumps({"+1+1": "@SUM(1,1)"}),
+                    "submitted_at": "2026-09-09T07:01:00+00:00",
+                    "updated_at": "2026-09-09T07:02:00+00:00",
+                },
+            ]
+            output = export_collection(Path(temp_dir), task, entries, members=None)
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(output, read_only=True, data_only=False)
+            values = [
+                workbook["统计结果"].cell(1, 3).value,
+                workbook["统计结果"].cell(2, 2).value,
+                workbook["统计结果"].cell(2, 3).value,
+                workbook["统计结果"].cell(2, 6).value,
+                workbook["任务信息"].cell(3, 2).value,
+            ]
+            for value in values:
+                self.assertIsInstance(value, str)
+                self.assertNotEqual(value[:1], "=")
+                self.assertNotEqual(value[:1], "+")
+                self.assertNotEqual(value[:1], "-")
+                self.assertNotEqual(value[:1], "@")
+
+    def test_member_stats_exclude_bot_and_robot(self):
+        members = [
+            {"user_id": "99999", "is_robot": False},
+            {"user_id": "88888", "is_robot": True},
+            {"user_id": "20001", "nickname": "张三"},
+            {"user_id": "20002", "nickname": "李四"},
+        ]
+        entries = [{"sender_id": "20001"}, {"sender_id": "77777"}]
+        stats = collection_member_stats(members, entries, self_id="99999")
+        self.assertEqual(stats["eligible_ids"], {"20001", "20002"})
+        self.assertEqual(stats["submitted_ids"], {"20001"})
+        self.assertEqual(stats["missing_ids"], {"20002"})
+
+    def test_export_time_formatter_converts_utc_to_configured_timezone(self):
+        self.assertEqual(
+            format_local_time("2026-09-09T07:00:00+00:00", "Asia/Shanghai", "minutes"),
+            "2026-09-09 15:00",
+        )
+
 
 class PluginContractTests(unittest.TestCase):
     ROOT = Path(__file__).resolve().parents[1]
@@ -214,6 +373,49 @@ class PluginContractTests(unittest.TestCase):
             self.assertIn(tool_name, main)
         self.assertIn("event_message_type", main)
         self.assertIn("command_group", main)
+        self.assertNotIn("event.stop_event()", main)
+        self.assertIn("尚未执行的一次性提醒", main)
+        self.assertIn("at-least-once", (self.ROOT / "README.md").read_text(encoding="utf-8"))
+
+    def test_package_style_core_import_uses_package_storage(self):
+        package_name = "data.plugins.astrbot_plugin_lumielle_nexus"
+        package_module = type(sys)(package_name)
+        package_module.__path__ = [str(self.ROOT)]
+        plugins_module = type(sys)("data.plugins")
+        plugins_module.__path__ = [str(self.ROOT.parent)]
+        data_module = type(sys)("data")
+        data_module.__path__ = [str(self.ROOT.parent)]
+        previous = {
+            name: sys.modules.get(name)
+            for name in ("data", "data.plugins", package_name, f"{package_name}.storage", f"{package_name}.core")
+        }
+        try:
+            sys.modules.update({
+                "data": data_module,
+                "data.plugins": plugins_module,
+                package_name: package_module,
+            })
+            for name in (f"{package_name}.storage", f"{package_name}.core"):
+                sys.modules.pop(name, None)
+            storage_spec = importlib.util.spec_from_file_location(
+                f"{package_name}.storage", self.ROOT / "storage.py",
+            )
+            storage_module = importlib.util.module_from_spec(storage_spec)
+            sys.modules[f"{package_name}.storage"] = storage_module
+            storage_spec.loader.exec_module(storage_module)
+            core_spec = importlib.util.spec_from_file_location(
+                f"{package_name}.core", self.ROOT / "core.py",
+            )
+            core_module = importlib.util.module_from_spec(core_spec)
+            sys.modules[f"{package_name}.core"] = core_module
+            core_spec.loader.exec_module(core_module)
+            self.assertIs(core_module.Storage, storage_module.Storage)
+        finally:
+            for name, module in previous.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
 
 
 class QQAdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -272,6 +474,32 @@ class QQAdapterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(QQAdapterError) as raised:
             await adapter.get_group_info("123")
         self.assertIn("OneBot 调用失败", str(raised.exception))
+
+    async def test_small_file_upload_uses_base64_uri(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def call_action(self, action, **kwargs):
+                self.calls.append((action, kwargs))
+                return {"status": "ok"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "result.xlsx"
+            path.write_bytes(b"small xlsx payload")
+            client = FakeClient()
+            platform = SimpleNamespace(
+                meta=lambda: SimpleNamespace(name="aiocqhttp", id="qq-main"),
+                get_client=lambda: client,
+            )
+            context = SimpleNamespace(get_platform_inst=lambda platform_id: platform)
+            from qq_adapter import QQAdapter
+
+            await QQAdapter(context, "qq-main").upload_private_file("10001", path)
+            action, kwargs = client.calls[0]
+            self.assertEqual(action, "upload_private_file")
+            self.assertTrue(kwargs["file"].startswith("base64://"))
+            self.assertNotIn(str(path), kwargs["file"])
 
 
 if __name__ == "__main__":

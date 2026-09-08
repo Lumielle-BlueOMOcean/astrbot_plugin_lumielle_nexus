@@ -5,11 +5,18 @@ from __future__ import annotations
 import json
 import re
 from copy import copy
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook
+
+if __package__:
+    from .core import collection_member_stats, format_local_time
+else:
+    from core import collection_member_stats, format_local_time
+
+_ILLEGAL_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 
 def _safe_filename(text: str, fallback: str) -> str:
@@ -17,16 +24,16 @@ def _safe_filename(text: str, fallback: str) -> str:
     return (cleaned or fallback)[:80]
 
 
-def _display_time(value: str | None) -> str:
-    if not value:
-        return ""
-    try:
-        parsed = datetime.fromisoformat(value)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    except ValueError:
-        return str(value)
+def _safe_cell_value(value: Any) -> str:
+    text = "" if value is None else str(value)
+    text = _ILLEGAL_CONTROL_RE.sub("", text)
+    if text.lstrip(" \t\r\n").startswith(_FORMULA_PREFIXES):
+        return "'" + text
+    return text
+
+
+def _safe_row(values: list[Any]) -> list[str]:
+    return [_safe_cell_value(value) for value in values]
 
 
 def export_collection(
@@ -34,6 +41,9 @@ def export_collection(
     task: dict[str, Any],
     entries: list[dict[str, Any]],
     members: list[dict[str, Any]] | None = None,
+    *,
+    self_id: str | None = None,
+    timezone_name: str = "UTC",
 ) -> Path:
     export_dir = Path(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -45,50 +55,46 @@ def export_collection(
     workbook = Workbook()
     result_sheet = workbook.active
     result_sheet.title = "统计结果"
-    result_sheet.append(
-        ["QQ", "群昵称", *fields, "提交时间", "最后更新时间", "原始提交"],
-    )
+    result_sheet.append(_safe_row(["QQ", "群昵称", *fields, "提交时间", "最后更新时间", "原始提交"]))
     for entry in entries:
         parsed = json.loads(entry.get("parsed_data") or "{}")
-        result_sheet.append(
-            [
+        result_sheet.append(_safe_row([
                 entry.get("sender_id", ""),
                 entry.get("sender_name", ""),
                 *[parsed.get(field, "") for field in fields],
-                _display_time(entry.get("submitted_at")),
-                _display_time(entry.get("updated_at")),
+                format_local_time(entry.get("submitted_at"), timezone_name),
+                format_local_time(entry.get("updated_at"), timezone_name),
                 entry.get("raw_message", ""),
-            ],
-        )
+            ]))
 
     missing_sheet = workbook.create_sheet("未提交成员")
     if members is None:
-        missing_sheet.append(["无法获取完整群成员名单，未提交人数不可准确计算。"])
+        missing_sheet.append(_safe_row(["无法获取完整群成员名单，未提交人数不可准确计算。"]))
     else:
-        missing_sheet.append(["QQ", "群昵称"])
-        submitted_ids = {str(entry.get("sender_id", "")) for entry in entries}
-        for member in members:
-            member_id = str(member.get("user_id", ""))
-            if member_id and member_id not in submitted_ids:
-                missing_sheet.append(
-                    [member_id, member.get("card") or member.get("nickname") or ""],
-                )
+        missing_sheet.append(_safe_row(["QQ", "群昵称"]))
+        stats = collection_member_stats(members, entries, self_id=self_id)
+        for member_id in sorted(stats["missing_ids"]):
+            member = stats["eligible_members"][member_id]
+            missing_sheet.append(_safe_row([
+                member_id,
+                member.get("card") or member.get("nickname") or "",
+            ]))
 
     info_sheet = workbook.create_sheet("任务信息")
-    info_sheet.append(["项目", "值"])
+    info_sheet.append(_safe_row(["项目", "值"]))
     info_rows = [
         ("任务 ID", task.get("id", "")),
         ("标题", title),
         ("群", task.get("group_alias") or task.get("group_id", "")),
         ("群号", task.get("group_id", "")),
         ("创建者", task.get("creator_id", "")),
-        ("开始时间", _display_time(task.get("created_at"))),
-        ("结束时间", _display_time(task.get("finished_at"))),
+        ("开始时间", format_local_time(task.get("created_at"), timezone_name)),
+        ("结束时间", format_local_time(task.get("finished_at"), timezone_name)),
         ("字段", "、".join(fields)),
         ("总提交人数", len(entries)),
     ]
     for row in info_rows:
-        info_sheet.append(list(row))
+        info_sheet.append(_safe_row(list(row)))
 
     for sheet in workbook.worksheets:
         sheet.freeze_panes = "A2"

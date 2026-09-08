@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 from typing import Any
+
+INLINE_FILE_MAX_BYTES = 4 * 1024 * 1024
 
 
 class QQAdapterError(RuntimeError):
@@ -104,9 +107,16 @@ class QQAdapter:
 
     async def upload_private_file(self, user_id: str, path: Path) -> Any:
         path = Path(path)
+        try:
+            if path.stat().st_size <= INLINE_FILE_MAX_BYTES:
+                file_value = f"base64://{base64.b64encode(path.read_bytes()).decode('ascii')}"
+            else:
+                file_value = str(path)
+        except OSError as exc:
+            raise QQAdapterError(f"读取待发送文件失败：{exc}") from exc
         return await self._call(
             "upload_private_file",
             user_id=self._qq_id(user_id),
-            file=str(path),
+            file=file_value,
             name=path.name,
         )

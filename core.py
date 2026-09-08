@@ -10,7 +10,10 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from storage import Storage
+if __package__:
+    from .storage import Storage
+else:
+    from storage import Storage
 
 UTC = timezone.utc
 
@@ -60,9 +63,58 @@ def parse_collection_submission(
         value = match.group(2).strip()
         if label in normalized and value:
             result[normalized[label]] = value
-    if not result and len(fields) == 1 and raw_message.strip():
-        result[fields[0]] = raw_message.strip()
     return result
+
+
+def format_local_time(
+    value: str | datetime | None,
+    timezone_name: str,
+    timespec: str = "seconds",
+) -> str:
+    """Render a stored UTC timestamp in the configured local timezone."""
+    if not value:
+        return ""
+    try:
+        local_zone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"无效时区：{timezone_name}") from exc
+    parsed = value if isinstance(value, datetime) else None
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except ValueError:
+            return str(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    format_string = "%Y-%m-%d %H:%M" if timespec == "minutes" else "%Y-%m-%d %H:%M:%S"
+    return parsed.astimezone(local_zone).strftime(format_string)
+
+
+def collection_member_stats(
+    members: list[dict[str, Any]],
+    entries: list[dict[str, Any]],
+    self_id: str | None = None,
+) -> dict[str, Any]:
+    """Return member/submission sets using one consistent eligibility rule."""
+    excluded_id = str(self_id or "").strip()
+    eligible_members: dict[str, dict[str, Any]] = {}
+    for member in members:
+        member_id = str(member.get("user_id", "")).strip()
+        if not member_id or member_id == excluded_id or member.get("is_robot") is True:
+            continue
+        eligible_members[member_id] = member
+    eligible_ids = set(eligible_members)
+    submitted_ids = {
+        str(entry.get("sender_id", "")).strip()
+        for entry in entries
+        if str(entry.get("sender_id", "")).strip() in eligible_ids
+    }
+    return {
+        "eligible_members": eligible_members,
+        "eligible_ids": eligible_ids,
+        "submitted_ids": submitted_ids,
+        "missing_ids": eligible_ids - submitted_ids,
+    }
 
 
 class TaskManager:
@@ -165,7 +217,12 @@ class TaskManager:
             task = self.storage.get_task(str(task_id).strip())
             if task is None or task["platform_id"] != platform_id:
                 raise KeyError(f"任务不存在：{task_id}")
-            if task["status"] not in {"PENDING", "ACTIVE"}:
+            if task["type"] == "COLLECTION" and task["status"] == "ACTIVE":
+                raise ValueError(
+                    "进行中的信息收集不能通过 cancel 结束。请使用 collect-stop / "
+                    "nexus_stop_collection，以便生成并保存统计结果。",
+                )
+            if task["type"] != "REMINDER" or task["status"] != "PENDING":
                 raise ValueError(f"任务当前不能取消：{task['status']}")
             return self.storage.cancel_task(task["id"], platform_id, utc_now_iso())
 
@@ -252,6 +309,8 @@ class TaskManager:
             task = self.storage.get_task(str(task_id).strip())
             if task is None or task["platform_id"] != platform_id:
                 raise KeyError(f"任务不存在：{task_id}")
+            if task["type"] != "COLLECTION":
+                raise ValueError(f"该任务不是信息收集任务：{task_id}")
             entries = self.storage.list_entries(task["id"])
             return {"task": task, "entries": entries, "submitted_count": len(entries)}
 
