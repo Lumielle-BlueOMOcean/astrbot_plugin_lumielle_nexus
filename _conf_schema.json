@@ -1,0 +1,31 @@
+{
+  "operator_ids": {
+    "type": "list",
+    "description": "允许通过私聊控制群枢的额外 QQ 用户 ID",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  },
+  "timezone": {
+    "type": "string",
+    "description": "任务时间解析使用的时区",
+    "default": "Asia/Shanghai"
+  },
+  "scheduler_interval_seconds": {
+    "type": "int",
+    "description": "提醒 scheduler 检查间隔（秒）",
+    "default": 15,
+    "hint": "运行时会限制在 5 到 3600 秒之间。"
+  },
+  "max_retry_count": {
+    "type": "int",
+    "description": "提醒发送失败后的最大重试次数",
+    "default": 3
+  },
+  "collection_ack": {
+    "type": "bool",
+    "description": "群成员提交后是否回复简短确认",
+    "default": true
+  }
+}

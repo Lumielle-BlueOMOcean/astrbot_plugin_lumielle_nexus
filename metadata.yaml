@@ -1,0 +1,9 @@
+name: astrbot_plugin_lumielle_nexus
+display_name: 微光·群枢 / Lumielle Nexus
+desc: 通过私聊创建和管理面向 QQ 群的一次性提醒与信息收集任务。
+version: "0.1.0"
+author: Lumielle-BlueOMOcean
+repo: https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_lumielle_nexus
+astrbot_version: ">=4.28.0,<5"
+support_platforms:
+  - aiocqhttp
