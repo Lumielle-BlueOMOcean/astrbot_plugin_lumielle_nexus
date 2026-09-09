@@ -26,6 +26,7 @@ SUMMARY_MAX_CHUNKS = 10
 SUMMARY_PRIVATE_CHUNK_CHARS = 3500
 RELAY_CONFIRM_TTL_SECONDS = 60 * 60
 MODERATION_CONFIRM_TTL_SECONDS = 10 * 60
+VALID_GROUP_ROLES = {"owner", "admin", "member"}
 
 
 def utc_now_iso() -> str:
@@ -315,6 +316,32 @@ async def deliver_text_chunks(
     return start
 
 
+async def deliver_mention_batches(
+    user_ids: list[str],
+    send_batch: Callable[[list[str], str], Awaitable[Any]],
+    save_progress: Callable[[list[str]], Awaitable[Any]],
+    text: str,
+    progress: list[str],
+) -> list[str]:
+    """Send at most 20 mentions per call and persist after every success."""
+    normalized_ids = list(dict.fromkeys(
+        str(user_id).strip() for user_id in user_ids if str(user_id).strip()
+    ))
+    progress[:] = list(dict.fromkeys(
+        str(user_id).strip() for user_id in progress if str(user_id).strip()
+    ))
+    mentioned = set(progress)
+    remaining = [user_id for user_id in normalized_ids if user_id not in mentioned]
+    for start in range(0, len(remaining), 20):
+        batch = remaining[start:start + 20]
+        batch_text = str(text).strip() if not progress else ""
+        await send_batch(batch, batch_text)
+        progress.extend(user_id for user_id in batch if user_id not in mentioned)
+        mentioned.update(batch)
+        await save_progress(list(progress))
+    return list(progress)
+
+
 def _llm_response_text(response: Any) -> str:
     for attribute in ("completion_text", "text", "content"):
         value = getattr(response, attribute, None)
@@ -536,6 +563,12 @@ def member_role(member: dict[str, Any]) -> str:
     return str(member.get("role") or "member").strip().casefold() or "member"
 
 
+def strict_member_role(member: dict[str, Any]) -> str | None:
+    """Return a protocol-confirmed role, never guessing missing metadata."""
+    role = str(member.get("role") or "").strip().casefold()
+    return role if role in VALID_GROUP_ROLES else None
+
+
 def is_human_member(member: dict[str, Any], self_id: str | None = None) -> bool:
     member_id = str(member.get("user_id") or "").strip()
     excluded_id = str(self_id or "").strip()
@@ -631,12 +664,16 @@ def validate_moderation_preflight(
     bot_id: str,
     target_id: str,
 ) -> str | None:
-    bot_role = member_role(bot_member)
-    target_role = member_role(target_member)
+    bot_role = strict_member_role(bot_member)
+    target_role = strict_member_role(target_member)
     if str(bot_id).strip() == str(target_id).strip():
         return "不能对机器人自己执行群管理操作。"
     if _is_robot_member(target_member):
         return "不能对机器人账号执行群管理操作。"
+    if bot_role is None:
+        return "无法确认机器人在该群的权限角色，已拒绝执行群管理操作。"
+    if target_role is None:
+        return "无法确认目标成员的群角色，已拒绝执行群管理操作。"
     if bot_role not in {"owner", "admin"}:
         return "机器人不是该群管理员，不能执行群管理操作。"
     if target_role == "owner":
@@ -1462,21 +1499,56 @@ class TaskManager:
         platform_id: str,
         group: str | None = None,
         include_children: bool = False,
+        requester_id: str | None = None,
+        allow_admin_override: bool = False,
+        moderation_only: bool = False,
     ) -> list[dict[str, Any]]:
         async with self.lock:
             group_id = None
             if group:
                 group_id = self._resolve_binding(group, platform_id)["group_id"]
-            return self.storage.list_tasks(platform_id, group_id, include_children)
+            tasks = self.storage.list_tasks(platform_id, group_id, include_children)
+            visible: list[dict[str, Any]] = []
+            for task in tasks:
+                if task["type"] != "MODERATION":
+                    if not moderation_only:
+                        visible.append(task)
+                    continue
+                if allow_admin_override or (
+                    requester_id is not None
+                    and str(task["creator_id"]) == str(requester_id)
+                ):
+                    visible.append(task)
+            return visible
 
-    async def get_task(self, task_id: str, platform_id: str) -> dict[str, Any]:
+    async def get_task(
+        self,
+        task_id: str,
+        platform_id: str,
+        requester_id: str | None = None,
+        allow_admin_override: bool = False,
+    ) -> dict[str, Any]:
         async with self.lock:
             task = self.storage.get_task(str(task_id).strip())
             if task is None or task["platform_id"] != platform_id:
                 raise KeyError(f"任务不存在：{task_id}")
+            if task["type"] == "MODERATION" and not (
+                allow_admin_override
+                or (
+                    requester_id is not None
+                    and str(task["creator_id"]) == str(requester_id)
+                )
+            ):
+                raise ValueError("你无权查看该群管理任务")
             return task
 
-    async def cancel_task(self, task_id: str, platform_id: str) -> dict[str, Any]:
+    async def cancel_task(
+        self,
+        task_id: str,
+        platform_id: str,
+        requester_id: str | None = None,
+        allow_admin_override: bool = False,
+    ) -> dict[str, Any]:
         async with self.lock:
             task = self.storage.get_task(str(task_id).strip())
             if task is None or task["platform_id"] != platform_id:
@@ -1492,7 +1564,17 @@ class TaskManager:
             elif task["type"] in {"DDL", "RECURRING", "COURSE", "SUMMARY"}:
                 if task["status"] != "ACTIVE":
                     raise ValueError(f"任务当前不能取消：{task['status']}")
-            elif task["type"] in {"RELAY", "MODERATION"}:
+            elif task["type"] == "MODERATION":
+                if requester_id is None:
+                    raise ValueError("你无权取消该群管理任务")
+                return self.storage.cancel_moderation(
+                    task["id"],
+                    platform_id,
+                    str(requester_id),
+                    utc_now_iso(),
+                    allow_admin_override=allow_admin_override,
+                )
+            elif task["type"] == "RELAY":
                 if task["status"] != "PENDING":
                     raise ValueError(f"任务当前不能取消：{task['status']}")
             else:
@@ -1763,20 +1845,37 @@ class TaskManager:
             )
 
     async def finish_relay(
-        self, task_id: str, success: bool, error: str = "",
+        self,
+        task_id: str,
+        success: bool,
+        error: str = "",
+        result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         async with self.lock:
             now = utc_now_iso()
+            current = self.storage.get_task(task_id)
+            existing: dict[str, Any] = {}
+            if current:
+                try:
+                    parsed = json.loads(current.get("result") or "{}")
+                    if isinstance(parsed, dict):
+                        existing = parsed
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            if result:
+                existing.update(result)
             if success:
                 return self.storage.update_task(
                     task_id,
                     status="COMPLETED",
+                    result=existing,
                     updated_at=now,
                     finished_at=now,
                 )
             return self.storage.update_task(
                 task_id,
                 status="FAILED",
+                result=existing,
                 last_error=str(error)[:1000],
                 updated_at=now,
                 finished_at=now,
@@ -1881,18 +1980,29 @@ class TaskManager:
     ) -> dict[str, Any]:
         async with self.lock:
             now = utc_now_iso()
+            current = self.storage.get_task(task_id)
+            existing: dict[str, Any] = {}
+            if current:
+                try:
+                    parsed = json.loads(current.get("result") or "{}")
+                    if isinstance(parsed, dict):
+                        existing = parsed
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            if result:
+                existing.update(result)
             if success:
                 return self.storage.update_task(
                     task_id,
                     status="COMPLETED",
-                    result=result or {},
+                    result=existing,
                     updated_at=now,
                     finished_at=now,
                 )
             return self.storage.update_task(
                 task_id,
                 status="FAILED",
-                result=result or {},
+                result=existing,
                 last_error=str(error)[:1000],
                 updated_at=now,
                 finished_at=now,

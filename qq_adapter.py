@@ -137,6 +137,28 @@ class QQAdapter:
             )
         return await self.send_group_message(group_id, message)
 
+    async def send_group_at_member_batch(
+        self,
+        group_id: str,
+        user_ids: list[str],
+        text: str = "",
+    ) -> Any:
+        """Send exactly one bounded OneBot message mentioning 1-20 members."""
+        normalized_ids = [
+            self._qq_id(user_id)
+            for user_id in user_ids
+            if str(user_id).strip()
+        ]
+        if not 1 <= len(normalized_ids) <= 20:
+            raise ValueError("单批 @成员数量必须在 1 到 20 人之间")
+        message: list[dict[str, Any]] = [
+            {"type": "at", "data": {"qq": user_id}}
+            for user_id in normalized_ids
+        ]
+        if str(text).strip():
+            message.append({"type": "text", "data": {"text": str(text)}})
+        return await self.send_group_message(group_id, message)
+
     async def send_group_at_members(
         self,
         group_id: str,
@@ -151,13 +173,9 @@ class QQAdapter:
         ]
         results: list[Any] = []
         for start in range(0, len(normalized_ids), 20):
-            message: list[dict[str, Any]] = [
-                {"type": "at", "data": {"qq": user_id}}
-                for user_id in normalized_ids[start:start + 20]
-            ]
-            if str(text).strip():
-                message.append({"type": "text", "data": {"text": str(text)}})
-            results.append(await self.send_group_message(group_id, message))
+            results.append(await self.send_group_at_member_batch(
+                group_id, user_ids[start:start + 20], text,
+            ))
         return results
 
     async def send_private_message(self, user_id: str, text: str) -> Any:

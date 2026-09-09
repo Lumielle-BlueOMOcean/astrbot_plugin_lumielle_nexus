@@ -2,7 +2,7 @@
 
 微光·群枢（Lumielle Nexus）是一个面向 AstrBot 的跨会话群任务编排插件，让私聊成为控制台，让群聊成为可调度的工作空间。
 
-当前版本：`0.4.0`
+当前版本：`0.4.1`
 
 ## 项目定位
 
@@ -42,7 +42,7 @@ pip install -r requirements.txt
 - `moderation_enabled`：默认 `false`；必须主动开启才允许群管理。
 - `moderator_ids`：独立的群管理 QQ 用户 ID 列表，不会自动继承 `operator_ids`。
 
-所有控制型命令和工具都要求来自私聊，并由 AstrBot Admin 或 `operator_ids` 授权。
+普通群枢控制型命令和工具要求来自私聊，并由 AstrBot Admin 或 `operator_ids` 授权；群管理操作另受独立 moderator 权限域约束。
 
 ## 群绑定与提醒
 
@@ -141,11 +141,13 @@ prepare → preview → explicit confirm → send
 
 preview 默认 1 小时有效，且只能由创建 preview 的 operator 确认。失败的 relay 不会自动重试，避免重复发送；可以重新准备。如果确认发送过程中进程异常退出，Relay 会标为 FAILED，发送结果未知，不会自动重发；请先查看目标群后再决定是否重新准备。
 
+成员集合 Relay 会按每批最多 20 人发送，首次成功批次携带正文，后续批次只发送 @。每批成功后都会持久化已 @ 的 QQ 号；若发送失败，结果会标记为部分成功并且不会自动重试。进程在 QQ 已成功但进度尚未落库的极小窗口仍可能产生重复 mention，系统不宣称 exactly-once。
+
 ## 群管理
 
 群管理默认完全关闭。开启 `moderation_enabled` 后，仍必须由 AstrBot Admin 或单独配置在 `moderator_ids` 的用户从私聊发起；普通 `operator_ids` 不会隐式升级。当前只支持一次针对一个群、一个成员的 mute、unmute、kick，不支持批量管理、全员禁言、设置管理员、退群或自动管理。
 
-群管理固定采用 `prepare → preview → explicit confirm → execute`，preview 有 10 分钟 TTL，确认前会重新检查 Bot 与目标成员角色；权限变化会阻止调用 OneBot。群管理不自动重试，进程在确认执行中断时会记录为 outcome unknown，需要人工检查群状态。
+群管理固定采用 `prepare → preview → explicit confirm → execute`，preview 有 10 分钟 TTL，确认前会重新检查 Bot 与目标成员角色；缺失或未知角色一律拒绝，权限变化会阻止调用 OneBot。群管理不自动重试，进程在确认执行中断时会记录为 outcome unknown，需要人工检查群状态。MODERATION 任务属于独立 moderator 权限域：普通 operator 无权查看详情、确认或取消；创建该操作的 moderator 只能处理自己的 preview，AstrBot Admin 可作为覆盖者取消或查看。
 
 ## 当前限制与后续规划
 

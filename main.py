@@ -22,6 +22,7 @@ if __package__:
         clamp_archive_retention_days,
         clamp_scheduler_interval,
         collection_member_stats,
+        deliver_mention_batches,
         deliver_text_chunks,
         format_local_time,
         generate_group_summary,
@@ -44,6 +45,7 @@ else:
         clamp_archive_retention_days,
         clamp_scheduler_interval,
         collection_member_stats,
+        deliver_mention_batches,
         deliver_text_chunks,
         format_local_time,
         generate_group_summary,
@@ -217,8 +219,21 @@ class LumielleNexus(Star):
         return "、".join(names.get(int(day), str(day)) for day in weekdays)
 
     async def _task_details(self, event: AstrMessageEvent, task_id: str) -> str:
+        if str(task_id).strip().upper().startswith("M-"):
+            allowed, message = self._authorized_moderator(event)
+            if not allowed:
+                return message
+        else:
+            allowed, message = self._authorized_for_control(event)
+            if not allowed:
+                return message
         try:
-            task = await self.manager.get_task(task_id, self._platform_id(event))
+            task = await self.manager.get_task(
+                task_id,
+                self._platform_id(event),
+                str(event.get_sender_id()),
+                allow_admin_override=event.is_admin(),
+            )
             payload = self._payload(task)
             lines = [f"任务：{task['id']}", f"类型：{task['type']}", f"群：{task['group_alias']}", f"状态：{task['status']}"]
             if task["type"] == "REMINDER":
@@ -617,23 +632,98 @@ class LumielleNexus(Star):
                 str(event.get_sender_id()),
             )
             payload = self._payload(task)
+            progress = self._payload({"payload": task.get("result")}).get(
+                "mentioned_user_ids", [],
+            )
+            progress = [str(user_id).strip() for user_id in progress if str(user_id).strip()]
             try:
                 adapter = self._adapter(event)
                 if payload.get("mention_user_ids"):
-                    await adapter.send_group_at_members(
-                        task["group_id"], payload["mention_user_ids"], payload["content"],
+                    await self.manager.update_reminder_result(task["id"], {
+                        "mentioned_user_ids": progress,
+                        "delivery_outcome": "pending",
+                    })
+
+                    async def send_batch(user_ids: list[str], text: str) -> Any:
+                        return await adapter.send_group_at_member_batch(
+                            task["group_id"], user_ids, text,
+                        )
+
+                    async def save_progress(user_ids: list[str]) -> Any:
+                        progress[:] = user_ids
+                        return await self.manager.update_reminder_result(task["id"], {
+                            "mentioned_user_ids": list(progress),
+                            "delivery_outcome": "pending",
+                        })
+
+                    await deliver_mention_batches(
+                        payload["mention_user_ids"],
+                        send_batch,
+                        save_progress,
+                        payload["content"],
+                        progress,
                     )
                 elif payload.get("mention_all"):
                     await adapter.send_group_at_all(task["group_id"], payload["content"])
                 else:
                     await adapter.send_group_text(task["group_id"], payload["content"])
             except QQAdapterError as exc:
-                await self.manager.finish_relay(task["id"], False, str(exc))
+                all_ids = [
+                    str(user_id).strip()
+                    for user_id in payload.get("mention_user_ids", [])
+                    if str(user_id).strip()
+                ]
+                mentioned = list(dict.fromkeys(progress))
+                pending = [user_id for user_id in all_ids if user_id not in mentioned]
+                outcome = "partial" if mentioned else "failed"
+                await self.manager.finish_relay(
+                    task["id"],
+                    False,
+                    str(exc),
+                    {
+                        "mentioned_user_ids": mentioned,
+                        "pending_user_ids": pending,
+                        "delivery_outcome": outcome,
+                        "reason": "adapter_error",
+                    },
+                )
+                if mentioned:
+                    return (
+                        f"Relay 部分发送成功：已完成 {len(mentioned)} 人，剩余 "
+                        f"{len(pending)} 人未确认发送。该 Relay 不会自动重试，请检查群聊后重新准备需要补发的内容。"
+                    )
                 return f"转述发送失败：{exc}。该 Relay 已标记失败，请重新准备。"
-            await self.manager.finish_relay(task["id"], True)
+            await self.manager.finish_relay(
+                task["id"],
+                True,
+                result={
+                    "mentioned_user_ids": list(dict.fromkeys(progress)),
+                    "pending_user_ids": [],
+                    "delivery_outcome": "completed",
+                },
+            )
             return f"已将 Relay {task['id']} 发送到「{task['group_alias']}」。"
         except (KeyError, ValueError) as exc:
             return f"确认转述失败：{exc}"
+
+    async def _cancel_task(self, event: AstrMessageEvent, task_id: str) -> str:
+        is_moderation = str(task_id).strip().upper().startswith("M-")
+        if is_moderation:
+            allowed, message = self._authorized_moderator(event)
+        else:
+            allowed, message = self._authorized_for_control(event)
+        if not allowed:
+            return message
+        try:
+            task = await self.manager.cancel_task(
+                task_id,
+                self._platform_id(event),
+                str(event.get_sender_id()),
+                allow_admin_override=event.is_admin(),
+            )
+            return f"已取消任务：{task['id']}"
+        except (KeyError, ValueError) as exc:
+            return f"取消失败：{exc}"
 
     @staticmethod
     def _moderation_action_text(action: str) -> str:
@@ -743,6 +833,15 @@ class LumielleNexus(Star):
                     },
                 )
                 return f"确认群管理失败：{preflight_error}操作未发送。"
+        except (QQAdapterError, KeyError, ValueError) as exc:
+            await self.manager.finish_moderation(
+                task["id"], False, "moderation_preflight_changed", {
+                    "reason": "moderation_preflight_changed",
+                },
+            )
+            return f"确认群管理失败：无法确认最新群成员权限（{exc}），操作未发送。"
+
+        try:
             if payload["action"] in {"mute", "unmute"}:
                 await adapter.set_group_ban(
                     task["group_id"],
@@ -776,7 +875,22 @@ class LumielleNexus(Star):
             return f"群管理操作失败：{exc}。该操作不会自动重试。"
 
     async def _tasks(self, event: AstrMessageEvent, group: str | None = None) -> str:
-        tasks = await self.manager.list_tasks(self._platform_id(event), group or None)
+        operator_allowed, _operator_message = self._authorized_for_control(event)
+        moderation_allowed, moderation_message = self._authorized_moderator(event)
+        if not operator_allowed and not moderation_allowed:
+            return moderation_message
+        moderation_only = moderation_allowed and not operator_allowed
+        tasks = await self.manager.list_tasks(
+            self._platform_id(event),
+            group or None,
+            requester_id=str(event.get_sender_id()),
+            allow_admin_override=event.is_admin(),
+            moderation_only=moderation_only,
+        )
+        if not event.is_admin() and not moderation_allowed:
+            tasks = [task for task in tasks if task["type"] != "MODERATION"]
+        if not self.moderation_enabled:
+            tasks = [task for task in tasks if task["type"] != "MODERATION"]
         if not tasks:
             return "暂无任务。"
         return "任务列表：\n" + "\n".join(self._task_line(task) for task in tasks[:30])
@@ -1058,10 +1172,51 @@ class LumielleNexus(Star):
             self_id=self_id,
             target_ids=collection_payload.get("target_member_ids"),
         )
-        missing_ids = sorted(stats["missing_ids"])
+        missing_set = stats["missing_ids"]
+        missing_ids: list[str] = []
+        seen_missing: set[str] = set()
+        for member in members:
+            member_id = str(member.get("user_id") or "").strip()
+            if member_id in missing_set and member_id not in seen_missing:
+                missing_ids.append(member_id)
+                seen_missing.add(member_id)
         if not missing_ids:
             return
-        await adapter.send_group_at_members(task["group_id"], missing_ids, payload["message"])
+        stored_result = self._payload({"payload": task.get("result")})
+        mentioned_ids = [
+            str(user_id).strip()
+            for user_id in stored_result.get("mentioned_user_ids", [])
+            if str(user_id).strip()
+        ]
+        await self.manager.update_reminder_result(task["id"], {
+            "mentioned_user_ids": list(dict.fromkeys(mentioned_ids)),
+        })
+
+        async def send_batch(user_ids: list[str], text: str) -> Any:
+            return await adapter.send_group_at_member_batch(
+                task["group_id"], user_ids, text,
+            )
+
+        async def save_progress(user_ids: list[str]) -> Any:
+            mentioned_ids[:] = user_ids
+            return await self.manager.update_reminder_result(task["id"], {
+                "mentioned_user_ids": list(mentioned_ids),
+            })
+
+        # The adapter's send_group_at_members convenience API remains available,
+        # but chase delivery uses the single-batch primitive for durable progress.
+        mentioned_set = set(mentioned_ids)
+        remaining_ids = [
+            user_id for user_id in missing_ids if user_id not in mentioned_set
+        ]
+        if remaining_ids:
+            await deliver_mention_batches(
+                remaining_ids,
+                send_batch,
+                save_progress,
+                payload["message"],
+                mentioned_ids,
+            )
         interval = int(payload.get("repeat_interval_minutes") or 0)
         if interval:
             try:
@@ -1186,16 +1341,14 @@ class LumielleNexus(Star):
 
     @nexus.command("tasks", priority=10)
     async def cmd_tasks(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
-        allowed, message = self._authorized_for_control(event)
         args = self._command_args(event)
-        yield event.plain_result(message if not allowed else await self._tasks(event, args[0] if args else None))
+        yield event.plain_result(await self._tasks(event, args[0] if args else None))
 
     @nexus.command("task", priority=10)
     async def cmd_task(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
-        allowed, message = self._authorized_for_control(event)
         args = self._command_args(event)
         yield event.plain_result(
-            message if not allowed else (
+            (
                 await self._task_details(event, args[0])
                 if args else "用法：/nexus task <任务ID>"
             ),
@@ -1203,18 +1356,11 @@ class LumielleNexus(Star):
 
     @nexus.command("cancel", priority=10)
     async def cmd_cancel(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
-        allowed, message = self._authorized_for_control(event)
         args = self._command_args(event)
-        if not allowed:
-            yield event.plain_result(message)
-        elif not args:
+        if not args:
             yield event.plain_result("用法：/nexus cancel <任务ID>")
         else:
-            try:
-                task = await self.manager.cancel_task(args[0], self._platform_id(event))
-                yield event.plain_result(f"已取消任务：{task['id']}")
-            except (KeyError, ValueError) as exc:
-                yield event.plain_result(f"取消失败：{exc}")
+            yield event.plain_result(await self._cancel_task(event, args[0]))
 
     @nexus.command("collect-start", priority=10)
     async def cmd_collect_start(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
@@ -1345,18 +1491,16 @@ class LumielleNexus(Star):
         Args:
             group(string): 可选的群别名或群号；留空表示全部任务。
         """
-        allowed, message = self._authorized_for_control(event)
-        return message if not allowed else await self._tasks(event, group or None)
+        return await self._tasks(event, group or None)
 
     @filter.llm_tool(name="nexus_get_task")
     async def nexus_get_task(self, event: AstrMessageEvent, task_id: str) -> str:
-        """查看一个群枢任务的详细信息。只能在私聊 operator 中调用，不返回原始 JSON 或服务器文件路径。
+        """查看一个群枢任务的详细信息。普通任务只能在私聊 operator 中调用；MODERATION 只能由创建者 moderator 或 AstrBot Admin 查看，不返回原始 JSON 或服务器文件路径。
 
         Args:
             task_id(string): 任务 ID，例如 D-20260909-001、S-20260909-001 或 K-20260909-001。
         """
-        allowed, message = self._authorized_for_control(event)
-        return message if not allowed else await self._task_details(event, task_id)
+        return await self._task_details(event, task_id)
 
     @filter.llm_tool(name="nexus_create_ddl")
     async def nexus_create_ddl(
@@ -1510,19 +1654,12 @@ class LumielleNexus(Star):
 
     @filter.llm_tool(name="nexus_cancel_task")
     async def nexus_cancel_task(self, event: AstrMessageEvent, task_id: str) -> str:
-        """取消一个尚未执行的一次性提醒、PENDING relay 或 PENDING 群管理操作，或取消 ACTIVE 的 DDL、周期、课程、每周总结父任务并级联取消其未执行子提醒。信息收集必须使用 nexus_stop_collection 结束；只能在私聊 operator 中调用。
+        """取消一个尚未执行的一次性提醒、PENDING relay 或 PENDING 群管理操作，或取消 ACTIVE 的 DDL、周期、课程、每周总结父任务并级联取消其未执行子提醒。信息收集必须使用 nexus_stop_collection 结束；普通任务只能在私聊 operator 中调用，MODERATION 只能由创建者 moderator 或 AstrBot Admin 取消。
 
         Args:
             task_id(string): 要取消的任务 ID，例如 R-20260909-001。
         """
-        allowed, message = self._authorized_for_control(event)
-        if not allowed:
-            return message
-        try:
-            task = await self.manager.cancel_task(task_id, self._platform_id(event))
-            return f"已取消任务：{task['id']}"
-        except (KeyError, ValueError) as exc:
-            return f"取消失败：{exc}"
+        return await self._cancel_task(event, task_id)
 
     @filter.llm_tool(name="nexus_start_collection")
     async def nexus_start_collection(

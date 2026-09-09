@@ -590,6 +590,8 @@ class Storage:
                 ).fetchone()
                 if task is None:
                     raise KeyError(f"任务不存在：{task_id}")
+                if task["type"] == "MODERATION":
+                    raise ValueError("MODERATION 任务必须通过群管理权限域取消")
                 if task["status"] in {"PENDING", "ACTIVE"}:
                     self._conn.execute(
                         "UPDATE tasks SET status = 'CANCELLED', updated_at = ?, finished_at = ? WHERE id = ?",
@@ -608,6 +610,45 @@ class Storage:
                 self._conn.rollback()
                 raise
         return self.get_task(task_id)
+
+    def cancel_moderation(
+        self,
+        task_id: str,
+        platform_id: str,
+        requester_id: str,
+        updated_at: str,
+        allow_admin_override: bool = False,
+    ) -> dict[str, Any]:
+        """Cancel a pending moderation preview under its own permission domain."""
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                task = self._conn.execute(
+                    "SELECT * FROM tasks WHERE id = ? AND platform_id = ?",
+                    (str(task_id), str(platform_id)),
+                ).fetchone()
+                if task is None:
+                    raise KeyError(f"任务不存在：{task_id}")
+                if task["type"] != "MODERATION":
+                    raise ValueError("该任务不是群管理任务")
+                if task["status"] != "PENDING":
+                    raise ValueError(f"群管理任务当前不能取消：{task['status']}")
+                if not allow_admin_override and str(task["creator_id"]) != str(requester_id):
+                    raise ValueError("你无权取消该群管理任务")
+                self._conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'CANCELLED', updated_at = ?, finished_at = ?
+                    WHERE id = ? AND platform_id = ? AND type = 'MODERATION'
+                      AND status = 'PENDING'
+                    """,
+                    (str(updated_at), str(updated_at), str(task_id), str(platform_id)),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return self.get_task(str(task_id))
 
     def claim_due_tasks(self, now_iso: str, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
@@ -650,51 +691,73 @@ class Storage:
 
     def recover_processing_relays(self, updated_at: str) -> int:
         """Mark interrupted relay confirmations failed without resending them."""
-        result_json = json.dumps({
-            "delivery_outcome": "unknown",
-            "reason": "interrupted_during_confirm",
-        }, ensure_ascii=False)
         with self._lock:
-            cursor = self._conn.execute(
-                """
-                UPDATE tasks
-                SET status = 'FAILED', updated_at = ?, finished_at = ?,
-                    last_error = ?, result = ?
-                WHERE type = 'RELAY' AND status = 'PROCESSING'
-                """,
-                (
-                    updated_at,
-                    updated_at,
-                    "Relay execution interrupted; delivery outcome unknown",
-                    result_json,
-                ),
-            )
+            rows = self._conn.execute(
+                "SELECT id, result FROM tasks WHERE type = 'RELAY' AND status = 'PROCESSING'",
+            ).fetchall()
+            for row in rows:
+                try:
+                    result = json.loads(row["result"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    result = {}
+                if not isinstance(result, dict):
+                    result = {}
+                result.update({
+                    "delivery_outcome": "unknown",
+                    "reason": "interrupted_during_confirm",
+                })
+                self._conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'FAILED', updated_at = ?, finished_at = ?,
+                        last_error = ?, result = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        updated_at,
+                        updated_at,
+                        "Relay execution interrupted; delivery outcome unknown",
+                        json.dumps(result, ensure_ascii=False),
+                        row["id"],
+                    ),
+                )
             self._conn.commit()
-        return int(cursor.rowcount)
+        return len(rows)
 
     def recover_processing_moderations(self, updated_at: str) -> int:
         """Never replay an interrupted destructive moderation action."""
-        result_json = json.dumps({
-            "execution_outcome": "unknown",
-            "reason": "interrupted_during_confirm",
-        }, ensure_ascii=False)
         with self._lock:
-            cursor = self._conn.execute(
-                """
-                UPDATE tasks
-                SET status = 'FAILED', updated_at = ?, finished_at = ?,
-                    last_error = ?, result = ?
-                WHERE type = 'MODERATION' AND status = 'PROCESSING'
-                """,
-                (
-                    str(updated_at),
-                    str(updated_at),
-                    "Moderation execution interrupted; outcome unknown",
-                    result_json,
-                ),
-            )
+            rows = self._conn.execute(
+                "SELECT id, result FROM tasks WHERE type = 'MODERATION' AND status = 'PROCESSING'",
+            ).fetchall()
+            for row in rows:
+                try:
+                    result = json.loads(row["result"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    result = {}
+                if not isinstance(result, dict):
+                    result = {}
+                result.update({
+                    "execution_outcome": "unknown",
+                    "reason": "interrupted_during_confirm",
+                })
+                self._conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'FAILED', updated_at = ?, finished_at = ?,
+                        last_error = ?, result = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(updated_at),
+                        str(updated_at),
+                        "Moderation execution interrupted; outcome unknown",
+                        json.dumps(result, ensure_ascii=False),
+                        row["id"],
+                    ),
+                )
             self._conn.commit()
-        return int(cursor.rowcount)
+        return len(rows)
 
     def list_schedule_parents(self) -> list[dict[str, Any]]:
         with self._lock:
