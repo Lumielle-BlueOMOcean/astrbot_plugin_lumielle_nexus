@@ -55,7 +55,7 @@
 
 - 群消息 Archive 默认关闭，开启后才记录新的文本消息。
 - 按关键词、时间范围检索已保存的群文本。
-- 按需群聊总结和自动周总结。
+- 按需群聊总结和自动 `weekly summary`（周总结）。
 - 群消息不会逐条调用 LLM：平时先持久化 capture，checkpoint 只处理 cursor 之后的新消息。
 - 总结模型只负责整理，不会自动创建 DDL 或其他任务。
 
@@ -275,6 +275,8 @@ prepare → preview → explicit confirm → send
 ```
 
 `nexus_prepare_relay` 只生成 `X-...` preview；用户明确确认后才调用 `nexus_confirm_relay`。Relay 失败不自动重试，避免产生重复外部消息。
+
+调度和确认流程按持久化、`at-least-once` 语义设计；跨群 Relay 仍坚持显式确认，并且失败后要求重新检查再 prepare。
 
 ### Moderation
 
