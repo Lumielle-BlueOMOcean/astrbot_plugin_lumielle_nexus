@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -104,11 +104,67 @@ class LumielleNexus(Star):
         parts = text.split()
         return parts[2:] if len(parts) >= 2 else []
 
-    @staticmethod
-    def _task_line(task: dict[str, Any]) -> str:
-        payload = LumielleNexus._payload(task)
-        label = payload.get("title") or payload.get("message") or task["type"]
+    def _task_line(self, task: dict[str, Any]) -> str:
+        payload = self._payload(task)
+        task_type = task["type"]
+        if task_type == "DDL":
+            label = f"{payload.get('title', 'DDL')}，截止 {format_local_time(task['run_at'], self.manager.timezone_name, 'minutes')}"
+        elif task_type == "RECURRING":
+            label = f"{payload.get('message', '周期提醒')}，下次 {format_local_time(task['run_at'], self.manager.timezone_name, 'minutes')}"
+        elif task_type == "COURSE":
+            label = f"{payload.get('course_name', '课程')}，下次提醒 {format_local_time(task['run_at'], self.manager.timezone_name, 'minutes')}"
+        elif task_type == "COLLECTION":
+            label = payload.get("title") or task_type
+        else:
+            label = f"{payload.get('message', task_type)}，时间 {format_local_time(task.get('run_at'), self.manager.timezone_name, 'minutes')}"
         return f"{task['id']} [{task['status']}] {task['group_alias']}：{label}"
+
+    @staticmethod
+    def _weekdays_text(weekdays: list[int]) -> str:
+        names = {1: "周一", 2: "周二", 3: "周三", 4: "周四", 5: "周五", 6: "周六", 7: "周日"}
+        return "、".join(names.get(int(day), str(day)) for day in weekdays)
+
+    async def _task_details(self, event: AstrMessageEvent, task_id: str) -> str:
+        try:
+            task = await self.manager.get_task(task_id, self._platform_id(event))
+            payload = self._payload(task)
+            lines = [f"任务：{task['id']}", f"类型：{task['type']}", f"群：{task['group_alias']}", f"状态：{task['status']}"]
+            if task["type"] == "REMINDER":
+                lines.extend([
+                    f"时间：{format_local_time(task.get('run_at'), self.manager.timezone_name, 'minutes')}",
+                    f"内容：{payload.get('message', '')}",
+                ])
+            elif task["type"] == "DDL":
+                lines.extend([
+                    f"标题：{payload.get('title', '')}",
+                    f"截止：{format_local_time(task.get('run_at'), self.manager.timezone_name, 'minutes')}",
+                    f"提前提醒（分钟）：{', '.join(str(item) for item in payload.get('remind_before_minutes', [])) or '无'}",
+                ])
+            elif task["type"] == "RECURRING":
+                lines.extend([
+                    f"星期：{self._weekdays_text(payload.get('weekdays', []))}",
+                    f"时间：{payload.get('time_of_day', '')}",
+                    f"下次：{format_local_time(task.get('run_at'), self.manager.timezone_name, 'minutes')}",
+                ])
+            elif task["type"] == "COURSE":
+                lines.extend([
+                    f"课程：{payload.get('course_name', '')}",
+                    f"星期：{self._weekdays_text(payload.get('weekdays', []))}",
+                    f"上课时间：{payload.get('start_time', '')}",
+                    f"地点：{payload.get('location', '') or '未设置'}",
+                    f"提前：{payload.get('remind_before_minutes', 0)} 分钟",
+                    f"下次提醒：{format_local_time(task.get('run_at'), self.manager.timezone_name, 'minutes')}",
+                    f"结束日期：{payload.get('end_date') or '未设置'}",
+                ])
+            elif task["type"] == "COLLECTION":
+                status = await self.manager.collection_status(task["id"], self._platform_id(event))
+                lines.extend([
+                    f"标题：{payload.get('title', '')}",
+                    f"提交人数：{status['submitted_count']}",
+                ])
+            return "\n".join(lines)
+        except (KeyError, ValueError) as exc:
+            return f"查询失败：{exc}"
 
     async def _bind_group(self, event: AstrMessageEvent, alias: str, group_id: str) -> str:
         allowed, message = self._authorized_for_control(event)
@@ -278,14 +334,10 @@ class LumielleNexus(Star):
     async def _scheduler_loop(self) -> None:
         while True:
             try:
+                await self.manager.materialize_due_schedules()
                 for task in await self.manager.due_tasks():
                     try:
-                        payload = self._payload(task)
-                        adapter = QQAdapter(self.context, task["platform_id"])
-                        if payload.get("mention_all"):
-                            await adapter.send_group_at_all(task["group_id"], payload["message"])
-                        else:
-                            await adapter.send_group_text(task["group_id"], payload["message"])
+                        await self._execute_reminder(task)
                         await self.manager.finish_reminder(task["id"], True)
                     except Exception as exc:
                         logger.exception("群枢提醒任务执行失败 %s", task.get("id"))
@@ -298,6 +350,54 @@ class LumielleNexus(Star):
             except Exception:
                 logger.exception("群枢 scheduler 迭代失败")
             await asyncio.sleep(self.scheduler_interval_seconds)
+
+    async def _execute_reminder(self, task: dict[str, Any]) -> None:
+        payload = self._payload(task)
+        if payload.get("kind") == "collection_chase":
+            await self._execute_collection_chase(task, payload)
+            return
+        adapter = QQAdapter(self.context, task["platform_id"])
+        if payload.get("mention_all"):
+            await adapter.send_group_at_all(task["group_id"], payload["message"])
+        else:
+            await adapter.send_group_text(task["group_id"], payload["message"])
+
+    async def _execute_collection_chase(
+        self,
+        task: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        status = await self.manager.collection_status(
+            payload["collection_task_id"], task["platform_id"],
+        )
+        collection = status["task"]
+        if collection["status"] != "ACTIVE":
+            return
+        adapter = QQAdapter(self.context, task["platform_id"])
+        members = await adapter.get_group_member_list(task["group_id"])
+        try:
+            self_id = str((await adapter.get_login_info()).get("user_id") or "")
+        except QQAdapterError:
+            self_id = None
+        stats = collection_member_stats(members, status["entries"], self_id=self_id)
+        missing_ids = sorted(stats["missing_ids"])
+        if not missing_ids:
+            return
+        await adapter.send_group_at_members(task["group_id"], missing_ids, payload["message"])
+        interval = int(payload.get("repeat_interval_minutes") or 0)
+        if interval:
+            try:
+                await self.manager.schedule_collection_chase(
+                    collection["id"],
+                    datetime.now(timezone.utc) + timedelta(minutes=interval),
+                    payload["message"],
+                    interval,
+                    task["platform_id"],
+                    task["creator_id"],
+                    task["creator_private_origin"],
+                )
+            except (KeyError, ValueError):
+                logger.exception("群枢重复催办未能安排下一次 %s", task.get("id"))
 
     @filter.command_group("nexus")
     def nexus(self) -> None:
@@ -314,7 +414,8 @@ class LumielleNexus(Star):
             "/nexus bind <别名> <群号>\n"
             "/nexus groups\n"
             "/nexus tasks [群别名]\n"
-            "/nexus cancel <提醒任务ID>（仅限尚未执行的一次性提醒）\n"
+            "/nexus task <任务ID>\n"
+            "/nexus cancel <任务ID>（提醒或可取消的时间任务父任务）\n"
             "/nexus collect-start 群别名|标题|字段1,字段2[,公告][,all]\n"
             "/nexus collect-status <任务ID>\n"
             "/nexus collect-stop <任务ID>\n"
@@ -340,6 +441,17 @@ class LumielleNexus(Star):
         allowed, message = self._authorized_for_control(event)
         args = self._command_args(event)
         yield event.plain_result(message if not allowed else await self._tasks(event, args[0] if args else None))
+
+    @nexus.command("task", priority=10)
+    async def cmd_task(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
+        allowed, message = self._authorized_for_control(event)
+        args = self._command_args(event)
+        yield event.plain_result(
+            message if not allowed else (
+                await self._task_details(event, args[0])
+                if args else "用法：/nexus task <任务ID>"
+            ),
+        )
 
     @nexus.command("cancel", priority=10)
     async def cmd_cancel(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
@@ -475,9 +587,169 @@ class LumielleNexus(Star):
         allowed, message = self._authorized_for_control(event)
         return message if not allowed else await self._tasks(event, group or None)
 
+    @filter.llm_tool(name="nexus_get_task")
+    async def nexus_get_task(self, event: AstrMessageEvent, task_id: str) -> str:
+        """查看一个群枢任务的详细信息。只能在私聊 operator 中调用，不返回原始 JSON 或服务器文件路径。
+
+        Args:
+            task_id(string): 任务 ID，例如 D-20260909-001、S-20260909-001 或 K-20260909-001。
+        """
+        allowed, message = self._authorized_for_control(event)
+        return message if not allowed else await self._task_details(event, task_id)
+
+    @filter.llm_tool(name="nexus_create_ddl")
+    async def nexus_create_ddl(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        title: str,
+        deadline: str,
+        remind_before_minutes: list[int],
+        message: str = "",
+        mention_all: bool = False,
+    ) -> str:
+        """创建带多个提前提醒的持久化 DDL。只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 已绑定群别名。
+            title(string): DDL 标题。
+            deadline(string): 按插件时区解释的明确 YYYY-MM-DD HH:MM 时间。
+            remind_before_minutes(list[number]): 提前分钟数，例如 [4320, 1440, 180]；必须为整数，0 表示截止时刻提醒，只有明确传入才会创建。
+            message(string): 可选的群提醒内容；留空由插件生成。
+            mention_all(boolean): 是否 @全体成员。
+        """
+        allowed, denied = self._authorized_for_control(event)
+        if not allowed:
+            return denied
+        try:
+            task = await self.manager.create_ddl(
+                group, title, deadline, remind_before_minutes, message, mention_all,
+                self._platform_id(event), event.get_sender_id(), event.unified_msg_origin,
+            )
+            skipped = self._payload(task).get("skipped_offsets", [])
+            suffix = f"已跳过已过去的提前时间：{', '.join(str(item) for item in skipped)} 分钟。" if skipped else ""
+            return f"已创建 DDL 任务 {task['id']}。{suffix}"
+        except (KeyError, ValueError) as exc:
+            return f"创建 DDL 失败：{exc}"
+
+    @filter.llm_tool(name="nexus_create_recurring_reminder")
+    async def nexus_create_recurring_reminder(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        weekdays: list[int],
+        time_of_day: str,
+        message: str,
+        mention_all: bool = False,
+        start_date: str = "",
+        end_date: str = "",
+    ) -> str:
+        """创建每周周期提醒。仅支持明确的 weekly weekday/time 规则，1=Monday、2=Tuesday、3=Wednesday、4=Thursday、5=Friday、6=Saturday、7=Sunday；只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 已绑定群别名。
+            weekdays(list[number]): 星期列表，1=Monday 到 7=Sunday，必须为整数。
+            time_of_day(string): 按插件时区解释的 HH:MM。
+            message(string): 每次提醒内容。
+            mention_all(boolean): 是否 @全体成员。
+            start_date(string): 可选的 YYYY-MM-DD 起始日期。
+            end_date(string): 可选的 YYYY-MM-DD 结束日期。
+        """
+        allowed, denied = self._authorized_for_control(event)
+        if not allowed:
+            return denied
+        try:
+            task = await self.manager.create_recurring_reminder(
+                group, weekdays, time_of_day, message, mention_all, start_date, end_date,
+                self._platform_id(event), event.get_sender_id(), event.unified_msg_origin,
+            )
+            return (
+                f"已创建周期提醒 {task['id']}，下次执行："
+                f"{format_local_time(task['run_at'], self.manager.timezone_name, 'minutes')} "
+                f"（{self.manager.timezone_name}）。"
+            )
+        except (KeyError, ValueError) as exc:
+            return f"创建周期提醒失败：{exc}"
+
+    @filter.llm_tool(name="nexus_create_course")
+    async def nexus_create_course(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        course_name: str,
+        weekdays: list[int],
+        start_time: str,
+        location: str = "",
+        remind_before_minutes: int = 20,
+        start_date: str = "",
+        end_date: str = "",
+        mention_all: bool = False,
+    ) -> str:
+        """创建每周课程提醒。weekdays 使用 1=Monday 到 7=Sunday；所有时间按插件时区解释，只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 已绑定群别名。
+            course_name(string): 课程名称。
+            weekdays(list[number]): 上课星期，1=Monday 到 7=Sunday，必须为整数。
+            start_time(string): 上课时间 HH:MM。
+            location(string): 可选地点。
+            remind_before_minutes(number): 提前提醒分钟数，必须为非负整数。
+            start_date(string): 可选课程起始日期 YYYY-MM-DD。
+            end_date(string): 可选课程结束日期 YYYY-MM-DD。
+            mention_all(boolean): 是否 @全体成员。
+        """
+        allowed, denied = self._authorized_for_control(event)
+        if not allowed:
+            return denied
+        try:
+            task = await self.manager.create_course(
+                group, course_name, weekdays, start_time, location, remind_before_minutes,
+                start_date, end_date, mention_all, self._platform_id(event),
+                event.get_sender_id(), event.unified_msg_origin,
+            )
+            return (
+                f"已创建课程提醒 {task['id']}，下次提醒："
+                f"{format_local_time(task['run_at'], self.manager.timezone_name, 'minutes')} "
+                f"（{self.manager.timezone_name}）。"
+            )
+        except (KeyError, ValueError) as exc:
+            return f"创建课程提醒失败：{exc}"
+
+    @filter.llm_tool(name="nexus_schedule_collection_chase")
+    async def nexus_schedule_collection_chase(
+        self,
+        event: AstrMessageEvent,
+        task_id: str,
+        run_at: str,
+        message: str = "",
+        repeat_interval_minutes: int = 0,
+    ) -> str:
+        """为 ACTIVE 信息收集安排未提交成员催办。到时只 @当前未提交成员，不 @全体；repeat_interval_minutes 为 0 表示单次，否则必须至少 60 分钟且不超过 7 天。只能在私聊 operator 中调用。
+
+        Args:
+            task_id(string): ACTIVE COLLECTION 任务 ID。
+            run_at(string): 按插件时区解释的明确 YYYY-MM-DD HH:MM 时间。
+            message(string): 可选催办内容。
+            repeat_interval_minutes(number): 重复间隔分钟数，必须为整数，0 或至少 60。
+        """
+        allowed, denied = self._authorized_for_control(event)
+        if not allowed:
+            return denied
+        try:
+            task = await self.manager.schedule_collection_chase(
+                task_id, run_at, message, repeat_interval_minutes,
+                self._platform_id(event), event.get_sender_id(), event.unified_msg_origin,
+            )
+            return (
+                f"已安排收集催办 {task['id']}，执行时间："
+                f"{format_local_time(task['run_at'], self.manager.timezone_name, 'minutes')}。"
+            )
+        except (KeyError, ValueError) as exc:
+            return f"安排催办失败：{exc}"
+
     @filter.llm_tool(name="nexus_cancel_task")
     async def nexus_cancel_task(self, event: AstrMessageEvent, task_id: str) -> str:
-        """取消一个尚未执行的一次性提醒。信息收集必须使用 nexus_stop_collection 结束；只能在私聊 operator 中调用。
+        """取消一个尚未执行的一次性提醒，或取消 ACTIVE 的 DDL、周期提醒、课程父任务并级联取消其未执行子提醒。信息收集必须使用 nexus_stop_collection 结束；只能在私聊 operator 中调用。
 
         Args:
             task_id(string): 要取消的任务 ID，例如 R-20260909-001。

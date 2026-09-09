@@ -58,7 +58,9 @@ class Storage:
                     retry_count INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT,
                     updated_at TEXT NOT NULL,
-                    finished_at TEXT
+                    finished_at TEXT,
+                    parent_id TEXT,
+                    occurrence_key TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_tasks_due
@@ -77,6 +79,21 @@ class Storage:
                     PRIMARY KEY (task_id, sender_id),
                     FOREIGN KEY (task_id) REFERENCES tasks(id)
                 );
+                """,
+            )
+            columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            if "parent_id" not in columns:
+                self._conn.execute("ALTER TABLE tasks ADD COLUMN parent_id TEXT")
+            if "occurrence_key" not in columns:
+                self._conn.execute("ALTER TABLE tasks ADD COLUMN occurrence_key TEXT")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id)")
+            self._conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_parent_occurrence
+                ON tasks(parent_id, occurrence_key)
+                WHERE parent_id IS NOT NULL AND occurrence_key IS NOT NULL
                 """,
             )
             self._conn.commit()
@@ -191,6 +208,8 @@ class Storage:
         created_at: str,
         run_at: str | None,
         payload: dict[str, Any],
+        parent_id: str | None = None,
+        occurrence_key: str | None = None,
     ) -> dict[str, Any]:
         payload_json = json.dumps(payload, ensure_ascii=False)
         with self._lock:
@@ -199,8 +218,8 @@ class Storage:
                 INSERT INTO tasks
                     (id, type, status, group_id, group_alias, platform_id,
                      creator_id, creator_private_origin, created_at, run_at,
-                     payload, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     payload, updated_at, parent_id, occurrence_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -215,6 +234,8 @@ class Storage:
                     run_at,
                     payload_json,
                     created_at,
+                    parent_id,
+                    occurrence_key,
                 ),
             )
             self._conn.commit()
@@ -284,10 +305,11 @@ class Storage:
         self,
         platform_id: str | None = None,
         group_id: str | None = None,
+        include_children: bool = False,
     ) -> list[dict[str, Any]]:
         query = "SELECT * FROM tasks"
         params: list[str] = []
-        clauses: list[str] = []
+        clauses: list[str] = [] if include_children else ["parent_id IS NULL"]
         if platform_id:
             clauses.append("platform_id = ?")
             params.append(platform_id)
@@ -307,6 +329,7 @@ class Storage:
         *,
         status: str | None = None,
         result: dict[str, Any] | None = None,
+        run_at: str | None = None,
         retry_count: int | None = None,
         last_error: str | None = None,
         updated_at: str,
@@ -320,6 +343,9 @@ class Storage:
         if result is not None:
             assignments.append("result = ?")
             params.append(json.dumps(result, ensure_ascii=False))
+        if run_at is not None:
+            assignments.append("run_at = ?")
+            params.append(run_at)
         if retry_count is not None:
             assignments.append("retry_count = ?")
             params.append(retry_count)
@@ -354,6 +380,14 @@ class Storage:
                 if task["status"] in {"PENDING", "ACTIVE"}:
                     self._conn.execute(
                         "UPDATE tasks SET status = 'CANCELLED', updated_at = ?, finished_at = ? WHERE id = ?",
+                        (updated_at, updated_at, task_id),
+                    )
+                    self._conn.execute(
+                        """
+                        UPDATE tasks
+                        SET status = 'CANCELLED', updated_at = ?, finished_at = ?
+                        WHERE parent_id = ? AND status = 'PENDING'
+                        """,
                         (updated_at, updated_at, task_id),
                     )
                 self._conn.commit()
@@ -401,6 +435,77 @@ class Storage:
             self._conn.commit()
         return int(cursor.rowcount)
 
+    def list_schedule_parents(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE type IN ('DDL', 'RECURRING', 'COURSE') AND status = 'ACTIVE'
+                ORDER BY run_at, created_at
+                """,
+            ).fetchall()
+        return self._rows(rows)
+
+    def list_children(self, parent_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tasks WHERE parent_id = ? ORDER BY run_at, created_at",
+                (parent_id,),
+            ).fetchall()
+        return self._rows(rows)
+
+    def create_child_reminder(
+        self,
+        task_id: str,
+        parent_id: str,
+        occurrence_key: str,
+        group_id: str,
+        group_alias: str,
+        platform_id: str,
+        creator_id: str,
+        creator_private_origin: str,
+        created_at: str,
+        run_at: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO tasks
+                    (id, type, status, group_id, group_alias, platform_id,
+                     creator_id, creator_private_origin, created_at, run_at,
+                     payload, updated_at, parent_id, occurrence_key)
+                VALUES (?, 'REMINDER', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    group_id,
+                    group_alias,
+                    platform_id,
+                    creator_id,
+                    creator_private_origin,
+                    created_at,
+                    run_at,
+                    payload_json,
+                    created_at,
+                    parent_id,
+                    occurrence_key,
+                ),
+            )
+            self._conn.commit()
+        task = self.get_task(task_id)
+        if task is None:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT * FROM tasks WHERE parent_id = ? AND occurrence_key = ?",
+                    (parent_id, occurrence_key),
+                ).fetchone()
+            task = self._row(row)
+        if task is None:
+            raise KeyError(f"无法创建提醒子任务：{task_id}")
+        return task
+
     def get_active_collection(self, platform_id: str, group_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
@@ -434,6 +539,14 @@ class Storage:
                 self._conn.execute(
                     "UPDATE tasks SET status = 'PROCESSING', updated_at = ? WHERE id = ?",
                     (updated_at, task_id),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'CANCELLED', updated_at = ?, finished_at = ?
+                    WHERE parent_id = ? AND status = 'PENDING'
+                    """,
+                    (updated_at, updated_at, task_id),
                 )
                 self._conn.commit()
             except Exception:

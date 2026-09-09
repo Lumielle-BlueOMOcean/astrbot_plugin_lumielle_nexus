@@ -75,6 +75,12 @@ class QQAdapter:
             raise QQAdapterError("OneBot 返回的群成员列表格式不可识别")
         return [member for member in result if isinstance(member, dict)]
 
+    async def get_login_info(self) -> dict[str, Any]:
+        result = await self._call("get_login_info")
+        if not isinstance(result, dict):
+            raise QQAdapterError("OneBot 返回的登录信息格式不可识别")
+        return result
+
     async def send_group_message(self, group_id: str, message: list[dict[str, Any]]) -> Any:
         return await self._call(
             "send_group_msg",
@@ -97,6 +103,29 @@ class QQAdapter:
                 {"type": "text", "data": {"text": f" {str(text).strip()}"}},
             )
         return await self.send_group_message(group_id, message)
+
+    async def send_group_at_members(
+        self,
+        group_id: str,
+        user_ids: list[str],
+        text: str = "",
+    ) -> list[Any]:
+        """Mention members in batches to keep OneBot message chains bounded."""
+        normalized_ids = [
+            self._qq_id(user_id)
+            for user_id in user_ids
+            if str(user_id).strip()
+        ]
+        results: list[Any] = []
+        for start in range(0, len(normalized_ids), 20):
+            message: list[dict[str, Any]] = [
+                {"type": "at", "data": {"qq": user_id}}
+                for user_id in normalized_ids[start:start + 20]
+            ]
+            if str(text).strip():
+                message.append({"type": "text", "data": {"text": str(text)}})
+            results.append(await self.send_group_message(group_id, message))
+        return results
 
     async def send_private_message(self, user_id: str, text: str) -> Any:
         return await self._call(

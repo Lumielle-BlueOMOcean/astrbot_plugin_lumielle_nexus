@@ -1,13 +1,21 @@
 import json
 import importlib.util
+import sqlite3
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
-from core import TaskManager, collection_member_stats, format_local_time
+from core import (
+    TaskManager,
+    collection_member_stats,
+    format_local_time,
+    next_course_reminder_occurrence,
+    next_weekly_occurrence,
+)
 from exporter import export_collection
 from storage import Storage
 
@@ -56,23 +64,24 @@ class CoreSmokeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_due_reminder_recovers_after_storage_reopen(self):
         await self.manager.bind_group("班群", "123456789", "qq-main", "10001")
+        due_at = datetime.now(timezone.utc) + timedelta(seconds=1)
         task = await self.manager.create_reminder(
             "班群",
-            datetime.now(timezone.utc) - timedelta(minutes=1),
+            due_at,
             "重载后仍要发送",
             False,
             "qq-main",
             "10001",
             "origin",
         )
-        claimed = await self.manager.due_tasks(datetime.now(timezone.utc))
+        claimed = await self.manager.due_tasks(due_at + timedelta(seconds=1))
         self.assertEqual(claimed[0]["id"], task["id"])
         self.assertEqual(self.storage.get_task(task["id"])["status"], "PROCESSING")
 
         self.storage.close()
         reopened_storage = Storage(Path(self.temp_dir.name))
         reopened_manager = TaskManager(reopened_storage, timezone_name="Asia/Shanghai")
-        recovered = await reopened_manager.due_tasks(datetime.now(timezone.utc))
+        recovered = await reopened_manager.due_tasks(due_at + timedelta(seconds=1))
         self.assertEqual(recovered[0]["id"], task["id"])
         reopened_storage.close()
 
@@ -201,6 +210,301 @@ class CoreSmokeTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.complete_collection(task["id"], {"export_path": "/tmp/result.xlsx"})
         final = self.storage.get_task(task["id"])
         self.assertEqual(final["status"], "COMPLETED")
+
+
+class StorageMigrationTests(unittest.TestCase):
+    def test_old_database_is_migrated_without_losing_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "lumielle_nexus.db"
+            connection = sqlite3.connect(db_path)
+            connection.executescript(
+                """
+                CREATE TABLE group_bindings (
+                    alias TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    platform_id TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (platform_id, alias),
+                    UNIQUE (platform_id, group_id)
+                );
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    group_alias TEXT NOT NULL,
+                    platform_id TEXT NOT NULL,
+                    creator_id TEXT NOT NULL,
+                    creator_private_origin TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    run_at TEXT,
+                    payload TEXT NOT NULL,
+                    result TEXT NOT NULL DEFAULT '{}',
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    updated_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
+                CREATE TABLE collection_entries (
+                    task_id TEXT NOT NULL,
+                    sender_id TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    raw_message TEXT NOT NULL,
+                    parsed_data TEXT NOT NULL,
+                    submitted_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (task_id, sender_id),
+                    FOREIGN KEY (task_id) REFERENCES tasks(id)
+                );
+                """,
+            )
+            connection.execute(
+                "INSERT INTO group_bindings VALUES (?, ?, ?, ?, ?)",
+                ("班群", "123", "qq-main", "10001", "2026-09-09T00:00:00+00:00"),
+            )
+            connection.execute(
+                "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "R-old", "REMINDER", "PENDING", "123", "班群", "qq-main",
+                    "10001", "origin", "2026-09-09T00:00:00+00:00",
+                    "2026-09-10T00:00:00+00:00", "{}", "{}", 0, None,
+                    "2026-09-09T00:00:00+00:00", None,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "C-old", "COLLECTION", "ACTIVE", "123", "班群", "qq-main",
+                    "10001", "origin", "2026-09-09T00:00:00+00:00", None,
+                    json.dumps({"title": "旧统计", "fields": ["内容"]}), "{}", 0, None,
+                    "2026-09-09T00:00:00+00:00", None,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO collection_entries VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "C-old", "20001", "张三", "内容：已提交", '{"内容":"已提交"}',
+                    "2026-09-09T01:00:00+00:00", "2026-09-09T01:00:00+00:00",
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            storage = Storage(Path(temp_dir))
+            columns = {
+                row[1] for row in storage._conn.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            self.assertIn("parent_id", columns)
+            self.assertIn("occurrence_key", columns)
+            self.assertEqual(storage.get_binding("班群", "qq-main")["group_id"], "123")
+            self.assertEqual(storage.get_task("R-old")["status"], "PENDING")
+            self.assertEqual(len(storage.list_entries("C-old")), 1)
+
+            storage.create_task(
+                "D-parent", "DDL", "ACTIVE", "123", "班群", "qq-main", "10001",
+                "origin", "2026-09-09T00:00:00+00:00", None, {},
+            )
+            storage.create_task(
+                "R-child", "REMINDER", "PENDING", "123", "班群", "qq-main", "10001",
+                "origin", "2026-09-09T00:00:00+00:00", "2026-09-10T00:00:00+00:00", {},
+                parent_id="D-parent", occurrence_key="ddl:-60",
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                storage.create_task(
+                    "R-duplicate", "REMINDER", "PENDING", "123", "班群", "qq-main", "10001",
+                    "origin", "2026-09-09T00:00:00+00:00", "2026-09-10T00:00:00+00:00", {},
+                    parent_id="D-parent", occurrence_key="ddl:-60",
+                )
+            visible = {task["id"] for task in storage.list_tasks("qq-main")}
+            all_tasks = {task["id"] for task in storage.list_tasks("qq-main", include_children=True)}
+            self.assertIn("D-parent", visible)
+            self.assertNotIn("R-child", visible)
+            self.assertIn("R-child", all_tasks)
+            storage.close()
+
+
+class ScheduleCoreTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.storage = Storage(Path(self.temp_dir.name))
+        self.manager = TaskManager(self.storage, timezone_name="Asia/Shanghai", max_retry_count=3)
+        await self.manager.bind_group("班群", "123456789", "qq-main", "10001")
+
+    async def asyncTearDown(self):
+        self.storage.close()
+        self.temp_dir.cleanup()
+
+    async def test_weekly_occurrence_is_timezone_aware_and_respects_end_date(self):
+        shanghai = ZoneInfo("Asia/Shanghai")
+        after = datetime(2026, 9, 7, 8, 0, tzinfo=shanghai)
+        occurrence = next_weekly_occurrence(
+            after, [1, 3], "07:40", "Asia/Shanghai", start_date="2026-09-07",
+        )
+        self.assertEqual(occurrence, datetime(2026, 9, 8, 23, 40, tzinfo=timezone.utc))
+        self.assertEqual(
+            next_weekly_occurrence(
+                after, [1], "07:40", "Asia/Shanghai", start_date="2026-09-21",
+            ),
+            datetime(2026, 9, 20, 23, 40, tzinfo=timezone.utc),
+        )
+        self.assertIsNone(
+            next_weekly_occurrence(
+                datetime(2026, 9, 9, 8, 0, tzinfo=shanghai),
+                [1, 3], "07:40", "Asia/Shanghai", end_date="2026-09-09",
+            ),
+        )
+
+    async def test_course_reminder_can_cross_to_previous_local_date(self):
+        after = datetime(2026, 9, 6, 23, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        occurrence = next_course_reminder_occurrence(
+            after, [1], "00:10", 30, "Asia/Shanghai",
+        )
+        self.assertEqual(occurrence, datetime(2026, 9, 6, 15, 40, tzinfo=timezone.utc))
+
+    async def test_recurring_materializes_once_and_skips_stale_occurrence(self):
+        now = datetime(2026, 9, 7, 6, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        task = await self.manager.create_recurring_reminder(
+            "班群", [1, 3, 5], "07:40", "请打卡", False, "", "",
+            "qq-main", "10001", "origin", now=now,
+        )
+        self.assertEqual(task["id"][0], "S")
+        due = datetime(2026, 9, 6, 23, 41, tzinfo=timezone.utc)
+        created = await self.manager.materialize_due_schedules(due)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(len(await self.manager.materialize_due_schedules(due)), 0)
+        children = [
+            item for item in self.storage.list_tasks("qq-main", include_children=True)
+            if item.get("parent_id") == task["id"]
+        ]
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0]["status"], "PENDING")
+        parent = self.storage.get_task(task["id"])
+        self.assertEqual(parent["run_at"], "2026-09-08T23:40:00+00:00")
+
+        stale = await self.manager.materialize_due_schedules(
+            datetime(2026, 9, 8, 4, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(stale, [])
+        self.assertEqual(
+            self.storage.get_task(task["id"])["run_at"], "2026-09-08T23:40:00+00:00",
+        )
+
+    async def test_course_parent_stores_next_reminder_and_ends(self):
+        now = datetime(2026, 9, 7, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        task = await self.manager.create_course(
+            "班群", "高等数学", [1], "10:00", "A101", 20, "2026-09-07", "2026-09-07",
+            False, "qq-main", "10001", "origin", now=now,
+        )
+        self.assertEqual(task["type"], "COURSE")
+        self.assertEqual(task["run_at"], "2026-09-07T01:40:00+00:00")
+        await self.manager.materialize_due_schedules(
+            datetime(2026, 9, 7, 2, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(self.storage.get_task(task["id"])["status"], "COMPLETED")
+
+    async def test_ddl_materializes_future_offsets_and_cancels_children(self):
+        now = datetime(2026, 9, 14, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        task = await self.manager.create_ddl(
+            "班群", "高数作业", "2026-09-15 23:59", [4320, 1440, 180, 0, 180],
+            "", False, "qq-main", "10001", "origin", now=now,
+        )
+        payload = json.loads(task["payload"])
+        self.assertEqual(payload["remind_before_minutes"], [0, 180, 1440, 4320])
+        self.assertEqual(payload["skipped_offsets"], [4320])
+        children = [
+            item for item in self.storage.list_tasks("qq-main", include_children=True)
+            if item.get("parent_id") == task["id"]
+        ]
+        self.assertEqual(len(children), 3)
+        self.assertIn(0, [json.loads(child["payload"])["offset_minutes"] for child in children])
+        cancelled = await self.manager.cancel_task(task["id"], "qq-main")
+        self.assertEqual(cancelled["status"], "CANCELLED")
+        self.assertTrue(all(
+            child["status"] == "CANCELLED"
+            for child in self.storage.list_children(task["id"])
+        ))
+
+    async def test_ddl_rejects_past_deadline_and_invalid_offsets(self):
+        now = datetime(2026, 9, 9, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        with self.assertRaisesRegex(ValueError, "截止时间必须在未来"):
+            await self.manager.create_ddl(
+                "班群", "已过期", "2026-09-09 11:59", [0], "", False,
+                "qq-main", "10001", "origin", now=now,
+            )
+        with self.assertRaises(ValueError):
+            await self.manager.create_ddl(
+                "班群", "负数", "2026-09-15 11:59", [-1], "", False,
+                "qq-main", "10001", "origin", now=now,
+            )
+        with self.assertRaises(ValueError):
+            await self.manager.create_ddl(
+                "班群", "浮点", "2026-09-15 11:59", [1.5], "", False,
+                "qq-main", "10001", "origin", now=now,
+            )
+        with self.assertRaises(ValueError):
+            await self.manager.create_ddl(
+                "班群", "过大", "2026-09-15 11:59", [366 * 24 * 60 + 1], "", False,
+                "qq-main", "10001", "origin", now=now,
+            )
+
+    async def test_reminder_retry_moves_run_at_with_backoff_and_finalizes(self):
+        task = await self.manager.create_reminder(
+            "班群", datetime.now(timezone.utc) + timedelta(seconds=1), "重试", False,
+            "qq-main", "10001", "origin",
+        )
+        claimed = (await self.manager.due_tasks(
+            datetime.fromisoformat(task["run_at"]) + timedelta(seconds=1),
+        ))[0]
+        first = await self.manager.finish_reminder(claimed["id"], False, "失败1")
+        first_delay = datetime.fromisoformat(first["run_at"]) - datetime.now(timezone.utc)
+        self.assertGreaterEqual(first_delay.total_seconds(), 20)
+        self.assertLessEqual(first_delay.total_seconds(), 40)
+        second_claim = (await self.manager.due_tasks(
+            datetime.fromisoformat(first["run_at"]) + timedelta(seconds=1),
+        ))[0]
+        second = await self.manager.finish_reminder(second_claim["id"], False, "失败2")
+        second_delay = datetime.fromisoformat(second["run_at"]) - datetime.now(timezone.utc)
+        self.assertGreaterEqual(second_delay.total_seconds(), 110)
+        self.assertLessEqual(second_delay.total_seconds(), 130)
+        third_claim = (await self.manager.due_tasks(
+            datetime.fromisoformat(second["run_at"]) + timedelta(seconds=1),
+        ))[0]
+        third = await self.manager.finish_reminder(third_claim["id"], False, "失败3")
+        third_delay = datetime.fromisoformat(third["run_at"]) - datetime.now(timezone.utc)
+        self.assertGreaterEqual(third_delay.total_seconds(), 290)
+        self.assertLessEqual(third_delay.total_seconds(), 310)
+        final_claim = (await self.manager.due_tasks(
+            datetime.fromisoformat(third["run_at"]) + timedelta(seconds=1),
+        ))[0]
+        final = await self.manager.finish_reminder(final_claim["id"], False, "失败4")
+        self.assertEqual(final["status"], "FAILED")
+
+    async def test_standalone_reminder_rejects_old_time(self):
+        with self.assertRaisesRegex(ValueError, "提醒时间不能早于当前时间"):
+            await self.manager.create_reminder(
+                "班群", datetime.now(timezone.utc) - timedelta(seconds=120), "过期", False,
+                "qq-main", "10001", "origin",
+            )
+
+    async def test_collection_chase_is_a_durable_child_and_stops_with_collection(self):
+        collection = await self.manager.start_collection(
+            "班群", "缺交催办", ["内容"], "", False, "qq-main", "10001", "origin",
+        )
+        chase = await self.manager.schedule_collection_chase(
+            collection["id"], "2026-09-10 20:00", "请尽快提交", 60,
+            "qq-main", "10001", "origin",
+        )
+        chase_payload = json.loads(chase["payload"])
+        self.assertEqual(chase["parent_id"], collection["id"])
+        self.assertEqual(chase_payload["kind"], "collection_chase")
+        with self.assertRaisesRegex(ValueError, "至少 60 分钟"):
+            await self.manager.schedule_collection_chase(
+                collection["id"], "2026-09-10 21:00", "", 59,
+                "qq-main", "10001", "origin",
+            )
+        await self.manager.stop_collection(collection["id"], "qq-main")
+        self.assertEqual(self.storage.get_task(chase["id"])["status"], "CANCELLED")
 
 
 class CollectionExportTests(unittest.TestCase):
@@ -347,7 +651,7 @@ class PluginContractTests(unittest.TestCase):
         metadata = (self.ROOT / "metadata.yaml").read_text(encoding="utf-8")
         config = json.loads((self.ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         self.assertIn("name: astrbot_plugin_lumielle_nexus", metadata)
-        self.assertIn('version: "0.1.0"', metadata)
+        self.assertIn('version: "0.2.0"', metadata)
         self.assertIn('astrbot_version: ">=4.28.0,<5"', metadata)
         self.assertIn("- aiocqhttp", metadata)
         self.assertEqual(config["operator_ids"]["default"], [])
@@ -369,13 +673,25 @@ class PluginContractTests(unittest.TestCase):
             "nexus_start_collection",
             "nexus_collection_status",
             "nexus_stop_collection",
+            "nexus_get_task",
+            "nexus_create_ddl",
+            "nexus_create_recurring_reminder",
+            "nexus_create_course",
+            "nexus_schedule_collection_chase",
         ):
             self.assertIn(tool_name, main)
         self.assertIn("event_message_type", main)
         self.assertIn("command_group", main)
+        self.assertIn("materialize_due_schedules", main)
+        self.assertIn("send_group_at_members", main)
+        self.assertIn("1=Monday", main)
+        self.assertIn("/nexus task", main)
+        readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("0.2.0", readme)
+        self.assertIn("weekly", readme)
+        self.assertIn("at-least-once", readme)
         self.assertNotIn("event.stop_event()", main)
         self.assertIn("尚未执行的一次性提醒", main)
-        self.assertIn("at-least-once", (self.ROOT / "README.md").read_text(encoding="utf-8"))
 
     def test_package_style_core_import_uses_package_storage(self):
         package_name = "data.plugins.astrbot_plugin_lumielle_nexus"
@@ -500,6 +816,35 @@ class QQAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(action, "upload_private_file")
             self.assertTrue(kwargs["file"].startswith("base64://"))
             self.assertNotIn(str(path), kwargs["file"])
+
+    async def test_group_at_members_batches_twenty_mentions(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def call_action(self, action, **kwargs):
+                self.calls.append((action, kwargs))
+                return {"status": "ok"}
+
+        client = FakeClient()
+        platform = SimpleNamespace(
+            meta=lambda: SimpleNamespace(name="aiocqhttp", id="qq-main"),
+            get_client=lambda: client,
+        )
+        context = SimpleNamespace(get_platform_inst=lambda platform_id: platform)
+        from qq_adapter import QQAdapter
+
+        await QQAdapter(context, "qq-main").send_group_at_members(
+            "123", [str(value) for value in range(1, 46)], "请尽快提交",
+        )
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(
+            [len(call[1]["message"]) - 1 for call in client.calls], [20, 20, 5],
+        )
+        self.assertTrue(all(
+            call[1]["message"][-1]["data"]["text"] == "请尽快提交"
+            for call in client.calls
+        ))
 
 
 if __name__ == "__main__":
