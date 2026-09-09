@@ -12,3 +12,5 @@
 10. 跨群 relay 必须先展示 preview，再经过用户明确确认后发送。
 11. moderation 不得 automatic retry；中断时标记 outcome unknown。
 12. ordinary operator 权限不能隐式升级为 moderator，必须单独通过 moderator_ids 或 AstrBot Admin 授权。
+13. Collection natural-language extraction 默认关闭；deterministic parser 永远优先，只有显式 submission trigger 才能调用 LLM。
+14. LLM extraction 输出必须经过 deterministic validation 后才能写库；群消息 extraction 不得拥有 tools 或触发外部操作。

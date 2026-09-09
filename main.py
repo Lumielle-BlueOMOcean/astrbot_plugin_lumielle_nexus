@@ -22,6 +22,12 @@ if __package__:
         clamp_archive_retention_days,
         clamp_scheduler_interval,
         collection_member_stats,
+        COLLECTION_AI_COOLDOWN_SECONDS,
+        COLLECTION_AI_MAX_CONCURRENCY,
+        COLLECTION_AI_MAX_INPUT_CHARS,
+        COLLECTION_AI_TIMEOUT_SECONDS,
+        build_collection_extraction_prompt,
+        build_collection_extraction_system_prompt,
         deliver_mention_batches,
         deliver_text_chunks,
         format_local_time,
@@ -29,6 +35,8 @@ if __package__:
         member_display_name,
         member_role,
         next_interval_occurrence,
+        parse_ai_extraction_response,
+        validate_ai_extraction_candidate,
         resolve_member_refs,
         search_group_members,
         validate_moderation_preflight,
@@ -45,6 +53,12 @@ else:
         clamp_archive_retention_days,
         clamp_scheduler_interval,
         collection_member_stats,
+        COLLECTION_AI_COOLDOWN_SECONDS,
+        COLLECTION_AI_MAX_CONCURRENCY,
+        COLLECTION_AI_MAX_INPUT_CHARS,
+        COLLECTION_AI_TIMEOUT_SECONDS,
+        build_collection_extraction_prompt,
+        build_collection_extraction_system_prompt,
         deliver_mention_batches,
         deliver_text_chunks,
         format_local_time,
@@ -52,6 +66,8 @@ else:
         member_display_name,
         member_role,
         next_interval_occurrence,
+        parse_ai_extraction_response,
+        validate_ai_extraction_candidate,
         resolve_member_refs,
         search_group_members,
         validate_moderation_preflight,
@@ -92,6 +108,8 @@ class LumielleNexus(Star):
             str(value).strip() for value in moderator_ids if str(value).strip()
         }
         self._scheduler_task: asyncio.Task[None] | None = None
+        self._collection_ai_semaphore = asyncio.Semaphore(COLLECTION_AI_MAX_CONCURRENCY)
+        self._collection_ai_cooldowns: dict[tuple[str, str], float] = {}
 
     async def initialize(self) -> None:
         if self._scheduler_task is None or self._scheduler_task.done():
@@ -163,6 +181,18 @@ class LumielleNexus(Star):
             return json.loads(task.get("payload") or "{}")
         except (TypeError, json.JSONDecodeError):
             return {}
+
+    @staticmethod
+    def _llm_response_text(response: Any) -> str:
+        for attribute in ("completion_text", "text", "content"):
+            value = getattr(response, attribute, None)
+            if value:
+                return str(value).strip()
+        if isinstance(response, dict):
+            for key in ("completion_text", "text", "content"):
+                if response.get(key):
+                    return str(response[key]).strip()
+        return str(response).strip()
 
     @staticmethod
     def _event_source_message_id(event: AstrMessageEvent) -> str | None:
@@ -268,6 +298,7 @@ class LumielleNexus(Star):
                 lines.extend([
                     f"标题：{payload.get('title', '')}",
                     f"提交人数：{status['submitted_count']}",
+                    f"自然语言填写：{'开启' if payload.get('ai_extraction') else '关闭'}",
                 ])
             elif task["type"] == "SUMMARY":
                 lines.extend([
@@ -904,11 +935,33 @@ class LumielleNexus(Star):
         announcement: str = "",
         mention_all: bool = False,
         target_member_set: str = "",
+        ai_extraction: bool = False,
     ) -> str:
         allowed, message = self._authorized_for_control(event)
         if not allowed:
             return message
         try:
+            if not isinstance(ai_extraction, bool):
+                return "创建收集任务失败：ai_extraction 必须是布尔值。"
+            ai_provider_id = ""
+            if ai_extraction:
+                try:
+                    ai_provider_id = str(
+                        await self.context.get_current_chat_provider_id(
+                            event.unified_msg_origin,
+                        ) or "",
+                    ).strip()
+                except Exception:
+                    logger.exception("群枢自然语言收集 Provider 获取失败")
+                    return (
+                        "当前控制会话没有可用的 AstrBot LLM Provider，"
+                        "无法开启自然语言填写。可以关闭 ai_extraction 后使用标准字段格式提交。"
+                    )
+                if not ai_provider_id:
+                    return (
+                        "当前控制会话没有可用的 AstrBot LLM Provider，"
+                        "无法开启自然语言填写。可以关闭 ai_extraction 后使用标准字段格式提交。"
+                    )
             task = await self.manager.start_collection(
                 group,
                 title,
@@ -919,6 +972,8 @@ class LumielleNexus(Star):
                 event.get_sender_id(),
                 event.unified_msg_origin,
                 target_member_set,
+                ai_extraction,
+                ai_provider_id,
             )
             payload = self._payload(task)
             notice = payload.get("announcement") or (
@@ -926,6 +981,14 @@ class LumielleNexus(Star):
                 + "\n".join(f"{field}：" for field in payload["fields"])
                 + "\n\n直接在群内按以上格式发送即可。"
             )
+            if payload.get("ai_extraction"):
+                notice += (
+                    "\n\n也可以使用自然语言填写，但必须以“提交：”开头。\n"
+                    "例如：\n提交：我是张三，10月3日下午离校，7号晚上返校\n\n"
+                    "如需修改已提交内容，可使用：\n"
+                    "更正：返校时间改为10月8日晚上\n\n"
+                    "标准“字段：值”格式仍然最可靠。"
+                )
             try:
                 if payload.get("mention_all"):
                     await self._adapter(event).send_group_at_all(task["group_id"], notice)
@@ -964,6 +1027,7 @@ class LumielleNexus(Star):
                 f"{task['id']}：{self._payload(task).get('title', task['group_alias'])}",
                 f"状态：{task['status']}",
                 f"已提交：{submitted} 人",
+                f"自然语言填写：{'开启' if self._payload(task).get('ai_extraction') else '关闭'}",
             ]
             if members is not None:
                 lines.extend(
@@ -1396,6 +1460,126 @@ class LumielleNexus(Star):
             else "用法：/nexus collect-stop <任务ID>",
         )
 
+    @staticmethod
+    def _collection_ai_feedback(result: dict[str, Any]) -> str:
+        status = result.get("status")
+        if status == "saved":
+            applied = result.get("applied") or []
+            lines = ["已从自然语言提交中识别并记录："]
+            lines.extend(f"{item['field']}：{item['value']}" for item in applied)
+            ignored = list(dict.fromkeys(result.get("ignored_existing") or []))
+            if ignored:
+                lines.append(
+                    "以下字段已有记录，提交模式未覆盖：" + "、".join(ignored)
+                )
+            rejected = [
+                str(item.get("field")) for item in result.get("rejected", [])
+                if item.get("field")
+            ]
+            if rejected:
+                lines.append(
+                    "以下内容未可靠识别，未写入：" + "、".join(dict.fromkeys(rejected))
+                )
+            lines.append("如有识别错误，可使用：更正：……，或直接发送标准“字段：值”格式。")
+            return "\n".join(lines)
+        if status == "changed":
+            return (
+                "你的提交记录在识别期间已经发生变化，本次自然语言更正未自动写入。"
+                "请重新发送更正，或使用“字段：值”格式。"
+            )
+        if status == "no_change" and result.get("ignored_existing"):
+            return (
+                "已有字段未被提交模式覆盖："
+                + "、".join(dict.fromkeys(result["ignored_existing"]))
+                + "。如需修改，请使用“更正：……”或标准“字段：值”格式。"
+            )
+        return (
+            "没有可靠识别到可提交字段，本次未写入。\n"
+            "请使用例如：\n姓名：张三\n离校时间：10月3日下午"
+        )
+
+    async def _process_collection_ai_submission(
+        self,
+        event: AstrMessageEvent,
+        ai_context: dict[str, Any],
+        raw_message: str,
+    ) -> str | None:
+        body = str(ai_context.get("body") or "")
+        if not body:
+            return self._collection_ai_feedback({"status": "no_data", "rejected": []})
+        if len(body) > COLLECTION_AI_MAX_INPUT_CHARS:
+            return "自然语言提交内容过长，请缩短内容，或使用“字段：值”格式提交。"
+        task_id = str(ai_context.get("task_id") or "")
+        sender_id = str(event.get_sender_id())
+        cooldown_key = (task_id, sender_id)
+        now = asyncio.get_running_loop().time()
+        previous = self._collection_ai_cooldowns.get(cooldown_key)
+        if previous is not None and now - previous < COLLECTION_AI_COOLDOWN_SECONDS:
+            return "自然语言识别请求过于频繁，请稍后再试，或使用“字段：值”格式提交。"
+        self._collection_ai_cooldowns[cooldown_key] = now
+        payload = ai_context["payload"]
+        provider_id = str(payload.get("ai_provider_id") or "").strip()
+        if not provider_id:
+            return "当前自然语言识别服务不可用，请使用“字段：值”格式提交。"
+        try:
+            async with self._collection_ai_semaphore:
+                response = await asyncio.wait_for(
+                    self.context.llm_generate(
+                        chat_provider_id=provider_id,
+                        prompt=build_collection_extraction_prompt(
+                            payload["fields"], body, ai_context["mode"],
+                        ),
+                        system_prompt=build_collection_extraction_system_prompt(),
+                    ),
+                    timeout=COLLECTION_AI_TIMEOUT_SECONDS,
+                )
+        except asyncio.TimeoutError:
+            return "自然语言识别暂时超时，请重试，或使用“字段：值”格式提交。"
+        except Exception:
+            logger.exception("群枢自然语言收集 Provider 调用失败 %s/%s", task_id, sender_id)
+            return "当前自然语言识别服务暂不可用，请使用“字段：值”格式提交。"
+
+        try:
+            candidate = parse_ai_extraction_response(
+                self._llm_response_text(response),
+            )
+            validation = validate_ai_extraction_candidate(
+                candidate, payload["fields"], body,
+            )
+        except ValueError:
+            logger.info("群枢自然语言收集候选 JSON 无效 task=%s sender=%s", task_id, sender_id)
+            return self._collection_ai_feedback({"status": "invalid", "rejected": []})
+
+        accepted = validation["accepted"]
+        if not accepted:
+            logger.info(
+                "群枢自然语言收集候选未接受 task=%s sender=%s rejected=%s",
+                task_id,
+                sender_id,
+                [item.get("reason") for item in validation["rejected"]],
+            )
+            return self._collection_ai_feedback(validation)
+        try:
+            result = await self.manager.apply_collection_ai_candidate(
+                ai_context,
+                accepted,
+                raw_message,
+                event.get_sender_name(),
+            )
+        except Exception:
+            logger.exception("群枢自然语言收集候选保存失败 %s/%s", task_id, sender_id)
+            return "自然语言识别结果暂时无法保存，请使用“字段：值”格式提交。"
+        logger.info(
+            "群枢自然语言收集审计 task=%s sender=%s accepted=%s rejected=%s",
+            task_id,
+            sender_id,
+            [item["field"] for item in result.get("applied", [])],
+            [item.get("reason") for item in validation["rejected"]],
+        )
+        if result.get("status") == "saved" and not self.collection_ack:
+            return None
+        return self._collection_ai_feedback({**result, "rejected": validation["rejected"]})
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
         sender_id = str(event.get_sender_id())
@@ -1422,6 +1606,19 @@ class LumielleNexus(Star):
             message_text,
         )
         if result is None:
+            ai_context = await self.manager.get_collection_ai_context(
+                self._platform_id(event),
+                group_id,
+                sender_id,
+                message_text,
+            )
+            if ai_context is None:
+                return
+            feedback = await self._process_collection_ai_submission(
+                event, ai_context, message_text,
+            )
+            if feedback is not None:
+                yield event.plain_result(feedback)
             return
         if self.collection_ack:
             missing = result["missing"]
@@ -1671,8 +1868,9 @@ class LumielleNexus(Star):
         announcement: str = "",
         mention_all: bool = False,
         target_member_set: str = "",
+        ai_extraction: bool = False,
     ) -> str:
-        """在已绑定 QQ 群启动一次信息收集。创建后插件会在群里发送标题、字段格式和说明；同一群同时只能有一个 active collection。只能在私聊 operator 中调用。
+        """在已绑定 QQ 群启动一次信息收集。创建后插件会在群里发送标题、字段格式和说明；同一群同时只能有一个 active collection。只能在私聊 operator 中调用。自然语言填写默认关闭；只有用户明确要求允许自然语言填写、直接说人话提交或开启 AI 识别时才传 ai_extraction=true。开启后群成员仍必须以“提交：”或“更正：”开头，普通群聊不会调用 LLM。
 
         Args:
             group(string): 已绑定群别名或群号，例如“班群”。
@@ -1681,6 +1879,7 @@ class LumielleNexus(Star):
             announcement(string): 可选的群公告补充说明。
             mention_all(boolean): 是否在启动公告中 @全体成员。
             target_member_set(string): 可选的群内成员集合名称；创建时会 snapshot 成员，后续名单变化不影响本次收集。
+            ai_extraction(boolean): 是否显式开启带固定 AstrBot LLM Provider 的自然语言填写；默认 false，除非用户明确要求，否则不要传 true。
         """
         return await self._start_collection(
             event,
@@ -1690,6 +1889,7 @@ class LumielleNexus(Star):
             announcement,
             mention_all,
             target_member_set,
+            ai_extraction,
         )
 
     @filter.llm_tool(name="nexus_collection_status")
