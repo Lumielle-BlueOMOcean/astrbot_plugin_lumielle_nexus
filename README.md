@@ -2,7 +2,7 @@
 
 微光·群枢（Lumielle Nexus）是一个面向 AstrBot 的跨会话群任务编排插件，让私聊成为控制台，让群聊成为可调度的工作空间。
 
-当前版本：`0.2.0`
+当前版本：`0.2.1`
 
 ## 项目定位
 
@@ -38,7 +38,7 @@ python3 -m pip install -r requirements.txt
 
 - `operator_ids`：额外允许控制插件的 QQ 用户 ID；AstrBot Admin 始终允许。
 - `timezone`：默认 `Asia/Shanghai`。
-- `scheduler_interval_seconds`：默认 15 秒，运行时限制在 5–3600 秒。
+- `scheduler_interval_seconds`：默认 15 秒，运行时限制在 5–60 秒。
 - `max_retry_count`：提醒发送失败的最大重试次数，默认 3。
 - `collection_ack`：是否确认群成员提交，默认开启。
 
@@ -112,6 +112,8 @@ python3 -m pip install -r requirements.txt
 DDL 会创建一个逻辑父任务，并为仍在未来的提前时间生成内部一次性提醒；例如 `4320、1440、180` 分钟分别代表提前 3 天、1 天和 3 小时。过去的提前时间会跳过，截止时间必须在未来。
 
 周期提醒和课程提醒只保留下一次 occurrence。Bot 停机期间错过的旧 occurrence 默认跳过，恢复后不补发陈旧的上课或打卡消息；刚错过且在约 120 秒宽限期内的 occurrence 仍可执行。内部子提醒默认不会出现在普通任务列表中。
+
+DDL、周期提醒和课程提醒的内部子提醒都遵循同一条 120 秒发送宽限：停机后明显过期的子提醒会标记为 skipped，不会补发；独立的一次性提醒和已经进入 retry backoff 的提醒仍按持久化队列恢复执行。
 
 信息收集催办会在执行时重新获取群成员，只 @有效且尚未提交的成员；没有未提交成员时不发送消息，重复催办最短间隔为 60 分钟，统计结束后后续催办会自动跳过。
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,12 +14,24 @@ from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.star import Context, Star, StarTools
 
 if __package__:
-    from .core import TaskManager, collection_member_stats, format_local_time
+    from .core import (
+        TaskManager,
+        clamp_scheduler_interval,
+        collection_member_stats,
+        format_local_time,
+        next_interval_occurrence,
+    )
     from .exporter import export_collection
     from .qq_adapter import QQAdapter, QQAdapterError
     from .storage import Storage
 else:
-    from core import TaskManager, collection_member_stats, format_local_time
+    from core import (
+        TaskManager,
+        clamp_scheduler_interval,
+        collection_member_stats,
+        format_local_time,
+        next_interval_occurrence,
+    )
     from exporter import export_collection
     from qq_adapter import QQAdapter, QQAdapterError
     from storage import Storage
@@ -40,8 +52,9 @@ class LumielleNexus(Star):
         )
         operator_ids = self.config.get("operator_ids", []) or []
         self.operator_ids = {str(value).strip() for value in operator_ids if str(value).strip()}
-        interval = int(self.config.get("scheduler_interval_seconds", 15))
-        self.scheduler_interval_seconds = max(5, min(interval, 3600))
+        self.scheduler_interval_seconds = clamp_scheduler_interval(
+            self.config.get("scheduler_interval_seconds", 15),
+        )
         self.collection_ack = bool(self.config.get("collection_ack", True))
         self._scheduler_task: asyncio.Task[None] | None = None
 
@@ -337,8 +350,9 @@ class LumielleNexus(Star):
                 await self.manager.materialize_due_schedules()
                 for task in await self.manager.due_tasks():
                     try:
-                        await self._execute_reminder(task)
-                        await self.manager.finish_reminder(task["id"], True)
+                        executed = await self._execute_reminder(task)
+                        if executed:
+                            await self.manager.finish_reminder(task["id"], True)
                     except Exception as exc:
                         logger.exception("群枢提醒任务执行失败 %s", task.get("id"))
                         try:
@@ -351,16 +365,25 @@ class LumielleNexus(Star):
                 logger.exception("群枢 scheduler 迭代失败")
             await asyncio.sleep(self.scheduler_interval_seconds)
 
-    async def _execute_reminder(self, task: dict[str, Any]) -> None:
+    async def _execute_reminder(self, task: dict[str, Any]) -> bool:
+        skip_reason = await self.manager.reminder_skip_reason(task)
+        if skip_reason:
+            await self.manager.skip_reminder(
+                task["id"],
+                skip_reason,
+                status="CANCELLED" if skip_reason == "parent_cancelled" else "COMPLETED",
+            )
+            return False
         payload = self._payload(task)
         if payload.get("kind") == "collection_chase":
             await self._execute_collection_chase(task, payload)
-            return
+            return True
         adapter = QQAdapter(self.context, task["platform_id"])
         if payload.get("mention_all"):
             await adapter.send_group_at_all(task["group_id"], payload["message"])
         else:
             await adapter.send_group_text(task["group_id"], payload["message"])
+        return True
 
     async def _execute_collection_chase(
         self,
@@ -387,9 +410,15 @@ class LumielleNexus(Star):
         interval = int(payload.get("repeat_interval_minutes") or 0)
         if interval:
             try:
+                scheduled_run_at = payload.get("scheduled_run_at") or task["run_at"]
+                next_run = next_interval_occurrence(
+                    scheduled_run_at,
+                    interval,
+                    datetime.now(timezone.utc),
+                )
                 await self.manager.schedule_collection_chase(
                     collection["id"],
-                    datetime.now(timezone.utc) + timedelta(minutes=interval),
+                    next_run,
                     payload["message"],
                     interval,
                     task["platform_id"],

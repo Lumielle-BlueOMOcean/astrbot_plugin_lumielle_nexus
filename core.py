@@ -16,6 +16,7 @@ else:
     from storage import Storage
 
 UTC = timezone.utc
+SCHEDULE_GRACE_SECONDS = 120
 
 
 def utc_now_iso() -> str:
@@ -97,6 +98,61 @@ def _coerce_nonnegative_int(value: Any, label: str) -> int:
     if number < 0:
         raise ValueError(f"{label} 必须是非负整数")
     return number
+
+
+def clamp_scheduler_interval(value: Any) -> int:
+    try:
+        interval = int(value)
+    except (TypeError, ValueError):
+        interval = 15
+    return max(5, min(interval, 60))
+
+
+def next_interval_occurrence(
+    base_run_at: str | datetime,
+    interval_minutes: int,
+    now: str | datetime,
+) -> datetime:
+    """Return the first cadence occurrence strictly after ``now``."""
+    interval_minutes = _coerce_nonnegative_int(
+        interval_minutes, "重复催办间隔",
+    )
+    if interval_minutes == 0:
+        raise ValueError("重复催办间隔必须大于 0")
+    base = _as_utc(base_run_at)
+    current = _as_utc(now)
+    interval = timedelta(minutes=interval_minutes)
+    next_run = base + interval
+    if next_run <= current:
+        elapsed_intervals = int(
+            (current - base).total_seconds() // interval.total_seconds(),
+        ) + 1
+        next_run = base + elapsed_intervals * interval
+    return next_run
+
+
+def should_skip_stale_reminder(
+    task: dict[str, Any],
+    now: str | datetime,
+    grace_seconds: int = SCHEDULE_GRACE_SECONDS,
+) -> bool:
+    """Return whether a non-retry schedule child missed its send window."""
+    try:
+        payload = task.get("payload") or {}
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        kind = payload.get("kind") if isinstance(payload, dict) else None
+        if kind not in {"schedule", "ddl"}:
+            return False
+        if int(task.get("retry_count") or 0) > 0:
+            return False
+        run_at = task.get("run_at")
+        if not run_at:
+            return False
+        age = (_as_utc(now) - _as_utc(str(run_at))).total_seconds()
+        return age > grace_seconds
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def _normalize_weekdays(weekdays: list[int]) -> list[int]:
@@ -783,6 +839,7 @@ class TaskManager:
                     "collection_task_id": collection["id"],
                     "message": clean_message,
                     "repeat_interval_minutes": repeat_interval_minutes,
+                    "scheduled_run_at": run_at_iso,
                     "mention_all": False,
                 },
             )
@@ -793,6 +850,48 @@ class TaskManager:
                 str(task_id).strip(), platform_id, utc_now_iso(),
             )
             return {"task": task, "entries": self.storage.list_entries(task["id"])}
+
+    async def reminder_skip_reason(
+        self,
+        task: dict[str, Any],
+        now: datetime | None = None,
+    ) -> str | None:
+        """Check claimed reminder semantics immediately before external sending."""
+        async with self.lock:
+            current = self._now_utc(now)
+            current_task = self.storage.get_task(str(task["id"])) or task
+            payload = current_task.get("payload") or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    payload = {}
+            kind = payload.get("kind") if isinstance(payload, dict) else None
+            if kind in {"schedule", "ddl"} and current_task.get("parent_id"):
+                parent = self.storage.get_task(str(current_task["parent_id"]))
+                if parent is None or parent["status"] == "CANCELLED":
+                    return "parent_cancelled"
+            if should_skip_stale_reminder(current_task, current):
+                return "stale_schedule"
+            return None
+
+    async def skip_reminder(
+        self,
+        task_id: str,
+        reason: str,
+        status: str = "COMPLETED",
+    ) -> dict[str, Any]:
+        if status not in {"COMPLETED", "CANCELLED"}:
+            raise ValueError("跳过提醒只能进入 COMPLETED 或 CANCELLED")
+        async with self.lock:
+            now = utc_now_iso()
+            return self.storage.update_task(
+                task_id,
+                status=status,
+                result={"skipped": True, "reason": str(reason)},
+                updated_at=now,
+                finished_at=now,
+            )
 
     def _next_schedule_occurrence(
         self,

@@ -16,7 +16,7 @@
     "type": "int",
     "description": "提醒 scheduler 检查间隔（秒）",
     "default": 15,
-    "hint": "运行时会限制在 5 到 3600 秒之间。"
+    "hint": "运行时会限制在 5 到 60 秒之间。"
   },
   "max_retry_count": {
     "type": "int",

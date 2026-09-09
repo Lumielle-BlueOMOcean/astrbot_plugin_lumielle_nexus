@@ -11,10 +11,13 @@ from zoneinfo import ZoneInfo
 
 from core import (
     TaskManager,
+    clamp_scheduler_interval,
     collection_member_stats,
     format_local_time,
+    next_interval_occurrence,
     next_course_reminder_occurrence,
     next_weekly_occurrence,
+    should_skip_stale_reminder,
 )
 from exporter import export_collection
 from storage import Storage
@@ -506,6 +509,129 @@ class ScheduleCoreTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.stop_collection(collection["id"], "qq-main")
         self.assertEqual(self.storage.get_task(chase["id"])["status"], "CANCELLED")
 
+    async def test_stale_ddl_child_is_skipped_without_retry(self):
+        now = datetime(2026, 9, 9, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        parent = await self.manager.create_ddl(
+            "班群", "三天后截止", "2026-09-12 12:00", [2880], "", False,
+            "qq-main", "10001", "origin", now=now,
+        )
+        child = self.storage.list_children(parent["id"])[0]
+        stale_at = datetime.fromisoformat(child["run_at"]) + timedelta(seconds=121)
+        self.assertTrue(should_skip_stale_reminder(child, stale_at))
+        self.assertEqual(
+            await self.manager.reminder_skip_reason(child, stale_at),
+            "stale_schedule",
+        )
+        skipped = await self.manager.skip_reminder(child["id"], "stale_schedule")
+        self.assertEqual(skipped["status"], "COMPLETED")
+        self.assertEqual(json.loads(skipped["result"]), {
+            "skipped": True, "reason": "stale_schedule",
+        })
+        self.assertEqual(skipped["retry_count"], 0)
+
+    async def test_materialized_recurring_and_course_children_skip_after_grace(self):
+        recurring_now = datetime(2026, 9, 7, 6, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        recurring = await self.manager.create_recurring_reminder(
+            "班群", [1], "07:40", "请打卡", False, "", "",
+            "qq-main", "10001", "origin", now=recurring_now,
+        )
+        recurring_run = datetime.fromisoformat(recurring["run_at"])
+        recurring_children = await self.manager.materialize_due_schedules(
+            recurring_run + timedelta(seconds=1),
+        )
+        recurring_child = recurring_children[0]
+        self.assertTrue(
+            should_skip_stale_reminder(
+                recurring_child, recurring_run + timedelta(seconds=121),
+            ),
+        )
+
+        course = await self.manager.create_course(
+            "班群", "高等数学", [1], "10:00", "A101", 20,
+            "2026-09-07", "", False, "qq-main", "10001", "origin",
+            now=recurring_now,
+        )
+        course_run = datetime.fromisoformat(course["run_at"])
+        course_children = await self.manager.materialize_due_schedules(
+            course_run + timedelta(seconds=1),
+        )
+        self.assertTrue(
+            should_skip_stale_reminder(
+                course_children[0], course_run + timedelta(seconds=121),
+            ),
+        )
+
+    async def test_standalone_old_reminder_is_not_stale_skipped(self):
+        task = self.storage.create_task(
+            "R-old", "REMINDER", "PENDING", "123456789", "班群", "qq-main",
+            "10001", "origin", "2026-09-09T00:00:00+00:00",
+            "2026-09-09T01:00:00+00:00", {"message": "必须发送"},
+        )
+        claimed = await self.manager.due_tasks(
+            datetime(2026, 9, 12, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(claimed[0]["id"], task["id"])
+        self.assertFalse(should_skip_stale_reminder(
+            claimed[0], datetime(2026, 9, 12, 0, 0, tzinfo=timezone.utc),
+        ))
+        self.assertIsNone(await self.manager.reminder_skip_reason(
+            claimed[0], datetime(2026, 9, 12, 0, 0, tzinfo=timezone.utc),
+        ))
+
+    async def test_cancelled_parent_blocks_processing_child_before_send(self):
+        now = datetime(2026, 9, 9, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        parent = await self.manager.create_ddl(
+            "班群", "待取消", "2026-09-12 12:00", [0], "", False,
+            "qq-main", "10001", "origin", now=now,
+        )
+        child = self.storage.list_children(parent["id"])[0]
+        claimed = (await self.manager.due_tasks(
+            datetime.fromisoformat(child["run_at"]) + timedelta(seconds=1),
+        ))[0]
+        await self.manager.cancel_task(parent["id"], "qq-main")
+        self.assertEqual(
+            await self.manager.reminder_skip_reason(claimed),
+            "parent_cancelled",
+        )
+        skipped = await self.manager.skip_reminder(
+            claimed["id"], "parent_cancelled", status="CANCELLED",
+        )
+        self.assertEqual(skipped["status"], "CANCELLED")
+        self.assertEqual(json.loads(skipped["result"]), {
+            "skipped": True, "reason": "parent_cancelled",
+        })
+
+    async def test_repeating_chase_uses_logical_cadence_and_is_idempotent(self):
+        collection = await self.manager.start_collection(
+            "班群", "催办", ["内容"], "", False, "qq-main", "10001", "origin",
+        )
+        base = datetime(2026, 9, 9, 12, 0, tzinfo=timezone.utc)
+        execution_time = base + timedelta(minutes=3)
+        next_run = next_interval_occurrence(base, 60, execution_time)
+        self.assertEqual(next_run, base + timedelta(hours=1))
+        self.assertEqual(
+            next_interval_occurrence(base, 60, base + timedelta(days=2)),
+            base + timedelta(days=2, hours=1),
+        )
+        first = await self.manager.schedule_collection_chase(
+            collection["id"], base, "请提交", 60, "qq-main", "10001", "origin",
+        )
+        second = await self.manager.schedule_collection_chase(
+            collection["id"], next_run, "请提交", 60, "qq-main", "10001", "origin",
+        )
+        duplicate = await self.manager.schedule_collection_chase(
+            collection["id"], next_run, "请提交", 60, "qq-main", "10001", "origin",
+        )
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(second["id"], duplicate["id"])
+        self.assertEqual(len(self.storage.list_children(collection["id"])), 2)
+
+    def test_scheduler_interval_is_clamped_to_one_minute(self):
+        self.assertEqual(
+            [clamp_scheduler_interval(value) for value in (1, 15, 600, 3600)],
+            [5, 15, 60, 60],
+        )
+
 
 class CollectionExportTests(unittest.TestCase):
     def test_export_contains_requested_sheets_and_safe_filename(self):
@@ -651,7 +777,7 @@ class PluginContractTests(unittest.TestCase):
         metadata = (self.ROOT / "metadata.yaml").read_text(encoding="utf-8")
         config = json.loads((self.ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         self.assertIn("name: astrbot_plugin_lumielle_nexus", metadata)
-        self.assertIn('version: "0.2.0"', metadata)
+        self.assertIn('version: "0.2.1"', metadata)
         self.assertIn('astrbot_version: ">=4.28.0,<5"', metadata)
         self.assertIn("- aiocqhttp", metadata)
         self.assertEqual(config["operator_ids"]["default"], [])
@@ -687,7 +813,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("1=Monday", main)
         self.assertIn("/nexus task", main)
         readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("0.2.0", readme)
+        self.assertIn("0.2.1", readme)
         self.assertIn("weekly", readme)
         self.assertIn("at-least-once", readme)
         self.assertNotIn("event.stop_event()", main)
