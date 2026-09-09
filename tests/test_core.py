@@ -1289,7 +1289,7 @@ class PluginContractTests(unittest.TestCase):
         config = json.loads((self.ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         self.assertIn("name: astrbot_plugin_lumielle_nexus", metadata)
         self.assertIn('version: "0.6.0"', metadata)
-        self.assertIn('astrbot_version: ">=4.28.0,<5"', metadata)
+        self.assertIn('astrbot_version: ">=4.25.5,<5"', metadata)
         self.assertIn("- aiocqhttp", metadata)
         self.assertEqual(config["operator_ids"]["default"], [])
         self.assertEqual(config["timezone"]["default"], "Asia/Shanghai")

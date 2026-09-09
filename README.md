@@ -3,7 +3,7 @@
 > 一个面向 AstrBot + QQ 的跨会话群事务编排插件。
 
 [![Version](https://img.shields.io/badge/version-0.6.0-7c5cff.svg)](metadata.yaml)
-[![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.28.0%2C%3C5-4b8bbe.svg)](https://github.com/AstrBotDevs/AstrBot)
+[![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.25.5%2C%3C5-4b8bbe.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![Platform](https://img.shields.io/badge/platform-aiocqhttp%20%2F%20OneBot%20v11-12a594.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
@@ -12,7 +12,7 @@
 | 项目 | 当前版本 |
 | --- | --- |
 | Version | `0.6.0` |
-| AstrBot | `>=4.28.0,<5` |
+| AstrBot | `>=4.25.5,<5` |
 | Platform | `aiocqhttp` / OneBot v11（QQ，主要面向 NapCat） |
 | License | MIT |
 
@@ -30,6 +30,14 @@
 | QQ 群管理员控制 | ✅ 当前绑定群内支持有限控制 |
 | 自动测试 | ✅ 129 项 |
 | Real-world QQ / NapCat / Provider validation | 🧪 仍需按实际部署验证 |
+
+## 🔗 Compatibility
+
+- AstrBot：`>=4.25.5,<5`
+- 平台：`aiocqhttp` / OneBot v11（QQ，主要面向 NapCat）
+- 最低兼容版本已在独立临时环境使用 AstrBot 4.25.5 官方源码完成 loader smoke，插件可导入、初始化并注册 31 个工具。
+- AstrBot 4.28.0 loader smoke 同样通过。
+- 上述是代码级兼容性验证，不代表已经完成真实 QQ、NapCat 或 LLM Provider E2E 验证。
 
 ✅ 表示代码实现和自动化验证已完成；🧪 不代表已经在真实 QQ、NapCat 或付费 LLM Provider 环境中做过生产验证。
 
@@ -296,7 +304,7 @@ prepare → preview → explicit confirm → execute
 
 ### 插件加载失败
 
-在 `WebUI → 插件` 查看具体错误，先确认 AstrBot 版本满足 `>=4.28.0,<5`、Python 依赖已安装，再尝试插件页面的一键重载。不要删除 plugin data 作为排错手段。
+在 `WebUI → 插件` 查看具体错误，先确认 AstrBot 版本满足 `>=4.25.5,<5`、Python 依赖已安装，再尝试插件页面的一键重载。不要删除 plugin data 作为排错手段。
 
 ### 缺少 Python dependency
 
@@ -347,7 +355,7 @@ python3 -m unittest discover -s tests -v
 git diff --check
 ```
 
-结果为 129 项测试通过，AstrBot 4.28.0 官方源码 loader smoke 通过，31 个工具成功注册。当前没有进行真实 LLM 消耗测试，也没有在真实群执行 mute/kick 或发送测试 spam。
+结果为 129 项测试通过，AstrBot 4.25.5 与 4.28.0 官方源码 loader smoke 均通过，31 个工具成功注册。当前没有进行真实 LLM 消耗测试，也没有在真实群执行 mute/kick 或发送测试 spam。
 
 ## ⚖️ License
 
