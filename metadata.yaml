@@ -1,6 +1,6 @@
 name: astrbot_plugin_lumielle_nexus
 display_name: 微光·群枢 / Lumielle Nexus
-desc: 通过私聊创建和管理面向 QQ 群的任务、信息收集、消息归档、成员集合与安全群管理操作。
+desc: 面向 QQ 群的跨会话任务编排插件，支持提醒、DDL、信息收集、checkpoint 语义分析、成员身份、消息归档、跨群转述与安全群管理。
 version: "0.6.0"
 author: Lumielle-BlueOMOcean
 repo: https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_lumielle_nexus

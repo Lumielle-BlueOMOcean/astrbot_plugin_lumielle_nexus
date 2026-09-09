@@ -1,67 +1,101 @@
-# 微光·群枢 / Lumielle Nexus
+# 🌌 微光·群枢 / Lumielle Nexus
 
-微光·群枢（Lumielle Nexus）是一个面向 AstrBot 的跨会话群任务编排插件，让私聊成为控制台，让群聊成为可调度的工作空间。
+> 一个面向 AstrBot + QQ 的跨会话群事务编排插件。
 
-当前版本：`0.6.0`
+[![Version](https://img.shields.io/badge/version-0.6.0-7c5cff.svg)](metadata.yaml)
+[![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.28.0%2C%3C5-4b8bbe.svg)](https://github.com/AstrBotDevs/AstrBot)
+[![Platform](https://img.shields.io/badge/platform-aiocqhttp%20%2F%20OneBot%20v11-12a594.svg)](https://github.com/AstrBotDevs/AstrBot)
+[![License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
-## 项目定位
+微光·群枢（Lumielle Nexus）让私聊成为控制台，让群聊成为可调度的工作空间。它把提醒、DDL、信息收集、群消息事实、成员身份和安全操作持久化到同一个轻量 SQLite 任务系统中。
 
-插件面向 QQ + OneBot v11，首轮正式支持 AstrBot 的 `aiocqhttp` 平台，主要适配 NapCat。operator 通过私聊绑定目标群、创建提醒或收集任务，也可以在授权范围内归档和整理已保存的群文本。
+| 项目 | 当前版本 |
+| --- | --- |
+| Version | `0.6.0` |
+| AstrBot | `>=4.28.0,<5` |
+| Platform | `aiocqhttp` / OneBot v11（QQ，主要面向 NapCat） |
+| License | MIT |
 
-## 当前支持
+## 📊 当前状态
 
-- 私聊绑定群别名、查看群和任务。
-- 持久化单次提醒、DDL 提前提醒、每周周期提醒和课程提醒。
-- 在群内启动信息收集，支持字段解析、重复提交更新、checkpoint 增量分析、进度查询和 XLSX 导出。
-- 收集结束后尝试通过 QQ 私聊回传 Excel；回传失败不会丢失导出文件。
-- 消息归档、关键词/时间范围查询、按需群聊总结。
-- 每周自动总结，并将结果私聊发给创建者。
-- 跨群转述采用 prepare → preview → explicit confirm → send 流程。
-- 按群隔离的成员搜索和成员集合，可用于定向收集和 Relay @成员集合。
-- 默认关闭的单成员 mute、unmute、kick，采用独立 moderator 权限和确认预览。
-- Collection workflow 会持久化捕获自然语言消息，在催办/截止/状态 refresh 时按 checkpoint 批量分析，不会逐消息调用 LLM。
-- 成员身份字段（姓名、学号）可由标准提交和 checkpoint 学习，也可由 operator/当前群管理员核验维护。
+| 模块 | 状态 |
+| --- | --- |
+| Reminder / DDL / recurring / course | ✅ 已实现 |
+| Collection | ✅ 已实现 |
+| Checkpoint semantic workflow | ✅ 已实现 |
+| Identity DB | ✅ 已实现 |
+| Archive / Summary | ✅ 已实现 |
+| Relay | ✅ 已实现 |
+| Moderation | ✅ 已实现，默认关闭 |
+| QQ 群管理员控制 | ✅ 当前绑定群内支持有限控制 |
+| 自动测试 | ✅ 129 项 |
+| Real-world QQ / NapCat / Provider validation | 🧪 仍需按实际部署验证 |
 
-## 安装
+✅ 表示代码实现和自动化验证已完成；🧪 不代表已经在真实 QQ、NapCat 或付费 LLM Provider 环境中做过生产验证。
 
-将本仓库目录放入 AstrBot 插件目录并重载插件，安装依赖：
+## ✨ 能做什么
 
-```bash
-pip install -r requirements.txt
+### ⏰ 任务调度
+
+- 单次 Reminder。
+- DDL 及提前提醒。
+- recurring reminder。
+- course reminder。
+- 插件重载后从 SQLite 恢复未完成任务。
+
+### 📋 Collection 信息收集
+
+- 按字段收集群成员信息，重复提交自动更新。
+- 可按成员集合定向收集，并在创建时固定目标快照。
+- 标准字段消息立即确定性写入；自然语言填写由持久化 workflow capture 和增量 checkpoint 统一处理。
+- checkpoint 催办、deadline finalize、missing default 和 XLSX 导出。
+- 成员身份字段可从标准提交和可信 checkpoint 结果学习，并支持 operator/当前群管理员核验。
+
+### 🧠 群消息事实与 AI
+
+- 群消息 Archive 默认关闭，开启后才记录新的文本消息。
+- 按关键词、时间范围检索已保存的群文本。
+- 按需群聊总结和自动周总结。
+- 群消息不会逐条调用 LLM：平时先持久化 capture，checkpoint 只处理 cursor 之后的新消息。
+- 总结模型只负责整理，不会自动创建 DDL 或其他任务。
+
+### 🔐 协作与安全操作
+
+- 跨群 Relay 使用 `prepare → preview → explicit confirm → send`。
+- 成员集合按群隔离，可用于定向 Collection 和 Relay @成员集合。
+- 单成员 mute、unmute、kick 默认关闭，使用独立 moderator 权限和确认预览。
+
+## 🔄 Collection 工作流
+
+```mermaid
+flowchart LR
+    A[创建统计任务] --> B[群消息持久化 Capture]
+    B --> C[19:00 Checkpoint]
+    C --> D[@ 未形成有效结果成员]
+    D --> E[继续 Capture]
+    E --> F[20:00 Finalize]
+    F --> G[默认值]
+    G --> H[XLSX]
 ```
 
-需要 AstrBot `>=4.28.0,<5`、`aiocqhttp`/OneBot v11 平台和可用的 AstrBot LLM Provider。运行数据由 AstrBot plugin data directory 管理，默认位于 `data/plugin_data/astrbot_plugin_lumielle_nexus/`，不会写入仓库。
+典型流程是：平时只做持久化 capture，19:00 批量分析新增消息并催办，20:00 使用逻辑截止时间做最后一次 checkpoint、应用默认值并导出。checkpoint 只读取新增 cursor，不会重复分析整段历史。
 
-## 配置
+## 🚀 30 秒上手
 
-- `operator_ids`：允许控制插件的额外 QQ 用户 ID；AstrBot Admin 始终允许。
-- `timezone`：默认 `Asia/Shanghai`。
-- `scheduler_interval_seconds`：默认 15 秒，运行时限制在 5–60 秒。
-- `max_retry_count`：群提醒失败后的最大重试次数，默认 3。
-- `collection_ack`：是否确认群成员提交，默认开启。
-- `archive_max_message_chars`：单条归档文本最大 4000 字符，运行时限制在 256–20000。
-- `archive_retention_days`：默认保留 90 天；设为 0 表示不自动清理，其他值限制在 7–3650 天。
-- `moderation_enabled`：默认 `false`；必须主动开启才允许群管理。
-- `moderator_ids`：独立的群管理 QQ 用户 ID 列表，不会自动继承 `operator_ids`。
-
-跨群和隐私敏感控制（绑定、归档设置/清理/查询、总结、Relay）要求来自私聊，并由 AstrBot Admin 或 `operator_ids` 授权。绑定群内的任务和成员名单控制也可以由该当前群的 QQ 群主/管理员发起，但不能跨群；群管理操作另受独立 moderator 权限域约束。
-
-## 群绑定与提醒
-
-先在私聊中绑定群：
+完成安装和配置后，先在私聊绑定目标群：
 
 ```text
 /nexus bind 班群 123456789
 /nexus groups
 ```
 
-之后可以直接私聊：
+然后可以直接私聊自然语言：
 
 ```text
 明天下午三点在班群提醒所有人交实验报告。
 ```
 
-也可以使用可靠的命令 fallback：
+也可以使用命令 fallback：
 
 ```text
 /nexus tasks
@@ -69,104 +103,250 @@ pip install -r requirements.txt
 /nexus cancel R-...
 ```
 
-DDL、周期、课程和 collection chase 都会持久化，插件重载后由同一个 scheduler 恢复。停机期间错过过久的周期/课程/DDL 提前提醒会跳过，普通单次提醒仍保持 durable 行为。
+## 📋 真实 Collection 示例
 
-发送队列采用持久化的 at-least-once 执行语义；需要避免重复外部操作的 relay 则不进入自动重试队列。
-
-## 数据收集与 Excel
-
-例如私聊：
+管理员可以在私聊中，或在当前绑定群由 QQ 群主/管理员发起当前群控制：
 
 ```text
-在班群统计国庆离校信息，需要姓名、离校时间、返校时间，现在开始。
+现在统计大家的返校情况，
+19点提醒还没回复的同学，
+20点截止，
+没回复的默认未返校，
+最后给我整理成表格。
 ```
 
-群成员按以下格式提交即可：
+成员可以提交：
+
+```text
+我7号下午三点回来
+```
+
+或者使用确定性字段格式：
 
 ```text
 姓名：张三
-离校时间：10月1日 14:00
-返校时间：10月6日
+返校时间：10月7日下午3点
 ```
 
-同一成员再次提交会更新当前有效记录。可使用 `/nexus collect-start`、`/nexus collect-status`、`/nexus collect-stop` 作为 fallback。结束时生成包含统计结果、未提交成员和任务信息的 XLSX，并保存到 plugin data directory 的 `exports/`。
+两种消息都会先留下任务事实。标准字段格式会立即写入；自然语言不会在每条群消息到达时调用 LLM，而是在启用 `ai_extraction` 且到达 checkpoint、截止收尾或 operator 查询状态时批量理解。
 
-## Collection checkpoint 与身份
-
-自然语言填写默认关闭。开启 `ai_extraction` 后，群消息会先写入该 Collection 的 `workflow_messages`，不会在 `GROUP_MESSAGE` 中逐条调用 LLM；标准“字段：值”消息仍然立即解析并写入。自然语言消息只在计划 checkpoint、截止收尾或 operator 查询状态时，按新增 cursor 批量分析。
-
-例如可设置 19:00 催办 checkpoint、20:00 截止：
+### Checkpoint 时间和成本模型
 
 ```text
-在班群收集返校信息，需要姓名、返校时间；19:00 批量分析，20:00 截止，缺省状态填“未提交”。
+17:00 ─────────── 19:00 ─────────── 20:00
+      💾 Capture       🧠 Checkpoint      🧠 Finalize
+      0 LLM            only delta         📊 XLSX
 ```
 
-checkpoint 使用创建 Collection 时绑定的 AstrBot LLM Provider，只保存 Provider ID，不保存 API key、token 或 credential。模型返回的字段、用户 ID、evidence 和 confidence 会经过确定性校验；失败时 cursor 不推进，也不会发送错误的催办。状态查询默认 refresh，无新增自然语言消息时不会调用 LLM。
+例如 19:00 已分析到 cursor `#120`，20:00 只处理 `#121+`。私聊询问“目前统计怎么样？”会执行一次增量 checkpoint；如果没有新消息，则为 `0` 次 LLM 调用。checkpoint 受消息数、字符数和分片数限制，避免无限增长的上下文。
 
-Collection 会从标准提交和可信 checkpoint 结果学习“姓名/学号”身份字段；operator 或当前群 QQ 群主/管理员也可以用身份工具核验维护。已核验身份不会被未核验结果覆盖，导出时会尽力将身份列放在统计结果前部。
+## 🪪 成员身份
 
-## 成员集合
+Nexus 会把稳定身份字段保存在自己的身份表中：
 
-成员集合按 QQ 群隔离，例如可以在班群建立“班委”或“实验 A 组”。成员只能通过实时群成员列表中的 QQ 号、精确群名片或精确昵称加入；同名时不会猜测。信息收集可以在创建时 snapshot 一个集合，之后名单变化不会影响这次收集；Relay 也可以在 preview 时 snapshot 当前仍在群内的集合成员并在确认时 @这些确定的 QQ 号。
+```text
+QQ 123456789
+       ↓
+姓名：张三
+学号：2026123456
+```
 
-已退群成员不会从保存的名单历史中自动删除；新增或修改集合不会回写既有任务快照。
+标准提交可以学习姓名/学号，checkpoint 只能产生未核验（unverified）身份；operator 或当前群 QQ 群主/管理员可以核验维护。已核验身份不会被普通 AI 结果覆盖，导出时会尽力将身份列放在统计结果前部。
 
-## 群消息归档
+## 🔄 跨会话同步
 
-归档默认关闭。绑定群不会自动开始记录；必须显式开启：
+```mermaid
+flowchart TB
+    A[💬 AstrBot Conversation History] --> B[理解那个统计]
+    B --> C[🧠 Nexus Tasks DB]
+    C --> D[真实任务状态]
+    D --> E[📜 Workflow Messages]
+    E --> F[群任务事实]
+    F --> G[🪪 Identity DB]
+```
+
+Conversation history 只用于辅助识别当前会话上下文，例如补充最近提到的任务引用；任务状态、群消息事实和身份数据的 source of truth 是插件自己的 SQLite。插件不会把 API key、token 或 Provider credential 写进数据库。
+
+## 🔐 权限矩阵
+
+| 能力 | 私聊 Operator/Admin | QQ 群 owner/admin | 普通群成员 |
+| --- | :---: | :---: | :---: |
+| 创建当前群 Collection | ✅ | ✅ | ❌ |
+| 查看当前群统计 | ✅ | ✅ | ❌ |
+| 当前群 Reminder / DDL | ✅ | ✅ | ❌ |
+| Identity 维护 | ✅ | ✅ 当前群 | ❌ |
+| 跨群 Relay | ✅ | ❌ | ❌ |
+| Archive 管理 | ✅ | ❌ | ❌ |
+| Bind Group | ✅ | ❌ | ❌ |
+| Collection 回复 | — | — | ✅ |
+| mute / unmute / kick | 独立 moderator 权限 | 不自动获得 | ❌ |
+
+QQ群 admin 不等于 Nexus moderator。`operator_ids` 只控制普通群枢能力，不会自动升级为群管理权限；群管理还必须开启 `moderation_enabled`，并由 `moderator_ids` 或 AstrBot Admin 授权。跨群 Relay、Archive 和总结始终要求私聊 operator。
+
+## 📦 安装
+
+### 方法 A：AstrBot WebUI
+
+AstrBot 当前支持从 WebUI 的插件页面安装：
+
+```text
+AstrBot WebUI → 插件 → 右下角 + → URL 安装
+```
+
+使用仓库地址：
+
+```text
+https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_lumielle_nexus
+```
+
+安装后在插件页面找到“微光·群枢”，执行加载或重载。
+
+### 方法 B：Git 安装到 `data/plugins`
+
+```bash
+cd AstrBot/data/plugins
+git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_lumielle_nexus.git
+cd astrbot_plugin_lumielle_nexus
+git pull --ff-only origin main
+```
+
+然后执行：
+
+```text
+WebUI → 插件 → 微光·群枢 → 重载插件
+```
+
+升级时在已有插件目录执行 `git pull --ff-only origin main` 即可，不需要删除插件目录，也不应删除 plugin data。
+
+### 依赖
+
+在与 AstrBot 相同的 Python 环境中安装：
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+本插件只额外依赖 `openpyxl`；AstrBot、aiocqhttp/OneBot 和 LLM Provider 由宿主环境提供。
+
+## ⚙️ 初始配置
+
+配置项以 `_conf_schema.json` 为准：
+
+| 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `operator_ids` | `[]` | 额外允许控制插件的 QQ 用户 ID；AstrBot Admin 始终允许 |
+| `timezone` | `Asia/Shanghai` | 时间解析时区 |
+| `scheduler_interval_seconds` | `15` | scheduler 检查间隔，运行时限制 `5–60` 秒 |
+| `max_retry_count` | `3` | 普通提醒发送失败后的最大重试次数 |
+| `collection_ack` | `true` | 是否确认确定性群成员提交 |
+| `archive_max_message_chars` | `4000` | 单条归档文本上限，运行时限制 `256–20000` |
+| `archive_retention_days` | `90` | 归档自动保留天数；`0` 表示不自动清理，其他值限制 `7–3650` |
+| `moderation_enabled` | `false` | 是否开启单成员群管理；默认完全关闭 |
+| `moderator_ids` | `[]` | 独立群管理 QQ 用户 ID，不继承 `operator_ids` |
+
+## 🗃️ 数据、隐私与 Archive
+
+运行数据写入 AstrBot plugin data directory，而不是插件仓库：
+
+```text
+data/plugin_data/astrbot_plugin_lumielle_nexus/
+├── lumielle_nexus.db
+└── exports/
+```
+
+SQLite 可能包含 task state、Collection 结果、workflow messages、成员身份和可选群消息归档。Collection workflow capture 是任务正常工作所需的数据；长期 Group Archive 则默认 opt-in：
 
 ```text
 /nexus archive 班群 on
 /nexus archive-status 班群
+/nexus archive 班群 off
 ```
 
-开启后才记录新的文本消息，不会回溯开启前的历史；图片、语音、文件和视频内容不会解析。归档默认保留 90 天，也可以通过 `archive_retention_days` 调整或使用 `nexus_clear_archive` 显式清除已有文本数据。关闭归档只停止新增，不会自动删除已有记录。
+开启不会回溯旧消息，目前只保存 `GROUP_MESSAGE` 的可读文本表现，不下载图片、不做 OCR、不转写语音、不解析文件或视频。关闭只停止新增，不删除已有归档；明确清理请使用带确认的 `nexus_clear_archive`。
 
-## 群聊总结
+## 🛡️ 安全模型
 
-可以按时间范围请求总结：
+### Relay
 
-```text
-总结一下班群最近一周发生了什么。
-帮我整理班群最近一周所有作业、DDL 和需要班委处理的事情。
-```
-
-总结使用 AstrBot 当前 LLM Provider，长记录会按消息边界分块，最多处理最近 2000 条文本消息。消息数和活跃成员数由插件确定性统计。模型只负责整理，不会根据总结自动创建 DDL 或其他任务；DDL/待办内容仍然只是候选，需要 operator 判断后再确认创建。
-
-也可以创建自动周报：
-
-```text
-每周日晚十点把班群本周总结私聊发给我。
-```
-
-周报要求目标群已开启归档；归档关闭期间到期的周报会跳过，但不会取消后续计划，重新开启后下一次 occurrence 会恢复。周报按照逻辑计划时间回看固定窗口，停机恢复不会积累大量旧周报；LLM 已生成但 QQ 私聊发送失败时，会复用缓存结果和已发送分片进度重试发送。总结有输入预算和最多 10 个分片调用加 1 次合并调用，群聊记录会作为不可信数据处理。
-
-## 跨群转述
-
-跨群消息不是一次自然语言请求就直接发送。流程固定为：
+跨群发送永远不是一次自然语言请求就直接执行：
 
 ```text
 prepare → preview → explicit confirm → send
 ```
 
-例如先说“把这段发到班委群”，插件只创建待确认 preview 和 `X-...` Relay ID；用户明确确认后，才调用 `nexus_confirm_relay` 或：
+`nexus_prepare_relay` 只生成 `X-...` preview；用户明确确认后才调用 `nexus_confirm_relay`。Relay 失败不自动重试，避免产生重复外部消息。
+
+### Moderation
+
+群管理默认关闭，只支持单群单成员的 mute、unmute、kick。它需要独立 moderator 权限，且固定采用：
 
 ```text
-/nexus relay-confirm X-...
+prepare → preview → explicit confirm → execute
 ```
 
-preview 默认 1 小时有效，且只能由创建 preview 的 operator 确认。失败的 relay 不会自动重试，避免重复发送；可以重新准备。如果确认发送过程中进程异常退出，Relay 会标为 FAILED，发送结果未知，不会自动重发；请先查看目标群后再决定是否重新准备。
+预览有效期 10 分钟；确认前会重新检查 Bot 和目标成员角色；不自动重试。进程在执行中断时会记录 outcome unknown，应先人工检查群状态。当前不支持批量管理、全员禁言、设置管理员或退群。
 
-成员集合 Relay 会按每批最多 20 人发送，首次成功批次携带正文，后续批次只发送 @。每批成功后都会持久化已 @ 的 QQ 号；若发送失败，结果会标记为部分成功并且不会自动重试。进程在 QQ 已成功但进度尚未落库的极小窗口仍可能产生重复 mention，系统不宣称 exactly-once。
+### LLM
 
-## 群管理
+群消息是 untrusted input。标准格式优先由确定性逻辑处理；checkpoint/summary 使用有界输入、明确的事实约束和确定性校验。Summary 不使用 tools，也不会自动创建任务。
 
-群管理默认完全关闭。开启 `moderation_enabled` 后，仍必须由 AstrBot Admin 或单独配置在 `moderator_ids` 的用户从私聊发起；普通 `operator_ids` 不会隐式升级。当前只支持一次针对一个群、一个成员的 mute、unmute、kick，不支持批量管理、全员禁言、设置管理员、退群或自动管理。
+## 🔧 Troubleshooting
 
-群管理固定采用 `prepare → preview → explicit confirm → execute`，preview 有 10 分钟 TTL，确认前会重新检查 Bot 与目标成员角色；缺失或未知角色一律拒绝，权限变化会阻止调用 OneBot。群管理不自动重试，进程在确认执行中断时会记录为 outcome unknown，需要人工检查群状态。MODERATION 任务属于独立 moderator 权限域：普通 operator 无权查看详情、确认或取消；创建该操作的 moderator 只能处理自己的 preview，AstrBot Admin 可作为覆盖者取消或查看。
+### 插件加载失败
 
-## 当前限制与后续规划
+在 `WebUI → 插件` 查看具体错误，先确认 AstrBot 版本满足 `>=4.28.0,<5`、Python 依赖已安装，再尝试插件页面的一键重载。不要删除 plugin data 作为排错手段。
 
-当前归档只保存可读文本表现，不包含 OCR、语音转写、图片下载、向量检索或长期消息语义抽取。也不包含 WebUI、Redis、ORM、RAG、批量群管理或自动根据总结创建任务。
+### 缺少 Python dependency
 
-后续可考虑：recurring schedule 增强、DDL 工作流、课程表、未提交成员自动催办、weekly summary 增强、message archive 扩展、relay 工作流、成员集合增强，以及更丰富但仍需确认的 moderation 策略。
+使用 AstrBot 实际运行的 Python 环境执行：
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+### aiocqhttp unavailable
+
+当前版本只正式支持 `aiocqhttp` / OneBot v11（QQ，主要面向 NapCat），没有声明其他平台适配。
+
+### LLM checkpoint 不工作
+
+检查：
+
+- Collection 是否设置 `ai_extraction=true`；
+- 创建任务的控制会话是否有可用 Provider；
+- Provider 是否仍可用；
+- checkpoint 时间是否已经到达，且 Collection 仍为 ACTIVE。
+
+### Excel 没收到
+
+导出失败不会回滚统计结果。先到 AstrBot plugin data directory 的 `exports/` 查找文件；QQ 文件回传可能因 OneBot/NapCat 权限或协议能力失败。
+
+## 🚧 当前限制与后续规划
+
+当前尚未实现：
+
+- 同一群同时运行多个 ACTIVE Collection；
+- 图片归档、OCR、语音转写、文件内容提取；
+- embedding、向量数据库、RAG、知识图谱；
+- WebUI 页面、Redis、ORM、新 Web 服务；
+- 批量 moderation、全员禁言、设置管理员、退群；
+- 根据群总结自动创建任务；
+- 更复杂的课程表和周期规则。
+
+真实 NapCat、QQ 群和 AstrBot Provider 环境仍建议在实际使用前做一次小范围验证，尤其是消息发送、文件回传和群管理权限。
+
+## ✅ 开发验证
+
+当前仓库已完成：
+
+```bash
+python3 -m compileall .
+python3 -m unittest discover -s tests -v
+git diff --check
+```
+
+结果为 129 项测试通过，AstrBot 4.28.0 官方源码 loader smoke 通过，31 个工具成功注册。当前没有进行真实 LLM 消耗测试，也没有在真实群执行 mute/kick 或发送测试 spam。
+
+## ⚖️ License
+
+MIT License — see [LICENSE](LICENSE).
