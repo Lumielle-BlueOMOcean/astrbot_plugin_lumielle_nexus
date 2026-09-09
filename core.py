@@ -17,6 +17,10 @@ else:
 
 UTC = timezone.utc
 SCHEDULE_GRACE_SECONDS = 120
+SUMMARY_GRACE_SECONDS = 24 * 60 * 60
+SUMMARY_CHUNK_CHARS = 12000
+SUMMARY_MAX_MESSAGES = 2000
+SUMMARY_PRIVATE_CHUNK_CHARS = 3500
 
 
 def utc_now_iso() -> str:
@@ -108,6 +112,24 @@ def clamp_scheduler_interval(value: Any) -> int:
     return max(5, min(interval, 60))
 
 
+def clamp_archive_max_message_chars(value: Any) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = 4000
+    return max(256, min(limit, 20000))
+
+
+def clamp_archive_retention_days(value: Any) -> int:
+    try:
+        retention = int(value)
+    except (TypeError, ValueError):
+        retention = 90
+    if retention == 0:
+        return 0
+    return max(7, min(retention, 3650))
+
+
 def next_interval_occurrence(
     base_run_at: str | datetime,
     interval_minutes: int,
@@ -142,7 +164,7 @@ def should_skip_stale_reminder(
         if isinstance(payload, str):
             payload = json.loads(payload)
         kind = payload.get("kind") if isinstance(payload, dict) else None
-        if kind not in {"schedule", "ddl"}:
+        if kind not in {"schedule", "ddl", "weekly_summary"}:
             return False
         if int(task.get("retry_count") or 0) > 0:
             return False
@@ -150,9 +172,118 @@ def should_skip_stale_reminder(
         if not run_at:
             return False
         age = (_as_utc(now) - _as_utc(str(run_at))).total_seconds()
-        return age > grace_seconds
+        effective_grace = (
+            SUMMARY_GRACE_SECONDS if kind == "weekly_summary" else grace_seconds
+        )
+        return age > effective_grace
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
+
+
+def build_summary_system_prompt() -> str:
+    return (
+        "你是群聊记录整理助手。只依据提供的群聊记录总结。"
+        "不要补充记录中没有的信息。"
+        "如果多人说法冲突，明确标记“存在不同说法”。"
+        "区分已确认事实、推测/讨论、待确认事项。"
+        "时间、地点、DDL 等信息必须忠实于原文。"
+        "不要自动创建任务。DDL 和待办只能称为候选，不得据此直接创建任务。"
+    )
+
+
+def _summary_message_line(message: dict[str, Any]) -> str:
+    sender = str(message.get("sender_name") or message.get("sender_id") or "未知成员")
+    sent_at = str(message.get("sent_at") or "未知时间")
+    return f"{sent_at} {sender}：{str(message.get('message_text') or '')}"
+
+
+def build_summary_transcript_chunks(
+    messages: list[dict[str, Any]],
+    max_chars: int = SUMMARY_CHUNK_CHARS,
+    max_messages: int = SUMMARY_MAX_MESSAGES,
+) -> list[str]:
+    """Format messages chronologically without splitting an individual message."""
+    selected = list(messages[-max_messages:])
+    lines = [_summary_message_line(message) for message in selected]
+    chunks: list[str] = []
+    current: list[str] = []
+    current_size = 0
+    for line in lines:
+        line_size = len(line) + (1 if current else 0)
+        if current and current_size + line_size > max_chars:
+            chunks.append("\n".join(current))
+            current = []
+            current_size = 0
+        current.append(line)
+        current_size += len(line) + (1 if len(current) > 1 else 0)
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or ["（时间范围内没有文本消息。）"]
+
+
+def _llm_response_text(response: Any) -> str:
+    for attribute in ("completion_text", "text", "content"):
+        value = getattr(response, attribute, None)
+        if value:
+            return str(value).strip()
+    if isinstance(response, dict):
+        for key in ("completion_text", "text", "content"):
+            if response.get(key):
+                return str(response[key]).strip()
+    return str(response).strip()
+
+
+async def generate_group_summary(
+    context: Any,
+    provider_id: str,
+    messages: list[dict[str, Any]],
+    message_count: int,
+    window_start: str,
+    window_end: str,
+    focus: str = "",
+) -> str:
+    """Generate a bounded summary through AstrBot's current LLM provider."""
+    chunks = build_summary_transcript_chunks(messages)
+    metadata = (
+        f"时间范围：{window_start} 至 {window_end}\n"
+        f"消息数：{message_count}\n"
+        f"本次提供的消息数：{len(messages)}\n"
+        f"关注重点：{focus or '无特别重点'}"
+    )
+    system_prompt = build_summary_system_prompt()
+    if len(chunks) == 1:
+        response = await context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=(
+                f"{metadata}\n\n群聊记录：\n{chunks[0]}\n\n"
+                "请按重要通知、DDL/待办候选、课程/活动变化、主要讨论、待确认事项整理。"
+            ),
+            system_prompt=system_prompt,
+        )
+        return _llm_response_text(response)
+
+    notes: list[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        response = await context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=(
+                f"{metadata}\n这是第 {index}/{len(chunks)} 段群聊记录：\n{chunk}\n\n"
+                "只提炼忠实于原文的事实、冲突说法和待确认事项，写成简洁 factual notes；不要创建任务。"
+            ),
+            system_prompt=system_prompt,
+        )
+        notes.append(_llm_response_text(response))
+    response = await context.llm_generate(
+        chat_provider_id=provider_id,
+        prompt=(
+            f"{metadata}\n以下是分段事实笔记：\n\n"
+            + "\n\n---\n\n".join(notes)
+            + "\n\n请合并为完整群聊总结，区分已确认事实、推测/讨论和待确认事项，"
+            "DDL/待办只写候选，不要自动创建任务。"
+        ),
+        system_prompt=system_prompt,
+    )
+    return _llm_response_text(response)
 
 
 def _normalize_weekdays(weekdays: list[int]) -> list[int]:
@@ -315,6 +446,8 @@ class TaskManager:
         storage: Storage,
         timezone_name: str = "Asia/Shanghai",
         max_retry_count: int = 3,
+        archive_max_message_chars: int = 4000,
+        archive_retention_days: int = 90,
     ) -> None:
         try:
             self.timezone = ZoneInfo(timezone_name)
@@ -322,6 +455,13 @@ class TaskManager:
             raise ValueError(f"无效时区：{timezone_name}") from exc
         self.timezone_name = timezone_name
         self.max_retry_count = max(0, int(max_retry_count))
+        self.archive_max_message_chars = clamp_archive_max_message_chars(
+            archive_max_message_chars,
+        )
+        self.archive_retention_days = clamp_archive_retention_days(
+            archive_retention_days,
+        )
+        self._last_archive_prune_at: datetime | None = None
         self.storage = storage
         self.lock = asyncio.Lock()
         self.storage.recover_processing_reminders(utc_now_iso())
@@ -369,6 +509,172 @@ class TaskManager:
     async def list_groups(self, platform_id: str) -> list[dict[str, Any]]:
         async with self.lock:
             return self.storage.list_bindings(platform_id)
+
+    async def set_archive(
+        self, group: str, enabled: bool, platform_id: str,
+    ) -> dict[str, Any]:
+        async with self.lock:
+            binding = self._resolve_binding(group, platform_id)
+            return self.storage.upsert_archive_setting(
+                platform_id,
+                binding["group_id"],
+                bool(enabled),
+                utc_now_iso(),
+            )
+
+    async def archive_group_message(
+        self,
+        platform_id: str,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        message_text: str,
+        sent_at: str | datetime | None = None,
+        source_message_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        text = str(message_text or "").strip()
+        if not text:
+            return None
+        async with self.lock:
+            if self.storage.get_binding(str(group_id), str(platform_id)) is None:
+                return None
+            setting = self.storage.get_archive_setting(str(platform_id), str(group_id))
+            if not setting or not bool(setting["enabled"]):
+                return None
+            current = self._now_utc()
+            sent_iso = (
+                current.isoformat(timespec="seconds")
+                if sent_at is None
+                else _as_utc(sent_at).isoformat(timespec="seconds")
+            )
+            return self.storage.insert_group_message(
+                str(platform_id),
+                str(group_id),
+                str(source_message_id).strip() if source_message_id else None,
+                str(sender_id),
+                str(sender_name or sender_id),
+                text[: self.archive_max_message_chars],
+                sent_iso,
+                current.isoformat(timespec="seconds"),
+            )
+
+    async def archive_status(self, group: str, platform_id: str) -> dict[str, Any]:
+        async with self.lock:
+            binding = self._resolve_binding(group, platform_id)
+            status = self.storage.archive_status(platform_id, binding["group_id"])
+            status.update({"alias": binding["alias"], "group_id": binding["group_id"]})
+            return status
+
+    def _archive_range(
+        self,
+        start_time: str = "",
+        end_time: str = "",
+        now: datetime | None = None,
+    ) -> tuple[str, str]:
+        current = self._now_utc(now)
+        end = parse_run_at_datetime(end_time, self.timezone_name) if end_time else current
+        start = (
+            parse_run_at_datetime(start_time, self.timezone_name)
+            if start_time else end - timedelta(days=7)
+        )
+        if start > end:
+            raise ValueError("开始时间不能晚于结束时间")
+        return start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")
+
+    async def search_messages(
+        self,
+        group: str,
+        keyword: str = "",
+        start_time: str = "",
+        end_time: str = "",
+        limit: int = 50,
+        platform_id: str = "",
+    ) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, (int, str)):
+            raise ValueError("limit 必须是 1 到 100 的整数")
+        try:
+            limit_number = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("limit 必须是 1 到 100 的整数") from exc
+        if not 1 <= limit_number <= 100:
+            raise ValueError("limit 必须是 1 到 100 的整数")
+        start, end = self._archive_range(start_time, end_time)
+        async with self.lock:
+            binding = self._resolve_binding(group, platform_id)
+            return self.storage.search_group_messages(
+                platform_id,
+                binding["group_id"],
+                str(keyword or "").strip(),
+                start,
+                end,
+                limit_number,
+            )
+
+    async def summary_snapshot(
+        self,
+        group: str,
+        start_time: str = "",
+        end_time: str = "",
+        platform_id: str = "",
+        *,
+        now: datetime | None = None,
+        max_messages: int = SUMMARY_MAX_MESSAGES,
+    ) -> dict[str, Any]:
+        start, end = self._archive_range(start_time, end_time, now)
+        async with self.lock:
+            binding = self._resolve_binding(group, platform_id)
+            messages = self.storage.search_group_messages(
+                platform_id, binding["group_id"], "", start, end, max_messages,
+            )
+            messages.reverse()
+            message_count = self.storage.count_group_messages(
+                platform_id, binding["group_id"], start, end,
+            )
+            unique_sender_count = self.storage.count_group_message_senders(
+                platform_id, binding["group_id"], start, end,
+            )
+            return {
+                "alias": binding["alias"],
+                "group_id": binding["group_id"],
+                "messages": messages,
+                "message_count": message_count,
+                "unique_sender_count": unique_sender_count,
+                "window_start": start,
+                "window_end": end,
+                "truncated": message_count > len(messages),
+            }
+
+    async def clear_archive(self, group: str, platform_id: str) -> int:
+        async with self.lock:
+            binding = self._resolve_binding(group, platform_id)
+            return self.storage.clear_group_messages(platform_id, binding["group_id"])
+
+    async def prune_archive(
+        self, now: datetime | None = None, retention_days: int | None = None,
+    ) -> int:
+        retention = self.archive_retention_days if retention_days is None else clamp_archive_retention_days(retention_days)
+        if retention == 0:
+            return 0
+        current = self._now_utc(now)
+        async with self.lock:
+            return self.storage.prune_group_messages(
+                (current - timedelta(days=retention)).isoformat(timespec="seconds"),
+            )
+
+    async def prune_archive_if_due(self, now: datetime | None = None) -> int:
+        current = self._now_utc(now)
+        async with self.lock:
+            if (
+                self._last_archive_prune_at is not None
+                and current - self._last_archive_prune_at < timedelta(hours=6)
+            ):
+                return 0
+            self._last_archive_prune_at = current
+            if self.archive_retention_days == 0:
+                return 0
+            return self.storage.prune_group_messages(
+                (current - timedelta(days=self.archive_retention_days)).isoformat(timespec="seconds"),
+            )
 
     async def create_reminder(
         self,
@@ -570,6 +876,57 @@ class TaskManager:
                 },
             )
 
+    async def create_weekly_summary(
+        self,
+        group: str,
+        weekday: int,
+        time_of_day: str,
+        lookback_days: int,
+        focus: str,
+        provider_id: str,
+        creator_id: str,
+        creator_private_origin: str,
+        platform_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        normalized_weekdays = _normalize_weekdays([weekday])
+        _parse_time_of_day(time_of_day)
+        lookback = _coerce_nonnegative_int(lookback_days, "lookback_days")
+        if not 1 <= lookback <= 30:
+            raise ValueError("lookback_days 必须在 1 到 30 之间")
+        provider_id = str(provider_id or "").strip()
+        if not provider_id:
+            raise ValueError("当前会话没有可用的 LLM Provider")
+        current = self._now_utc(now)
+        next_run = next_weekly_occurrence(
+            current,
+            normalized_weekdays,
+            time_of_day,
+            self.timezone_name,
+        )
+        if next_run is None:
+            raise ValueError("无法安排下一次周总结")
+        async with self.lock:
+            now_iso = current.isoformat(timespec="seconds")
+            return self._create_schedule_parent(
+                task_id=self._task_id("W"),
+                task_type="SUMMARY",
+                group=group,
+                platform_id=platform_id,
+                creator_id=creator_id,
+                creator_private_origin=creator_private_origin,
+                created_at=now_iso,
+                run_at=next_run.isoformat(timespec="seconds"),
+                payload={
+                    "weekday": normalized_weekdays[0],
+                    "time_of_day": str(time_of_day).strip(),
+                    "lookback_days": lookback,
+                    "focus": str(focus or "").strip(),
+                    "provider_id": provider_id,
+                },
+            )
+
     @staticmethod
     def _course_message(
         course_name: str, start_time: str, location: str, offset: int,
@@ -691,8 +1048,11 @@ class TaskManager:
             if task["type"] == "REMINDER":
                 if task["status"] != "PENDING":
                     raise ValueError(f"任务当前不能取消：{task['status']}")
-            elif task["type"] in {"DDL", "RECURRING", "COURSE"}:
+            elif task["type"] in {"DDL", "RECURRING", "COURSE", "SUMMARY"}:
                 if task["status"] != "ACTIVE":
+                    raise ValueError(f"任务当前不能取消：{task['status']}")
+            elif task["type"] == "RELAY":
+                if task["status"] != "PENDING":
                     raise ValueError(f"任务当前不能取消：{task['status']}")
             else:
                 raise ValueError(f"任务当前不能取消：{task['status']}")
@@ -851,6 +1211,74 @@ class TaskManager:
             )
             return {"task": task, "entries": self.storage.list_entries(task["id"])}
 
+    async def prepare_relay(
+        self,
+        target_group: str,
+        content: str,
+        mention_all: bool,
+        source_note: str,
+        platform_id: str,
+        creator_id: str,
+        creator_private_origin: str,
+    ) -> dict[str, Any]:
+        content = str(content or "").strip()
+        if not content:
+            raise ValueError("转述内容不能为空")
+        if len(content) > 6000:
+            raise ValueError("转述内容不能超过 6000 个字符")
+        async with self.lock:
+            binding = self._resolve_binding(target_group, platform_id)
+            now = utc_now_iso()
+            return self.storage.create_task(
+                task_id=self._task_id("X"),
+                task_type="RELAY",
+                status="PENDING",
+                group_id=binding["group_id"],
+                group_alias=binding["alias"],
+                platform_id=platform_id,
+                creator_id=str(creator_id),
+                creator_private_origin=str(creator_private_origin),
+                created_at=now,
+                run_at=None,
+                payload={
+                    "content": content,
+                    "mention_all": bool(mention_all),
+                    "source_note": str(source_note or "").strip(),
+                },
+            )
+
+    async def confirm_relay(self, task_id: str, platform_id: str) -> dict[str, Any]:
+        async with self.lock:
+            return self.storage.claim_relay(
+                str(task_id).strip(), platform_id, utc_now_iso(),
+            )
+
+    async def finish_relay(
+        self, task_id: str, success: bool, error: str = "",
+    ) -> dict[str, Any]:
+        async with self.lock:
+            now = utc_now_iso()
+            if success:
+                return self.storage.update_task(
+                    task_id,
+                    status="COMPLETED",
+                    updated_at=now,
+                    finished_at=now,
+                )
+            return self.storage.update_task(
+                task_id,
+                status="FAILED",
+                last_error=str(error)[:1000],
+                updated_at=now,
+                finished_at=now,
+            )
+
+    async def update_reminder_result(
+        self, task_id: str, result: dict[str, Any],
+    ) -> dict[str, Any]:
+        async with self.lock:
+            return self.storage.update_task_result(task_id, result, utc_now_iso())
+
     async def reminder_skip_reason(
         self,
         task: dict[str, Any],
@@ -867,12 +1295,12 @@ class TaskManager:
                 except json.JSONDecodeError:
                     payload = {}
             kind = payload.get("kind") if isinstance(payload, dict) else None
-            if kind in {"schedule", "ddl"} and current_task.get("parent_id"):
+            if kind in {"schedule", "ddl", "weekly_summary"} and current_task.get("parent_id"):
                 parent = self.storage.get_task(str(current_task["parent_id"]))
                 if parent is None or parent["status"] == "CANCELLED":
                     return "parent_cancelled"
             if should_skip_stale_reminder(current_task, current):
-                return "stale_schedule"
+                return "stale_summary" if kind == "weekly_summary" else "stale_schedule"
             return None
 
     async def skip_reminder(
@@ -918,6 +1346,13 @@ class TaskManager:
                 payload.get("start_date") or None,
                 payload.get("end_date") or None,
             )
+        if parent["type"] == "SUMMARY":
+            return next_weekly_occurrence(
+                after,
+                [int(payload["weekday"])],
+                payload["time_of_day"],
+                self.timezone_name,
+            )
         return None
 
     async def materialize_due_schedules(
@@ -943,7 +1378,12 @@ class TaskManager:
                     )
                     continue
 
-                within_grace = (current - run_at).total_seconds() <= 120
+                grace_seconds = (
+                    SUMMARY_GRACE_SECONDS
+                    if parent["type"] == "SUMMARY"
+                    else SCHEDULE_GRACE_SECONDS
+                )
+                within_grace = (current - run_at).total_seconds() <= grace_seconds
                 next_after = run_at if within_grace else current
                 next_run = self._next_schedule_occurrence(parent, next_after)
                 if within_grace:
@@ -952,6 +1392,21 @@ class TaskManager:
                         f"{parent['type'].lower()}:"
                         f"{run_at.astimezone(self.timezone).isoformat(timespec='minutes')}"
                     )
+                    child_payload = {
+                        "message": payload.get("message", ""),
+                        "mention_all": bool(payload.get("mention_all")),
+                        "kind": "weekly_summary" if parent["type"] == "SUMMARY" else "schedule",
+                        "parent_type": parent["type"],
+                        "occurrence_key": occurrence_key,
+                    }
+                    if parent["type"] == "SUMMARY":
+                        child_payload.update({
+                            "summary_parent_id": parent["id"],
+                            "provider_id": payload["provider_id"],
+                            "lookback_days": payload["lookback_days"],
+                            "focus": payload.get("focus", ""),
+                            "scheduled_run_at": run_at.isoformat(timespec="seconds"),
+                        })
                     child = self.storage.create_child_reminder(
                         task_id=self._task_id("R"),
                         parent_id=parent["id"],
@@ -963,13 +1418,7 @@ class TaskManager:
                         creator_private_origin=parent["creator_private_origin"],
                         created_at=current_iso,
                         run_at=run_at.isoformat(timespec="seconds"),
-                        payload={
-                            "message": payload["message"],
-                            "mention_all": bool(payload.get("mention_all")),
-                            "kind": "schedule",
-                            "parent_type": parent["type"],
-                            "occurrence_key": occurrence_key,
-                        },
+                        payload=child_payload,
                     )
                     created.append(child)
                 if next_run is None:

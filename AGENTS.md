@@ -8,3 +8,5 @@
 6. destructive moderation 必须有显式权限检查和确认机制；本版不实现此类能力。
 7. commit 前至少执行 syntax、lint（如可用）和 smoke verification。
 8. README 不得声称尚未完成的功能已经可用。
+9. 群消息归档默认 opt-in；只有 operator 显式开启的已绑定群文本消息才会保存。
+10. 跨群 relay 必须先展示 preview，再经过用户明确确认后发送。

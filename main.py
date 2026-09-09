@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +15,14 @@ from astrbot.api.star import Context, Star, StarTools
 
 if __package__:
     from .core import (
+        SUMMARY_PRIVATE_CHUNK_CHARS,
         TaskManager,
+        clamp_archive_max_message_chars,
+        clamp_archive_retention_days,
         clamp_scheduler_interval,
         collection_member_stats,
         format_local_time,
+        generate_group_summary,
         next_interval_occurrence,
     )
     from .exporter import export_collection
@@ -26,10 +30,14 @@ if __package__:
     from .storage import Storage
 else:
     from core import (
+        SUMMARY_PRIVATE_CHUNK_CHARS,
         TaskManager,
+        clamp_archive_max_message_chars,
+        clamp_archive_retention_days,
         clamp_scheduler_interval,
         collection_member_stats,
         format_local_time,
+        generate_group_summary,
         next_interval_occurrence,
     )
     from exporter import export_collection
@@ -49,6 +57,12 @@ class LumielleNexus(Star):
             self.storage,
             timezone_name=str(self.config.get("timezone", "Asia/Shanghai")),
             max_retry_count=int(self.config.get("max_retry_count", 3)),
+            archive_max_message_chars=clamp_archive_max_message_chars(
+                self.config.get("archive_max_message_chars", 4000),
+            ),
+            archive_retention_days=clamp_archive_retention_days(
+                self.config.get("archive_retention_days", 90),
+            ),
         )
         operator_ids = self.config.get("operator_ids", []) or []
         self.operator_ids = {str(value).strip() for value in operator_ids if str(value).strip()}
@@ -112,6 +126,24 @@ class LumielleNexus(Star):
             return {}
 
     @staticmethod
+    def _event_source_message_id(event: AstrMessageEvent) -> str | None:
+        for attribute in ("message_id", "get_message_id"):
+            value = getattr(event, attribute, None)
+            value = value() if callable(value) else value
+            if value not in (None, ""):
+                return str(value)
+        for attribute in ("message_obj", "raw_message"):
+            value = getattr(event, attribute, None)
+            if isinstance(value, dict):
+                for key in ("message_id", "id"):
+                    if value.get(key) not in (None, ""):
+                        return str(value[key])
+            nested = getattr(value, "message_id", None)
+            if nested not in (None, ""):
+                return str(nested)
+        return None
+
+    @staticmethod
     def _command_args(event: AstrMessageEvent) -> list[str]:
         text = str(event.get_message_str() or "").strip()
         parts = text.split()
@@ -128,6 +160,14 @@ class LumielleNexus(Star):
             label = f"{payload.get('course_name', '课程')}，下次提醒 {format_local_time(task['run_at'], self.manager.timezone_name, 'minutes')}"
         elif task_type == "COLLECTION":
             label = payload.get("title") or task_type
+        elif task_type == "SUMMARY":
+            label = (
+                f"每周{self._weekdays_text([payload.get('weekday', '')])} "
+                f"{payload.get('time_of_day', '')}，下次 "
+                f"{format_local_time(task.get('run_at'), self.manager.timezone_name, 'minutes')}"
+            )
+        elif task_type == "RELAY":
+            label = f"待确认转述：{payload.get('content', '')[:80]}"
         else:
             label = f"{payload.get('message', task_type)}，时间 {format_local_time(task.get('run_at'), self.manager.timezone_name, 'minutes')}"
         return f"{task['id']} [{task['status']}] {task['group_alias']}：{label}"
@@ -175,6 +215,20 @@ class LumielleNexus(Star):
                     f"标题：{payload.get('title', '')}",
                     f"提交人数：{status['submitted_count']}",
                 ])
+            elif task["type"] == "SUMMARY":
+                lines.extend([
+                    f"星期：{self._weekdays_text([payload.get('weekday', '')])}",
+                    f"时间：{payload.get('time_of_day', '')}",
+                    f"回看天数：{payload.get('lookback_days', 7)}",
+                    f"focus：{payload.get('focus') or '未设置'}",
+                    f"下次执行：{format_local_time(task.get('run_at'), self.manager.timezone_name, 'minutes')}",
+                ])
+            elif task["type"] == "RELAY":
+                lines.extend([
+                    f"@全体：{'是' if payload.get('mention_all') else '否'}",
+                    f"内容：{payload.get('content', '')}",
+                    f"来源备注：{payload.get('source_note') or '无'}",
+                ])
             return "\n".join(lines)
         except (KeyError, ValueError) as exc:
             return f"查询失败：{exc}"
@@ -203,6 +257,185 @@ class LumielleNexus(Star):
         return "已绑定群：\n" + "\n".join(
             f"- {group['alias']}：{group['group_id']}" for group in groups
         )
+
+    async def _set_archive(self, event: AstrMessageEvent, group: str, enabled: bool) -> str:
+        allowed, message = self._authorized_for_control(event)
+        if not allowed:
+            return message
+        try:
+            await self.manager.set_archive(group, enabled, self._platform_id(event))
+            if enabled:
+                return f"已开启「{group}」消息归档。从现在开始记录新的文本消息，不会回溯开启前的历史。"
+            return f"已关闭「{group}」消息归档。之后不再新增归档，已有数据不会自动删除。"
+        except (KeyError, ValueError) as exc:
+            return f"设置归档失败：{exc}"
+
+    async def _archive_status(self, event: AstrMessageEvent, group: str) -> str:
+        try:
+            status = await self.manager.archive_status(group, self._platform_id(event))
+            enabled = "开启" if status["enabled"] else "关闭"
+            lines = [
+                f"群：{status['alias']}",
+                f"归档：{enabled}",
+                f"已保存：{status['count']} 条文本消息",
+                f"最早：{format_local_time(status['earliest'], self.manager.timezone_name) if status['earliest'] else '暂无'}",
+                f"最新：{format_local_time(status['latest'], self.manager.timezone_name) if status['latest'] else '暂无'}",
+            ]
+            return "\n".join(lines)
+        except (KeyError, ValueError) as exc:
+            return f"查询归档失败：{exc}"
+
+    async def _search_messages(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        keyword: str = "",
+        start_time: str = "",
+        end_time: str = "",
+        limit: int = 50,
+    ) -> str:
+        try:
+            rows = await self.manager.search_messages(
+                group, keyword, start_time, end_time, limit, self._platform_id(event),
+            )
+            if not rows:
+                return "没有找到符合条件的群消息。"
+            return "\n".join(
+                f"{format_local_time(row['sent_at'], self.manager.timezone_name, 'minutes')} "
+                f"{row['sender_name']}：{row['message_text']}"
+                for row in rows
+            )
+        except (KeyError, ValueError) as exc:
+            return f"查询消息失败：{exc}"
+
+    async def _summarize_group(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        start_time: str = "",
+        end_time: str = "",
+        focus: str = "",
+        *,
+        scheduled_window: tuple[str, str] | None = None,
+        provider_id: str | None = None,
+    ) -> str:
+        try:
+            snapshot = await self.manager.summary_snapshot(
+                group,
+                start_time if scheduled_window is None else scheduled_window[0],
+                end_time if scheduled_window is None else scheduled_window[1],
+                self._platform_id(event),
+            )
+            if provider_id is None:
+                provider_id = await self.context.get_current_chat_provider_id(
+                    event.unified_msg_origin,
+                )
+            if not str(provider_id or "").strip():
+                raise ValueError("当前会话没有可用的 LLM Provider")
+            # generate_group_summary delegates the actual call to Context.llm_generate.
+            summary = await generate_group_summary(
+                self.context,
+                str(provider_id),
+                snapshot["messages"],
+                snapshot["message_count"],
+                snapshot["window_start"],
+                snapshot["window_end"],
+                focus,
+            )
+            metadata = (
+                "【群聊总结】\n"
+                f"时间范围：{format_local_time(snapshot['window_start'], self.manager.timezone_name, 'minutes')}"
+                f" 至 {format_local_time(snapshot['window_end'], self.manager.timezone_name, 'minutes')}\n"
+                f"消息数：{snapshot['message_count']}\n"
+                f"活跃成员数：{snapshot['unique_sender_count']}"
+            )
+            if snapshot["truncated"]:
+                metadata += "\n消息量较大，本次总结使用最近 2000 条文本消息。"
+            return f"{metadata}\n\n{summary}"
+        except (KeyError, ValueError) as exc:
+            return f"群消息已读取，但当前无法调用 AstrBot LLM Provider 生成总结：{exc}"
+        except Exception as exc:
+            logger.exception("群枢群聊总结失败")
+            return f"群消息已读取，但当前无法调用 AstrBot LLM Provider 生成总结：{exc}"
+
+    async def _create_weekly_summary(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        weekday: int,
+        time_of_day: str,
+        lookback_days: int = 7,
+        focus: str = "",
+    ) -> str:
+        allowed, message = self._authorized_for_control(event)
+        if not allowed:
+            return message
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(
+                event.unified_msg_origin,
+            )
+            task = await self.manager.create_weekly_summary(
+                group, weekday, time_of_day, lookback_days, focus, provider_id,
+                event.get_sender_id(), event.unified_msg_origin,
+                self._platform_id(event),
+            )
+            return (
+                f"已创建每周群聊总结 {task['id']}，下次执行："
+                f"{format_local_time(task['run_at'], self.manager.timezone_name, 'minutes')}。"
+                "届时会将总结私聊发给你。"
+            )
+        except (KeyError, ValueError) as exc:
+            return f"创建周总结失败：{exc}"
+        except Exception as exc:
+            logger.exception("群枢周总结创建失败")
+            return f"创建周总结失败：当前会话没有可用的 AstrBot LLM Provider（{exc}）"
+
+    async def _prepare_relay(
+        self,
+        event: AstrMessageEvent,
+        target_group: str,
+        content: str,
+        mention_all: bool = False,
+        source_note: str = "",
+    ) -> str:
+        allowed, message = self._authorized_for_control(event)
+        if not allowed:
+            return message
+        try:
+            task = await self.manager.prepare_relay(
+                target_group, content, mention_all, source_note,
+                self._platform_id(event), event.get_sender_id(), event.unified_msg_origin,
+            )
+            payload = self._payload(task)
+            return (
+                f"待发送到：{task['group_alias']}\n"
+                f"@全体：{'是' if payload.get('mention_all') else '否'}\n\n"
+                f"内容：\n{payload.get('content', '')}\n\n"
+                f"Relay ID：{task['id']}\n确认发送后我才会真正发到目标群。"
+            )
+        except (KeyError, ValueError) as exc:
+            return f"准备转述失败：{exc}"
+
+    async def _confirm_relay(self, event: AstrMessageEvent, task_id: str) -> str:
+        allowed, message = self._authorized_for_control(event)
+        if not allowed:
+            return message
+        try:
+            task = await self.manager.confirm_relay(task_id, self._platform_id(event))
+            payload = self._payload(task)
+            try:
+                adapter = self._adapter(event)
+                if payload.get("mention_all"):
+                    await adapter.send_group_at_all(task["group_id"], payload["content"])
+                else:
+                    await adapter.send_group_text(task["group_id"], payload["content"])
+            except QQAdapterError as exc:
+                await self.manager.finish_relay(task["id"], False, str(exc))
+                return f"转述发送失败：{exc}。该 Relay 已标记失败，请重新准备。"
+            await self.manager.finish_relay(task["id"], True)
+            return f"已将 Relay {task['id']} 发送到「{task['group_alias']}」。"
+        except (KeyError, ValueError) as exc:
+            return f"确认转述失败：{exc}"
 
     async def _tasks(self, event: AstrMessageEvent, group: str | None = None) -> str:
         tasks = await self.manager.list_tasks(self._platform_id(event), group or None)
@@ -347,6 +580,7 @@ class LumielleNexus(Star):
     async def _scheduler_loop(self) -> None:
         while True:
             try:
+                await self.manager.prune_archive_if_due()
                 await self.manager.materialize_due_schedules()
                 for task in await self.manager.due_tasks():
                     try:
@@ -378,12 +612,63 @@ class LumielleNexus(Star):
         if payload.get("kind") == "collection_chase":
             await self._execute_collection_chase(task, payload)
             return True
+        if payload.get("kind") == "weekly_summary":
+            await self._execute_weekly_summary(task, payload)
+            return True
         adapter = QQAdapter(self.context, task["platform_id"])
         if payload.get("mention_all"):
             await adapter.send_group_at_all(task["group_id"], payload["message"])
         else:
             await adapter.send_group_text(task["group_id"], payload["message"])
         return True
+
+    async def _execute_weekly_summary(
+        self,
+        task: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        cached = self._payload({"payload": task.get("result")})
+        summary_text = cached.get("summary_text")
+        if not summary_text:
+            scheduled = datetime.fromisoformat(payload["scheduled_run_at"])
+            if scheduled.tzinfo is None:
+                scheduled = scheduled.replace(tzinfo=timezone.utc)
+            window_end = scheduled.astimezone(timezone.utc)
+            window_start = window_end - timedelta(days=int(payload["lookback_days"]))
+            snapshot = await self.manager.summary_snapshot(
+                task["group_id"],
+                window_start.isoformat(timespec="seconds"),
+                window_end.isoformat(timespec="seconds"),
+                task["platform_id"],
+            )
+            summary_body = await generate_group_summary(
+                self.context,
+                str(payload["provider_id"]),
+                snapshot["messages"],
+                snapshot["message_count"],
+                snapshot["window_start"],
+                snapshot["window_end"],
+                str(payload.get("focus") or ""),
+            )
+            summary_text = (
+                "【群聊周报】\n"
+                f"时间范围：{format_local_time(snapshot['window_start'], self.manager.timezone_name, 'minutes')}"
+                f" 至 {format_local_time(snapshot['window_end'], self.manager.timezone_name, 'minutes')}\n"
+                f"消息数：{snapshot['message_count']}\n"
+                f"活跃成员数：{snapshot['unique_sender_count']}"
+                + ("\n消息量较大，本次总结使用最近 2000 条文本消息。" if snapshot["truncated"] else "")
+                + f"\n\n{summary_body}"
+            )
+            cached = {
+                "summary_text": summary_text,
+                "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "window_start": snapshot["window_start"],
+                "window_end": snapshot["window_end"],
+            }
+            await self.manager.update_reminder_result(task["id"], cached)
+        await QQAdapter(self.context, task["platform_id"]).send_private_text_chunks(
+            task["creator_id"], summary_text, SUMMARY_PRIVATE_CHUNK_CHARS,
+        )
 
     async def _execute_collection_chase(
         self,
@@ -445,6 +730,9 @@ class LumielleNexus(Star):
             "/nexus tasks [群别名]\n"
             "/nexus task <任务ID>\n"
             "/nexus cancel <任务ID>（提醒或可取消的时间任务父任务）\n"
+            "/nexus archive <群别名> on|off\n"
+            "/nexus archive-status <群别名>\n"
+            "/nexus relay-confirm <X-任务ID>\n"
             "/nexus collect-start 群别名|标题|字段1,字段2[,公告][,all]\n"
             "/nexus collect-status <任务ID>\n"
             "/nexus collect-stop <任务ID>\n"
@@ -464,6 +752,34 @@ class LumielleNexus(Star):
     async def cmd_groups(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
         allowed, message = self._authorized_for_control(event)
         yield event.plain_result(message if not allowed else await self._groups(event))
+
+    @nexus.command("archive", priority=10)
+    async def cmd_archive(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
+        args = self._command_args(event)
+        if len(args) < 2 or args[1].casefold() not in {"on", "off", "开启", "关闭"}:
+            yield event.plain_result("用法：/nexus archive <群别名> on|off")
+            return
+        enabled = args[1].casefold() in {"on", "开启"}
+        yield event.plain_result(await self._set_archive(event, args[0], enabled))
+
+    @nexus.command("archive-status", priority=10)
+    async def cmd_archive_status(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
+        allowed, message = self._authorized_for_control(event)
+        args = self._command_args(event)
+        yield event.plain_result(
+            message if not allowed else (
+                await self._archive_status(event, args[0])
+                if args else "用法：/nexus archive-status <群别名>"
+            ),
+        )
+
+    @nexus.command("relay-confirm", priority=10)
+    async def cmd_relay_confirm(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
+        args = self._command_args(event)
+        yield event.plain_result(
+            await self._confirm_relay(event, args[0])
+            if args else "用法：/nexus relay-confirm <X-任务ID>",
+        )
 
     @nexus.command("tasks", priority=10)
     async def cmd_tasks(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
@@ -536,12 +852,25 @@ class LumielleNexus(Star):
         sender_id = str(event.get_sender_id())
         if sender_id and sender_id == str(event.get_self_id()):
             return
+        group_id = str(event.get_group_id())
+        message_text = str(event.get_message_str() or "")
+        try:
+            await self.manager.archive_group_message(
+                self._platform_id(event),
+                group_id,
+                sender_id,
+                event.get_sender_name(),
+                message_text,
+                source_message_id=self._event_source_message_id(event),
+            )
+        except Exception:
+            logger.exception("群枢归档群消息失败")
         result = await self.manager.process_collection_message(
             self._platform_id(event),
-            str(event.get_group_id()),
+            group_id,
             sender_id,
             event.get_sender_name(),
-            event.get_message_str(),
+            message_text,
         )
         if result is None:
             return
@@ -778,7 +1107,7 @@ class LumielleNexus(Star):
 
     @filter.llm_tool(name="nexus_cancel_task")
     async def nexus_cancel_task(self, event: AstrMessageEvent, task_id: str) -> str:
-        """取消一个尚未执行的一次性提醒，或取消 ACTIVE 的 DDL、周期提醒、课程父任务并级联取消其未执行子提醒。信息收集必须使用 nexus_stop_collection 结束；只能在私聊 operator 中调用。
+        """取消一个尚未执行的一次性提醒、PENDING relay，或取消 ACTIVE 的 DDL、周期、课程、每周总结父任务并级联取消其未执行子提醒。信息收集必须使用 nexus_stop_collection 结束；只能在私聊 operator 中调用。
 
         Args:
             task_id(string): 要取消的任务 ID，例如 R-20260909-001。
@@ -838,3 +1167,143 @@ class LumielleNexus(Star):
             task_id(string): 要结束的收集任务 ID。
         """
         return await self._stop_collection(event, task_id)
+
+    @filter.llm_tool(name="nexus_set_archive")
+    async def nexus_set_archive(self, event: AstrMessageEvent, group: str, enabled: bool) -> str:
+        """开启或关闭已绑定 QQ 群的文本消息归档。默认关闭，开启不会回溯历史；只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 已绑定群别名或群号。
+            enabled(boolean): true 开启从现在开始归档，false 停止新增归档但保留已有数据。
+        """
+        return await self._set_archive(event, group, enabled)
+
+    @filter.llm_tool(name="nexus_archive_status")
+    async def nexus_archive_status(self, event: AstrMessageEvent, group: str) -> str:
+        """查看已绑定群的文本归档开关和消息数量，即使当前关闭也会显示已有数据。只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 已绑定群别名或群号。
+        """
+        allowed, message = self._authorized_for_control(event)
+        return message if not allowed else await self._archive_status(event, group)
+
+    @filter.llm_tool(name="nexus_search_messages")
+    async def nexus_search_messages(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        keyword: str = "",
+        start_time: str = "",
+        end_time: str = "",
+        limit: int = 50,
+    ) -> str:
+        """查询已绑定群的文本归档，时间按插件时区解释；只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 已绑定群别名或群号，不能查询未绑定群。
+            keyword(string): 可选关键词，使用简单文本匹配；留空表示最近消息。
+            start_time(string): 可选起始时间，YYYY-MM-DD HH:MM 或 ISO-8601。
+            end_time(string): 可选结束时间，YYYY-MM-DD HH:MM 或 ISO-8601。
+            limit(number): 返回 1 到 100 条消息，默认 50。
+        """
+        allowed, message = self._authorized_for_control(event)
+        return message if not allowed else await self._search_messages(
+            event, group, keyword, start_time, end_time, limit,
+        )
+
+    @filter.llm_tool(name="nexus_clear_archive")
+    async def nexus_clear_archive(
+        self, event: AstrMessageEvent, group: str, confirm: bool = False,
+    ) -> str:
+        """清空已绑定群的全部文本归档。永久删除；只有用户明确确认“删除/清空该群归档”后才能传 confirm=true。只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 已绑定群别名或群号。
+            confirm(boolean): 只有用户明确确认永久删除时才传 true，否则必须保持 false。
+        """
+        allowed, message = self._authorized_for_control(event)
+        if not allowed:
+            return message
+        if confirm is not True:
+            return "这是永久删除操作，请明确确认后再执行。"
+        try:
+            count = await self.manager.clear_archive(group, self._platform_id(event))
+            return f"已清空「{group}」的 {count} 条消息归档。"
+        except (KeyError, ValueError) as exc:
+            return f"清空归档失败：{exc}"
+
+    @filter.llm_tool(name="nexus_summarize_group")
+    async def nexus_summarize_group(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        start_time: str = "",
+        end_time: str = "",
+        focus: str = "",
+    ) -> str:
+        """根据已绑定群的文本归档生成总结。默认总结最近 7 天；只依据记录，不会自动创建任务；只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 已绑定群别名或群号。
+            start_time(string): 可选起始时间，按插件时区解释。
+            end_time(string): 可选结束时间，按插件时区解释。
+            focus(string): 可选关注重点，例如“DDL 和待办候选”。
+        """
+        allowed, message = self._authorized_for_control(event)
+        return message if not allowed else await self._summarize_group(
+            event, group, start_time, end_time, focus,
+        )
+
+    @filter.llm_tool(name="nexus_create_weekly_summary")
+    async def nexus_create_weekly_summary(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        weekday: int,
+        time_of_day: str,
+        lookback_days: int = 7,
+        focus: str = "",
+    ) -> str:
+        """创建自动每周群聊总结，按计划时间回看固定窗口并私聊发送给创建者。星期 1=Monday 到 7=Sunday；只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 已绑定群别名或群号。
+            weekday(number): 每周星期几，1=Monday 到 7=Sunday。
+            time_of_day(string): 按插件时区解释的 HH:MM。
+            lookback_days(number): 回看天数，1 到 30，默认 7。
+            focus(string): 可选关注重点。
+        """
+        return await self._create_weekly_summary(
+            event, group, weekday, time_of_day, lookback_days, focus,
+        )
+
+    @filter.llm_tool(name="nexus_prepare_relay")
+    async def nexus_prepare_relay(
+        self,
+        event: AstrMessageEvent,
+        target_group: str,
+        content: str,
+        mention_all: bool = False,
+        source_note: str = "",
+    ) -> str:
+        """准备向另一个已绑定群转述内容。即使用户说“发到某群”，第一步也只能调用本工具展示 preview；绝不能在同一轮自动确认或发送。用户明确确认后，再调用 nexus_confirm_relay。只能在私聊 operator 中调用。
+
+        Args:
+            target_group(string): 已绑定的目标群别名或群号。
+            content(string): 待转述内容，最多 6000 个字符。
+            mention_all(boolean): 是否在确认发送时 @全体。
+            source_note(string): 可选来源备注，仅用于 preview 和记录。
+        """
+        return await self._prepare_relay(
+            event, target_group, content, mention_all, source_note,
+        )
+
+    @filter.llm_tool(name="nexus_confirm_relay")
+    async def nexus_confirm_relay(self, event: AstrMessageEvent, task_id: str) -> str:
+        """发送此前已 prepare 且仍为 PENDING 的 relay。只有用户在看到 preview 后明确说“确认发送”才能调用；不能用于首次请求的自动发送。只能在私聊 operator 中调用。
+
+        Args:
+            task_id(string): nexus_prepare_relay 返回的 Relay ID，例如 X-20260909-001。
+        """
+        return await self._confirm_relay(event, task_id)

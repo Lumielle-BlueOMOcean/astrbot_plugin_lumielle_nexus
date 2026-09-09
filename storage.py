@@ -79,6 +79,34 @@ class Storage:
                     PRIMARY KEY (task_id, sender_id),
                     FOREIGN KEY (task_id) REFERENCES tasks(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS group_archive_settings (
+                    platform_id TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    enabled_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (platform_id, group_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS group_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform_id TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    source_message_id TEXT,
+                    sender_id TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    message_text TEXT NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    archived_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_group_messages_time
+                    ON group_messages(platform_id, group_id, sent_at);
+                CREATE INDEX IF NOT EXISTS idx_group_messages_sender_time
+                    ON group_messages(platform_id, group_id, sender_id, sent_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_group_messages_source
+                    ON group_messages(platform_id, group_id, source_message_id)
+                    WHERE source_message_id IS NOT NULL;
                 """,
             )
             columns = {
@@ -367,6 +395,11 @@ class Storage:
             raise KeyError(f"任务不存在：{task_id}")
         return task
 
+    def update_task_result(
+        self, task_id: str, result: dict[str, Any], updated_at: str,
+    ) -> dict[str, Any]:
+        return self.update_task(task_id, result=result, updated_at=updated_at)
+
     def cancel_task(self, task_id: str, platform_id: str, updated_at: str) -> dict[str, Any]:
         with self._lock:
             try:
@@ -440,7 +473,7 @@ class Storage:
             rows = self._conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE type IN ('DDL', 'RECURRING', 'COURSE') AND status = 'ACTIVE'
+                WHERE type IN ('DDL', 'RECURRING', 'COURSE', 'SUMMARY') AND status = 'ACTIVE'
                 ORDER BY run_at, created_at
                 """,
             ).fetchall()
@@ -609,3 +642,210 @@ class Storage:
                 (task_id,),
             ).fetchall()
         return self._rows(rows)
+
+    def get_archive_setting(
+        self, platform_id: str, group_id: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM group_archive_settings WHERE platform_id = ? AND group_id = ?",
+                (str(platform_id), str(group_id)),
+            ).fetchone()
+        return self._row(row)
+
+    def upsert_archive_setting(
+        self,
+        platform_id: str,
+        group_id: str,
+        enabled: bool,
+        updated_at: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT enabled_at FROM group_archive_settings WHERE platform_id = ? AND group_id = ?",
+                (str(platform_id), str(group_id)),
+            ).fetchone()
+            enabled_at = updated_at if enabled else (
+                existing["enabled_at"] if existing else None
+            )
+            self._conn.execute(
+                """
+                INSERT INTO group_archive_settings
+                    (platform_id, group_id, enabled, enabled_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(platform_id, group_id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    enabled_at = excluded.enabled_at,
+                    updated_at = excluded.updated_at
+                """,
+                (str(platform_id), str(group_id), int(bool(enabled)), enabled_at, updated_at),
+            )
+            self._conn.commit()
+        return self.get_archive_setting(str(platform_id), str(group_id))
+
+    def insert_group_message(
+        self,
+        platform_id: str,
+        group_id: str,
+        source_message_id: str | None,
+        sender_id: str,
+        sender_name: str,
+        message_text: str,
+        sent_at: str,
+        archived_at: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                INSERT OR IGNORE INTO group_messages
+                    (platform_id, group_id, source_message_id, sender_id, sender_name,
+                     message_text, sent_at, archived_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(platform_id), str(group_id), source_message_id,
+                    str(sender_id), str(sender_name), str(message_text),
+                    str(sent_at), str(archived_at),
+                ),
+            )
+            self._conn.commit()
+            if cursor.rowcount == 0:
+                return None
+            row = self._conn.execute(
+                "SELECT * FROM group_messages WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+        return self._row(row)
+
+    def archive_status(self, platform_id: str, group_id: str) -> dict[str, Any]:
+        with self._lock:
+            setting = self._conn.execute(
+                "SELECT * FROM group_archive_settings WHERE platform_id = ? AND group_id = ?",
+                (str(platform_id), str(group_id)),
+            ).fetchone()
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS count, MIN(sent_at) AS earliest, MAX(sent_at) AS latest
+                FROM group_messages WHERE platform_id = ? AND group_id = ?
+                """,
+                (str(platform_id), str(group_id)),
+            ).fetchone()
+        return {
+            "enabled": bool(setting and setting["enabled"]),
+            "enabled_at": setting["enabled_at"] if setting else None,
+            "updated_at": setting["updated_at"] if setting else None,
+            "count": int(row["count"]),
+            "earliest": row["earliest"],
+            "latest": row["latest"],
+        }
+
+    def count_group_messages(
+        self, platform_id: str, group_id: str, start_at: str | None = None,
+        end_at: str | None = None,
+    ) -> int:
+        clauses = ["platform_id = ?", "group_id = ?"]
+        params: list[Any] = [str(platform_id), str(group_id)]
+        if start_at:
+            clauses.append("sent_at >= ?")
+            params.append(start_at)
+        if end_at:
+            clauses.append("sent_at <= ?")
+            params.append(end_at)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT COUNT(*) AS count FROM group_messages WHERE {' AND '.join(clauses)}",
+                params,
+            ).fetchone()
+        return int(row["count"])
+
+    def count_group_message_senders(
+        self, platform_id: str, group_id: str, start_at: str | None = None,
+        end_at: str | None = None,
+    ) -> int:
+        clauses = ["platform_id = ?", "group_id = ?"]
+        params: list[Any] = [str(platform_id), str(group_id)]
+        if start_at:
+            clauses.append("sent_at >= ?")
+            params.append(start_at)
+        if end_at:
+            clauses.append("sent_at <= ?")
+            params.append(end_at)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT COUNT(DISTINCT sender_id) AS count FROM group_messages WHERE {' AND '.join(clauses)}",
+                params,
+            ).fetchone()
+        return int(row["count"])
+
+    def search_group_messages(
+        self,
+        platform_id: str,
+        group_id: str,
+        keyword: str,
+        start_at: str | None,
+        end_at: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        clauses = ["platform_id = ?", "group_id = ?"]
+        params: list[Any] = [str(platform_id), str(group_id)]
+        if keyword:
+            clauses.append("message_text LIKE ?")
+            params.append(f"%{keyword}%")
+        if start_at:
+            clauses.append("sent_at >= ?")
+            params.append(start_at)
+        if end_at:
+            clauses.append("sent_at <= ?")
+            params.append(end_at)
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM group_messages
+                WHERE {' AND '.join(clauses)}
+                ORDER BY sent_at DESC, id DESC LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return self._rows(rows)
+
+    def prune_group_messages(self, cutoff: str) -> int:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM group_messages WHERE sent_at < ?", (str(cutoff),),
+            )
+            self._conn.commit()
+        return int(cursor.rowcount)
+
+    def clear_group_messages(self, platform_id: str, group_id: str) -> int:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM group_messages WHERE platform_id = ? AND group_id = ?",
+                (str(platform_id), str(group_id)),
+            )
+            self._conn.commit()
+        return int(cursor.rowcount)
+
+    def claim_relay(
+        self, task_id: str, platform_id: str, updated_at: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT * FROM tasks WHERE id = ? AND platform_id = ?",
+                    (str(task_id), str(platform_id)),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"任务不存在：{task_id}")
+                if row["type"] != "RELAY" or row["status"] != "PENDING":
+                    raise ValueError(f"任务当前不能确认：{row['status']}")
+                self._conn.execute(
+                    "UPDATE tasks SET status = 'PROCESSING', updated_at = ? WHERE id = ?",
+                    (updated_at, str(task_id)),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return self.get_task(str(task_id))

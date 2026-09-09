@@ -134,6 +134,21 @@ class QQAdapter:
             message=[{"type": "text", "data": {"text": str(text)}}],
         )
 
+    async def send_private_text_chunks(
+        self, user_id: str, text: str, max_chars: int = 3500,
+    ) -> list[Any]:
+        """Send long private text in bounded messages."""
+        value = str(text or "")
+        if max_chars < 1:
+            raise ValueError("私聊文本分片长度必须大于 0")
+        chunks = [value[index:index + max_chars] for index in range(0, len(value), max_chars)]
+        if not chunks:
+            chunks = [""]
+        return [
+            await self.send_private_message(user_id, chunk)
+            for chunk in chunks
+        ]
+
     async def upload_private_file(self, user_id: str, path: Path) -> Any:
         path = Path(path)
         try:

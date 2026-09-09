@@ -27,5 +27,17 @@
     "type": "bool",
     "description": "群成员提交后是否回复简短确认",
     "default": true
+  },
+  "archive_max_message_chars": {
+    "type": "int",
+    "description": "单条群消息归档的最大文本字符数",
+    "default": 4000,
+    "hint": "运行时会限制在 256 到 20000 之间。"
+  },
+  "archive_retention_days": {
+    "type": "int",
+    "description": "群消息归档自动保留天数，0 表示不自动清理",
+    "default": 90,
+    "hint": "非 0 值运行时会限制在 7 到 3650 天之间。"
   }
 }

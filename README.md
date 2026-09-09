@@ -2,98 +2,80 @@
 
 微光·群枢（Lumielle Nexus）是一个面向 AstrBot 的跨会话群任务编排插件，让私聊成为控制台，让群聊成为可调度的工作空间。
 
-当前版本：`0.2.1`
+当前版本：`0.3.0`
 
 ## 项目定位
 
-插件面向 QQ + OneBot v11，正式支持 AstrBot 的 `aiocqhttp` 平台，主要用于 NapCat 场景。operator 通过私聊绑定目标群、创建时间任务或信息收集任务，群内成员直接提交，operator 再私聊查看进度或结束统计。
+插件面向 QQ + OneBot v11，首轮正式支持 AstrBot 的 `aiocqhttp` 平台，主要适配 NapCat。operator 通过私聊绑定目标群、创建提醒或收集任务，也可以在授权范围内归档和整理已保存的群文本。
 
 ## 当前支持
 
-- 私聊绑定、查看和管理群别名。
-- 持久化的一次性定时提醒，支持可选 @全体和失败重试。
-- 每周 weekday/time 周期提醒。
-- DDL 截止时间和多个提前提醒。
-- 每周课程提醒，支持地点、提前分钟数和日期范围。
-- 私聊自然语言可调用的群枢 LLM tools。
-- 群内字段式信息收集，同一成员重复提交会更新当前有效记录。
-- 针对信息收集未提交成员的单次或重复催办，只 @当前未提交成员。
-- 收集进度查询、停止收集、XLSX 导出和 QQ 私聊文件回传尝试。
-- SQLite 持久化、重载恢复和提醒失败的 30/120/300 秒退避重试。
-- SQLite 数据保存在 AstrBot 的 `data/plugin_data/astrbot_plugin_lumielle_nexus/` 下。
+- 私聊绑定群别名、查看群和任务。
+- 持久化单次提醒、DDL 提前提醒、每周周期提醒和课程提醒。
+- 在群内启动信息收集，支持字段解析、重复提交更新、进度查询和 XLSX 导出。
+- 收集结束后尝试通过 QQ 私聊回传 Excel；回传失败不会丢失导出文件。
+- 消息归档、关键词/时间范围查询、按需群聊总结。
+- 每周自动总结，并将结果私聊发给创建者。
+- 跨群转述采用 prepare → preview → explicit confirm → send 流程。
 
 ## 安装
 
-将仓库目录放到 AstrBot 的插件目录，或通过 AstrBot 插件管理器安装。安装依赖：
+将本仓库目录放入 AstrBot 插件目录并重载插件，安装依赖：
 
 ```bash
-python3 -m pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
-需要 AstrBot `>=4.28.0,<5`，并配置可用的 `aiocqhttp` OneBot v11 连接（QQ/NapCat）。本插件不会修改 AstrBot Core。
+需要 AstrBot `>=4.28.0,<5`、`aiocqhttp`/OneBot v11 平台和可用的 AstrBot LLM Provider。运行数据由 AstrBot plugin data directory 管理，默认位于 `data/plugin_data/astrbot_plugin_lumielle_nexus/`，不会写入仓库。
 
 ## 配置
 
-在 AstrBot 插件配置中填写：
-
-- `operator_ids`：额外允许控制插件的 QQ 用户 ID；AstrBot Admin 始终允许。
+- `operator_ids`：允许控制插件的额外 QQ 用户 ID；AstrBot Admin 始终允许。
 - `timezone`：默认 `Asia/Shanghai`。
 - `scheduler_interval_seconds`：默认 15 秒，运行时限制在 5–60 秒。
-- `max_retry_count`：提醒发送失败的最大重试次数，默认 3。
+- `max_retry_count`：群提醒失败后的最大重试次数，默认 3。
 - `collection_ack`：是否确认群成员提交，默认开启。
+- `archive_max_message_chars`：单条归档文本最大 4000 字符，运行时限制在 256–20000。
+- `archive_retention_days`：默认保留 90 天；设为 0 表示不自动清理，其他值限制在 7–3650 天。
 
-所有控制操作都必须来自私聊，并由 AstrBot Admin 或 `operator_ids` 授权。群成员提交收集信息不需要 operator 权限。
+所有控制型命令和工具都要求来自私聊，并由 AstrBot Admin 或 `operator_ids` 授权。
 
-## 群绑定与命令 fallback
+## 群绑定与提醒
+
+先在私聊中绑定群：
 
 ```text
 /nexus bind 班群 123456789
 /nexus groups
-/nexus tasks
-/nexus task D-20260909-001
-/nexus cancel R-20260909-001  # 取消尚未执行的一次性提醒，或取消可取消的父任务
 ```
 
-收集命令：
-
-```text
-/nexus collect-start 班群|国庆离校信息|姓名,离校时间,返校时间|请按格式填写|all
-/nexus collect-status C-20260909-001
-/nexus collect-stop C-20260909-001
-```
-
-`/nexus help` 会显示完整 fallback 用法。命令主要用于初始化、调试和模型工具无法正确调用时的确定性操作。`/nexus cancel` 也可以取消 ACTIVE 的 DDL、周期提醒或课程父任务，并级联取消尚未执行的内部提醒；Collection 必须使用 `/nexus collect-stop`。
-
-## 私聊自然语言示例
-
-绑定群后，可以直接私聊：
+之后可以直接私聊：
 
 ```text
 明天下午三点在班群提醒所有人交实验报告。
 ```
 
-或：
+也可以使用可靠的命令 fallback：
 
 ```text
-在班群统计国庆离校信息，需要姓名、离校时间、返校时间，艾特全体开始。
+/nexus tasks
+/nexus task R-...
+/nexus cancel R-...
 ```
 
-其他自然语言示例：
+DDL、周期、课程和 collection chase 都会持久化，插件重载后由同一个 scheduler 恢复。停机期间错过过久的周期/课程/DDL 提前提醒会跳过，普通单次提醒仍保持 durable 行为。
 
-```text
-高数作业 9 月 15 日 23:59 截止，提前三天、一天和三小时提醒班群。
-每周一三五早上 7:40 在班群提醒大家打卡。
-以后每周二 10:00 高等数学，A101，上课前 20 分钟提醒班群，到 1 月 15 日结束。
-每天晚上 8 点催还没填离校信息的人，直到统计结束。
-```
-
-提醒时间由模型转换为明确的 `YYYY-MM-DD HH:MM` 后交给工具，并按配置时区解析。
-
-工具中的 `weekdays` 使用 `1=Monday` 到 `7=Sunday`；DDL 的 `remind_before_minutes` 单位是分钟。周期规则首版只支持每周星期/时间，不支持任意 cron、RRULE、农历、节假日历或自动课表导入。
+发送队列采用持久化的 at-least-once 执行语义；需要避免重复外部操作的 relay 则不进入自动重试队列。
 
 ## 数据收集与 Excel
 
-启动收集后，插件会向群内发送标题、字段和填写说明。成员可以发送：
+例如私聊：
+
+```text
+在班群统计国庆离校信息，需要姓名、离校时间、返校时间，现在开始。
+```
+
+群成员按以下格式提交即可：
 
 ```text
 姓名：张三
@@ -101,24 +83,56 @@ python3 -m pip install -r requirements.txt
 返校时间：10月6日
 ```
 
-支持中文或英文冒号、字段乱序；即使只有一个字段，也必须使用 `字段：值` 或 `字段: 值` 格式，普通聊天不会被记录。停止任务后，会在 plugin data 的 `exports/` 生成包含 `统计结果`、`未提交成员`、`任务信息` 三个 sheet 的 `.xlsx`，并尝试通过 QQ 私聊回传文件。如果 OneBot 无法取得完整群成员名单，导出仍会保留，但未提交人数无法准确计算。QQ 文件回传失败也不会丢失导出文件，回复只展示文件名，不展示服务器绝对路径。
+同一成员再次提交会更新当前有效记录。可使用 `/nexus collect-start`、`/nexus collect-status`、`/nexus collect-stop` 作为 fallback。结束时生成包含统计结果、未提交成员和任务信息的 XLSX，并保存到 plugin data directory 的 `exports/`。
 
-`/nexus cancel` 可以取消尚未执行的一次性提醒，也可以取消 ACTIVE 的 DDL、周期提醒或课程父任务，并级联取消尚未执行的内部提醒；进行中的信息收集请使用 `/nexus collect-stop <任务ID>`，以便正常生成统计结果。
+## 群消息归档
 
-提醒发送采用持久化队列和至少一次（at-least-once）投递语义：在消息已经发出但进程尚未来得及写入完成状态时发生崩溃，重载后可能再次发送同一提醒。
+归档默认关闭。绑定群不会自动开始记录；必须显式开启：
 
-## 时间任务说明
+```text
+/nexus archive 班群 on
+/nexus archive-status 班群
+```
 
-DDL 会创建一个逻辑父任务，并为仍在未来的提前时间生成内部一次性提醒；例如 `4320、1440、180` 分钟分别代表提前 3 天、1 天和 3 小时。过去的提前时间会跳过，截止时间必须在未来。
+开启后才记录新的文本消息，不会回溯开启前的历史；图片、语音、文件和视频内容不会解析。归档默认保留 90 天，也可以通过 `archive_retention_days` 调整或使用 `nexus_clear_archive` 显式清除已有文本数据。关闭归档只停止新增，不会自动删除已有记录。
 
-周期提醒和课程提醒只保留下一次 occurrence。Bot 停机期间错过的旧 occurrence 默认跳过，恢复后不补发陈旧的上课或打卡消息；刚错过且在约 120 秒宽限期内的 occurrence 仍可执行。内部子提醒默认不会出现在普通任务列表中。
+## 群聊总结
 
-DDL、周期提醒和课程提醒的内部子提醒都遵循同一条 120 秒发送宽限：停机后明显过期的子提醒会标记为 skipped，不会补发；独立的一次性提醒和已经进入 retry backoff 的提醒仍按持久化队列恢复执行。
+可以按时间范围请求总结：
 
-信息收集催办会在执行时重新获取群成员，只 @有效且尚未提交的成员；没有未提交成员时不发送消息，重复催办最短间隔为 60 分钟，统计结束后后续催办会自动跳过。
+```text
+总结一下班群最近一周发生了什么。
+帮我整理班群最近一周所有作业、DDL 和需要班委处理的事情。
+```
+
+总结使用 AstrBot 当前 LLM Provider，长记录会按消息边界分块，最多处理最近 2000 条文本消息。消息数和活跃成员数由插件确定性统计。模型只负责整理，不会根据总结自动创建 DDL 或其他任务；DDL/待办内容仍然只是候选，需要 operator 判断后再确认创建。
+
+也可以创建自动周报：
+
+```text
+每周日晚十点把班群本周总结私聊发给我。
+```
+
+周报按照逻辑计划时间回看固定窗口，停机恢复不会积累大量旧周报；LLM 已生成但 QQ 私聊发送失败时，会复用缓存结果重试发送。
+
+## 跨群转述
+
+跨群消息不是一次自然语言请求就直接发送。流程固定为：
+
+```text
+prepare → preview → explicit confirm → send
+```
+
+例如先说“把这段发到班委群”，插件只创建待确认 preview 和 `X-...` Relay ID；用户明确确认后，才调用 `nexus_confirm_relay` 或：
+
+```text
+/nexus relay-confirm X-...
+```
+
+失败的 relay 不会自动重试，避免重复发送；可以重新准备。
 
 ## 当前限制与后续规划
 
-当前版本仍有这些限制：同一群同一时间最多一个 active collection；周期规则只支持 weekly weekday/time；Collection 提交必须使用字段冒号格式，暂不提供复杂自然语言成员信息抽取。
+当前归档只保存可读文本表现，不包含 OCR、语音转写、图片下载、向量检索或长期消息语义抽取。首轮也不包含 WebUI、Redis、ORM、RAG、成员集合或群管理动作。
 
-后续规划包括自然语言 collection extraction、weekly summary、message archive、cross-group relay、member sets，以及 mute/kick/moderation。上述能力当前均未实现。
+后续可考虑：recurring schedule 增强、DDL 工作流、课程表、自然语言 collection extraction、未提交成员自动催办、weekly summary 增强、message archive 扩展、relay 工作流、member sets，以及显式确认的 mute/kick/moderation。

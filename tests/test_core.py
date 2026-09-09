@@ -10,9 +10,16 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from core import (
+    SUMMARY_GRACE_SECONDS,
+    SUMMARY_MAX_MESSAGES,
+    SUMMARY_CHUNK_CHARS,
     TaskManager,
+    build_summary_system_prompt,
+    clamp_archive_max_message_chars,
+    clamp_archive_retention_days,
     clamp_scheduler_interval,
     collection_member_stats,
+    generate_group_summary,
     format_local_time,
     next_interval_occurrence,
     next_course_reminder_occurrence,
@@ -300,9 +307,26 @@ class StorageMigrationTests(unittest.TestCase):
             }
             self.assertIn("parent_id", columns)
             self.assertIn("occurrence_key", columns)
+            table_names = {
+                row[0] for row in storage._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'",
+                ).fetchall()
+            }
+            self.assertIn("group_archive_settings", table_names)
+            self.assertIn("group_messages", table_names)
             self.assertEqual(storage.get_binding("班群", "qq-main")["group_id"], "123")
             self.assertEqual(storage.get_task("R-old")["status"], "PENDING")
             self.assertEqual(len(storage.list_entries("C-old")), 1)
+            storage.create_task(
+                "S-old", "RECURRING", "ACTIVE", "123", "班群", "qq-main", "10001",
+                "origin", "2026-09-09T00:00:00+00:00", "2026-09-10T00:00:00+00:00",
+                {"weekdays": [4], "time_of_day": "08:00", "message": "旧周期"},
+            )
+            storage.create_task(
+                "K-old", "COURSE", "ACTIVE", "123", "班群", "qq-main", "10001",
+                "origin", "2026-09-09T00:00:00+00:00", "2026-09-10T00:00:00+00:00",
+                {"weekdays": [4], "start_time": "08:00", "remind_before_minutes": 20},
+            )
 
             storage.create_task(
                 "D-parent", "DDL", "ACTIVE", "123", "班群", "qq-main", "10001",
@@ -319,6 +343,17 @@ class StorageMigrationTests(unittest.TestCase):
                     "origin", "2026-09-09T00:00:00+00:00", "2026-09-10T00:00:00+00:00", {},
                     parent_id="D-parent", occurrence_key="ddl:-60",
                 )
+            storage.upsert_archive_setting(
+                "qq-main", "123", True, "2026-09-09T02:00:00+00:00",
+            )
+            self.assertIsNotNone(storage.insert_group_message(
+                "qq-main", "123", "m1", "20001", "张三", "旧归档",
+                "2026-09-09T02:00:00+00:00", "2026-09-09T02:00:00+00:00",
+            ))
+            self.assertIsNone(storage.insert_group_message(
+                "qq-main", "123", "m1", "20001", "张三", "重复归档",
+                "2026-09-09T02:00:00+00:00", "2026-09-09T02:00:00+00:00",
+            ))
             visible = {task["id"] for task in storage.list_tasks("qq-main")}
             all_tasks = {task["id"] for task in storage.list_tasks("qq-main", include_children=True)}
             self.assertIn("D-parent", visible)
@@ -633,6 +668,249 @@ class ScheduleCoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ArchiveSummaryRelayTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.storage = Storage(Path(self.temp_dir.name))
+        self.manager = TaskManager(
+            self.storage,
+            timezone_name="Asia/Shanghai",
+            max_retry_count=3,
+            archive_max_message_chars=256,
+            archive_retention_days=90,
+        )
+        await self.manager.bind_group("班群", "123456789", "qq-main", "10001")
+        await self.manager.bind_group("班委群", "987654321", "qq-main", "10001")
+
+    async def asyncTearDown(self):
+        self.storage.close()
+        self.temp_dir.cleanup()
+
+    async def test_archive_is_opt_in_and_upserts_duplicate_source_ids(self):
+        self.assertIsNone(await self.manager.archive_group_message(
+            "qq-main", "123456789", "20001", "张三", "未开启", source_message_id="m0",
+        ))
+        await self.manager.set_archive("班群", True, "qq-main")
+        saved = await self.manager.archive_group_message(
+            "qq-main", "123456789", "20001", "张三", "关键词：实验报告", source_message_id="m1",
+        )
+        self.assertEqual(saved["source_message_id"], "m1")
+        duplicate = await self.manager.archive_group_message(
+            "qq-main", "123456789", "20001", "张三", "重复投递", source_message_id="m1",
+        )
+        self.assertIsNone(duplicate)
+        self.assertEqual((await self.manager.archive_status("班群", "qq-main"))["count"], 1)
+        await self.manager.set_archive("班群", False, "qq-main")
+        await self.manager.archive_group_message(
+            "qq-main", "123456789", "20002", "李四", "关闭后不保存", source_message_id="m2",
+        )
+        status = await self.manager.archive_status("班群", "qq-main")
+        self.assertFalse(status["enabled"])
+        self.assertEqual(status["count"], 1)
+
+    async def test_archive_truncates_empty_messages_searches_local_time_and_prunes(self):
+        await self.manager.set_archive("班群", True, "qq-main")
+        await self.manager.archive_group_message(
+            "qq-main", "123456789", "20001", "张三", "x" * 400,
+            sent_at="2026-09-09T07:31:00+00:00", source_message_id="m1",
+        )
+        await self.manager.archive_group_message(
+            "qq-main", "123456789", "20002", "李四", "DDL 周五交",
+            sent_at="2026-09-09T08:00:00+00:00", source_message_id="m2",
+        )
+        self.assertIsNone(await self.manager.archive_group_message(
+            "qq-main", "123456789", "20003", "王五", "", source_message_id="m3",
+        ))
+        rows = await self.manager.search_messages(
+            "班群", "DDL", "2026-09-09 15:00", "2026-09-09 16:30", 50, "qq-main",
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["sender_name"], "李四")
+        archived_rows = self.storage.search_group_messages(
+            "qq-main", "123456789", "", None, None, 50,
+        )
+        self.assertEqual(len(next(
+            row["message_text"] for row in archived_rows if row["sender_id"] == "20001"
+        )), 256)
+        removed = await self.manager.prune_archive(
+            datetime(2026, 9, 17, tzinfo=timezone.utc), retention_days=7,
+        )
+        self.assertEqual(removed, 2)
+
+    async def test_weekly_summary_parent_materializes_logical_child(self):
+        now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
+        parent = await self.manager.create_weekly_summary(
+            "班群", 7, "22:00", 7, "DDL", "provider-1", "10001", "origin",
+            "qq-main", now=now,
+        )
+        self.assertTrue(parent["id"].startswith("W-"))
+        self.assertEqual(parent["type"], "SUMMARY")
+        self.assertEqual(parent["run_at"], "2026-09-13T14:00:00+00:00")
+        children = await self.manager.materialize_due_schedules(
+            datetime(2026, 9, 13, 14, 0, 1, tzinfo=timezone.utc),
+        )
+        self.assertEqual(len(children), 1)
+        payload = json.loads(children[0]["payload"])
+        self.assertEqual(payload["kind"], "weekly_summary")
+        self.assertEqual(payload["scheduled_run_at"], "2026-09-13T14:00:00+00:00")
+        self.assertEqual(payload["provider_id"], "provider-1")
+        self.assertFalse(should_skip_stale_reminder(
+            children[0], datetime(2026, 9, 14, 13, 59, tzinfo=timezone.utc),
+        ))
+        self.assertTrue(should_skip_stale_reminder(
+            children[0], datetime(2026, 9, 14, 14, 1, tzinfo=timezone.utc),
+        ))
+        self.assertEqual(SUMMARY_GRACE_SECONDS, 24 * 60 * 60)
+
+    async def test_stale_weekly_summary_skips_without_backlog(self):
+        now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
+        parent = await self.manager.create_weekly_summary(
+            "班群", 7, "22:00", 7, "", "provider-1", "10001", "origin",
+            "qq-main", now=now,
+        )
+        run_at = datetime.fromisoformat(parent["run_at"])
+        created = await self.manager.materialize_due_schedules(
+            run_at + timedelta(days=1, seconds=1),
+        )
+        self.assertEqual(created, [])
+        children = self.storage.list_children(parent["id"])
+        self.assertEqual(children, [])
+        self.assertEqual(
+            self.storage.get_task(parent["id"])["run_at"],
+            "2026-09-20T14:00:00+00:00",
+        )
+
+    async def test_cancelled_summary_parent_blocks_claimed_child(self):
+        now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
+        parent = await self.manager.create_weekly_summary(
+            "班群", 7, "22:00", 7, "", "provider-1", "10001", "origin",
+            "qq-main", now=now,
+        )
+        run_at = datetime.fromisoformat(parent["run_at"])
+        await self.manager.materialize_due_schedules(run_at + timedelta(seconds=1))
+        child = (await self.manager.due_tasks(run_at + timedelta(seconds=2)))[0]
+        await self.manager.cancel_task(parent["id"], "qq-main")
+        self.assertEqual(await self.manager.reminder_skip_reason(child), "parent_cancelled")
+
+    async def test_summary_result_cache_is_persisted_on_child(self):
+        task = self.storage.create_task(
+            "R-summary", "REMINDER", "PROCESSING", "123456789", "班群", "qq-main",
+            "10001", "origin", "2026-09-09T00:00:00+00:00",
+            "2026-09-09T01:00:00+00:00", {"kind": "weekly_summary"},
+        )
+        result = await self.manager.update_reminder_result(
+            task["id"], {
+                "summary_text": "缓存周报",
+                "generated_at": "2026-09-09T01:01:00+00:00",
+                "window_start": "2026-09-02T01:00:00+00:00",
+                "window_end": "2026-09-09T01:00:00+00:00",
+            },
+        )
+        self.assertEqual(json.loads(result["result"])["summary_text"], "缓存周报")
+
+    async def test_relay_prepare_claim_and_terminal_state(self):
+        relay = await self.manager.prepare_relay(
+            "班委群", "请确认活动名单", False, "来自班群周报",
+            "qq-main", "10001", "origin",
+        )
+        self.assertTrue(relay["id"].startswith("X-"))
+        self.assertEqual(relay["status"], "PENDING")
+        claimed = await self.manager.confirm_relay(relay["id"], "qq-main")
+        self.assertEqual(claimed["status"], "PROCESSING")
+        completed = await self.manager.finish_relay(relay["id"], True)
+        self.assertEqual(completed["status"], "COMPLETED")
+        with self.assertRaisesRegex(ValueError, "不能确认"):
+            await self.manager.confirm_relay(relay["id"], "qq-main")
+
+    async def test_pending_relay_can_be_cancelled(self):
+        relay = await self.manager.prepare_relay(
+            "班委群", "待取消", False, "", "qq-main", "10001", "origin",
+        )
+        cancelled = await self.manager.cancel_task(relay["id"], "qq-main")
+        self.assertEqual(cancelled["status"], "CANCELLED")
+
+    async def test_relay_is_platform_bound_and_has_no_automatic_retry(self):
+        with self.assertRaisesRegex(ValueError, "6000"):
+            await self.manager.prepare_relay(
+                "班委群", "x" * 6001, False, "", "qq-main", "10001", "origin",
+            )
+        relay = await self.manager.prepare_relay(
+            "班委群", "不能跨平台确认", True, "", "qq-main", "10001", "origin",
+        )
+        with self.assertRaises(KeyError):
+            await self.manager.confirm_relay(relay["id"], "other-platform")
+        claimed = await self.manager.confirm_relay(relay["id"], "qq-main")
+        failed = await self.manager.finish_relay(claimed["id"], False, "发送失败")
+        self.assertEqual(failed["status"], "FAILED")
+        self.assertEqual(failed["retry_count"], 0)
+
+    def test_archive_config_ranges_are_clamped(self):
+        self.assertEqual(
+            [clamp_archive_max_message_chars(value) for value in (1, 4000, 30000)],
+            [256, 4000, 20000],
+        )
+        self.assertEqual(
+            [clamp_archive_retention_days(value) for value in (0, 1, 90, 4000)],
+            [0, 7, 90, 3650],
+        )
+
+
+class SummaryHelperTests(unittest.IsolatedAsyncioTestCase):
+    async def test_summary_prompt_and_short_provider_call(self):
+        class FakeContext:
+            def __init__(self):
+                self.calls = []
+
+            async def llm_generate(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(completion_text="总结内容")
+
+        context = FakeContext()
+        messages = [{
+            "sender_name": "张三",
+            "message_text": "实验报告周五交",
+            "sent_at": "2026-09-09T07:31:00+00:00",
+        }]
+        result = await generate_group_summary(
+            context, "provider-1", messages, 1, "2026-09-09T07:00:00+00:00",
+            "2026-09-09T08:00:00+00:00", "DDL",
+        )
+        self.assertEqual(result, "总结内容")
+        self.assertEqual(len(context.calls), 1)
+        self.assertEqual(context.calls[0]["chat_provider_id"], "provider-1")
+        self.assertIn("只依据提供的群聊记录", context.calls[0]["system_prompt"])
+        self.assertIn("冲突", context.calls[0]["system_prompt"])
+        self.assertIn("待确认", context.calls[0]["system_prompt"])
+        self.assertIn("不要自动创建任务", context.calls[0]["system_prompt"])
+        self.assertNotIn("tools", context.calls[0])
+
+    async def test_summary_chunking_uses_message_boundaries_and_merge_call(self):
+        class FakeContext:
+            def __init__(self):
+                self.calls = []
+
+            async def llm_generate(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(completion_text=f"notes-{len(self.calls)}")
+
+        messages = [
+            {
+                "sender_name": "成员",
+                "message_text": "消息内容 " + ("x" * 5000),
+                "sent_at": f"2026-09-09T0{index}:00:00+00:00",
+            }
+            for index in range(1, 4)
+        ]
+        context = FakeContext()
+        result = await generate_group_summary(
+            context, "provider-1", messages, len(messages), "start", "end", "",
+        )
+        self.assertEqual(result, "notes-3")
+        self.assertGreaterEqual(len(context.calls), 3)
+        self.assertLessEqual(len(context.calls), SUMMARY_MAX_MESSAGES)
+        self.assertEqual(SUMMARY_CHUNK_CHARS, 12000)
+
+
 class CollectionExportTests(unittest.TestCase):
     def test_export_contains_requested_sheets_and_safe_filename(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -777,7 +1055,7 @@ class PluginContractTests(unittest.TestCase):
         metadata = (self.ROOT / "metadata.yaml").read_text(encoding="utf-8")
         config = json.loads((self.ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         self.assertIn("name: astrbot_plugin_lumielle_nexus", metadata)
-        self.assertIn('version: "0.2.1"', metadata)
+        self.assertIn('version: "0.3.0"', metadata)
         self.assertIn('astrbot_version: ">=4.28.0,<5"', metadata)
         self.assertIn("- aiocqhttp", metadata)
         self.assertEqual(config["operator_ids"]["default"], [])
@@ -785,6 +1063,8 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(config["scheduler_interval_seconds"]["default"], 15)
         self.assertEqual(config["max_retry_count"]["default"], 3)
         self.assertTrue(config["collection_ack"]["default"])
+        self.assertEqual(config["archive_max_message_chars"]["default"], 4000)
+        self.assertEqual(config["archive_retention_days"]["default"], 90)
 
     def test_main_contract_has_current_registration_points(self):
         main = (self.ROOT / "main.py").read_text(encoding="utf-8")
@@ -804,6 +1084,14 @@ class PluginContractTests(unittest.TestCase):
             "nexus_create_recurring_reminder",
             "nexus_create_course",
             "nexus_schedule_collection_chase",
+            "nexus_set_archive",
+            "nexus_archive_status",
+            "nexus_search_messages",
+            "nexus_clear_archive",
+            "nexus_summarize_group",
+            "nexus_create_weekly_summary",
+            "nexus_prepare_relay",
+            "nexus_confirm_relay",
         ):
             self.assertIn(tool_name, main)
         self.assertIn("event_message_type", main)
@@ -813,11 +1101,17 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("1=Monday", main)
         self.assertIn("/nexus task", main)
         readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("0.2.1", readme)
+        self.assertIn("0.3.0", readme)
+        self.assertIn("默认关闭", readme)
+        self.assertIn("prepare", readme)
+        self.assertIn("confirm", readme)
         self.assertIn("weekly", readme)
         self.assertIn("at-least-once", readme)
         self.assertNotIn("event.stop_event()", main)
         self.assertIn("尚未执行的一次性提醒", main)
+        self.assertIn("get_current_chat_provider_id", main)
+        self.assertIn("llm_generate", main)
+        self.assertNotIn("get_using_provider()", main)
 
     def test_package_style_core_import_uses_package_storage(self):
         package_name = "data.plugins.astrbot_plugin_lumielle_nexus"
@@ -971,6 +1265,29 @@ class QQAdapterTests(unittest.IsolatedAsyncioTestCase):
             call[1]["message"][-1]["data"]["text"] == "请尽快提交"
             for call in client.calls
         ))
+
+    async def test_private_text_chunks_are_sent_sequentially(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def call_action(self, action, **kwargs):
+                self.calls.append((action, kwargs))
+                return {"status": "ok"}
+
+        client = FakeClient()
+        platform = SimpleNamespace(
+            meta=lambda: SimpleNamespace(name="aiocqhttp", id="qq-main"),
+            get_client=lambda: client,
+        )
+        context = SimpleNamespace(get_platform_inst=lambda platform_id: platform)
+        from qq_adapter import QQAdapter
+
+        await QQAdapter(context, "qq-main").send_private_text_chunks("10001", "abcdef", 3)
+        self.assertEqual(
+            [call[1]["message"][0]["data"]["text"] for call in client.calls],
+            ["abc", "def"],
+        )
 
 
 if __name__ == "__main__":
