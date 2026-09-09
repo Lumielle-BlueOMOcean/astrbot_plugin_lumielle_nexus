@@ -398,7 +398,17 @@ class Storage:
     def update_task_result(
         self, task_id: str, result: dict[str, Any], updated_at: str,
     ) -> dict[str, Any]:
-        return self.update_task(task_id, result=result, updated_at=updated_at)
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(f"任务不存在：{task_id}")
+        try:
+            existing = json.loads(task.get("result") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+        merged = {**existing, **dict(result)}
+        return self.update_task(task_id, result=merged, updated_at=updated_at)
 
     def cancel_task(self, task_id: str, platform_id: str, updated_at: str) -> dict[str, Any]:
         with self._lock:
@@ -464,6 +474,30 @@ class Storage:
                 WHERE type = 'REMINDER' AND status = 'PROCESSING'
                 """,
                 (updated_at,),
+            )
+            self._conn.commit()
+        return int(cursor.rowcount)
+
+    def recover_processing_relays(self, updated_at: str) -> int:
+        """Mark interrupted relay confirmations failed without resending them."""
+        result_json = json.dumps({
+            "delivery_outcome": "unknown",
+            "reason": "interrupted_during_confirm",
+        }, ensure_ascii=False)
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'FAILED', updated_at = ?, finished_at = ?,
+                    last_error = ?, result = ?
+                WHERE type = 'RELAY' AND status = 'PROCESSING'
+                """,
+                (
+                    updated_at,
+                    updated_at,
+                    "Relay execution interrupted; delivery outcome unknown",
+                    result_json,
+                ),
             )
             self._conn.commit()
         return int(cursor.rowcount)
@@ -789,8 +823,14 @@ class Storage:
         clauses = ["platform_id = ?", "group_id = ?"]
         params: list[Any] = [str(platform_id), str(group_id)]
         if keyword:
-            clauses.append("message_text LIKE ?")
-            params.append(f"%{keyword}%")
+            escaped_keyword = (
+                str(keyword)
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            clauses.append("message_text LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped_keyword}%")
         if start_at:
             clauses.append("sent_at >= ?")
             params.append(start_at)
@@ -827,8 +867,14 @@ class Storage:
         return int(cursor.rowcount)
 
     def claim_relay(
-        self, task_id: str, platform_id: str, updated_at: str,
+        self,
+        task_id: str,
+        platform_id: str,
+        confirmer_id: str,
+        updated_at: str,
+        expires_before: str | None = None,
     ) -> dict[str, Any]:
+        expired = False
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -840,12 +886,50 @@ class Storage:
                     raise KeyError(f"任务不存在：{task_id}")
                 if row["type"] != "RELAY" or row["status"] != "PENDING":
                     raise ValueError(f"任务当前不能确认：{row['status']}")
-                self._conn.execute(
-                    "UPDATE tasks SET status = 'PROCESSING', updated_at = ? WHERE id = ?",
-                    (updated_at, str(task_id)),
-                )
+                if str(row["creator_id"]) != str(confirmer_id):
+                    raise ValueError("该 Relay 只能由创建 preview 的 operator 确认发送。")
+                if expires_before and str(row["created_at"]) < str(expires_before):
+                    self._conn.execute(
+                        """
+                        UPDATE tasks
+                        SET status = 'CANCELLED', updated_at = ?, finished_at = ?,
+                            result = ?
+                        WHERE id = ? AND platform_id = ? AND type = 'RELAY'
+                          AND status = 'PENDING' AND creator_id = ?
+                        """,
+                        (
+                            updated_at,
+                            updated_at,
+                            json.dumps({
+                                "skipped": True,
+                                "reason": "relay_preview_expired",
+                            }, ensure_ascii=False),
+                            str(task_id),
+                            str(platform_id),
+                            str(confirmer_id),
+                        ),
+                    )
+                    expired = True
+                else:
+                    cursor = self._conn.execute(
+                        """
+                        UPDATE tasks SET status = 'PROCESSING', updated_at = ?
+                        WHERE id = ? AND platform_id = ? AND type = 'RELAY'
+                          AND status = 'PENDING' AND creator_id = ?
+                        """,
+                        (
+                            updated_at,
+                            str(task_id),
+                            str(platform_id),
+                            str(confirmer_id),
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError("任务当前不能确认：状态已改变")
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
+        if expired:
+            raise ValueError("该 Relay preview 已过期，请重新准备后确认。")
         return self.get_task(str(task_id))

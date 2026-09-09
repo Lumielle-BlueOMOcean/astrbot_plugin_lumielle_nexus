@@ -21,6 +21,7 @@ if __package__:
         clamp_archive_retention_days,
         clamp_scheduler_interval,
         collection_member_stats,
+        deliver_text_chunks,
         format_local_time,
         generate_group_summary,
         next_interval_occurrence,
@@ -36,6 +37,7 @@ else:
         clamp_archive_retention_days,
         clamp_scheduler_interval,
         collection_member_stats,
+        deliver_text_chunks,
         format_local_time,
         generate_group_summary,
         next_interval_occurrence,
@@ -350,7 +352,10 @@ class LumielleNexus(Star):
                 f"活跃成员数：{snapshot['unique_sender_count']}"
             )
             if snapshot["truncated"]:
-                metadata += "\n消息量较大，本次总结使用最近 2000 条文本消息。"
+                metadata += (
+                    "\n消息量较大，本次总结受输入预算限制，仅使用时间窗口内最近的部分文本消息。"
+                    f"\n用于总结：{len(snapshot['messages'])} 条"
+                )
             return f"{metadata}\n\n{summary}"
         except (KeyError, ValueError) as exc:
             return f"群消息已读取，但当前无法调用 AstrBot LLM Provider 生成总结：{exc}"
@@ -421,7 +426,11 @@ class LumielleNexus(Star):
         if not allowed:
             return message
         try:
-            task = await self.manager.confirm_relay(task_id, self._platform_id(event))
+            task = await self.manager.confirm_relay(
+                task_id,
+                self._platform_id(event),
+                str(event.get_sender_id()),
+            )
             payload = self._payload(task)
             try:
                 adapter = self._adapter(event)
@@ -656,7 +665,11 @@ class LumielleNexus(Star):
                 f" 至 {format_local_time(snapshot['window_end'], self.manager.timezone_name, 'minutes')}\n"
                 f"消息数：{snapshot['message_count']}\n"
                 f"活跃成员数：{snapshot['unique_sender_count']}"
-                + ("\n消息量较大，本次总结使用最近 2000 条文本消息。" if snapshot["truncated"] else "")
+                + (
+                    "\n消息量较大，本次总结受输入预算限制，仅使用时间窗口内最近的部分文本消息。"
+                    f"\n用于总结：{len(snapshot['messages'])} 条"
+                    if snapshot["truncated"] else ""
+                )
                 + f"\n\n{summary_body}"
             )
             cached = {
@@ -664,10 +677,25 @@ class LumielleNexus(Star):
                 "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "window_start": snapshot["window_start"],
                 "window_end": snapshot["window_end"],
+                "sent_chunk_count": 0,
             }
             await self.manager.update_reminder_result(task["id"], cached)
-        await QQAdapter(self.context, task["platform_id"]).send_private_text_chunks(
-            task["creator_id"], summary_text, SUMMARY_PRIVATE_CHUNK_CHARS,
+        cached["summary_text"] = summary_text
+        adapter = QQAdapter(self.context, task["platform_id"])
+
+        async def send_chunk(chunk: str) -> Any:
+            return await adapter.send_private_message(task["creator_id"], chunk)
+
+        async def save_progress(sent_chunk_count: int) -> None:
+            cached["sent_chunk_count"] = sent_chunk_count
+            await self.manager.update_reminder_result(task["id"], cached)
+
+        await deliver_text_chunks(
+            summary_text,
+            SUMMARY_PRIVATE_CHUNK_CHARS,
+            int(cached.get("sent_chunk_count") or 0),
+            send_chunk,
+            save_progress,
         )
 
     async def _execute_collection_chase(
