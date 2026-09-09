@@ -25,6 +25,7 @@ SUMMARY_MAX_TOTAL_CHARS = 120000
 SUMMARY_MAX_CHUNKS = 10
 SUMMARY_PRIVATE_CHUNK_CHARS = 3500
 RELAY_CONFIRM_TTL_SECONDS = 60 * 60
+MODERATION_CONFIRM_TTL_SECONDS = 10 * 60
 
 
 def utc_now_iso() -> str:
@@ -517,17 +518,152 @@ def format_local_time(
     return parsed.astimezone(local_zone).strftime(format_string)
 
 
+def _is_robot_member(member: dict[str, Any]) -> bool:
+    value = member.get("is_robot")
+    return value is True or str(value).strip().casefold() in {"1", "true", "yes"}
+
+
+def member_display_name(member: dict[str, Any]) -> str:
+    return str(
+        member.get("card")
+        or member.get("nickname")
+        or member.get("user_id")
+        or "未知成员"
+    ).strip()
+
+
+def member_role(member: dict[str, Any]) -> str:
+    return str(member.get("role") or "member").strip().casefold() or "member"
+
+
+def is_human_member(member: dict[str, Any], self_id: str | None = None) -> bool:
+    member_id = str(member.get("user_id") or "").strip()
+    excluded_id = str(self_id or "").strip()
+    return bool(member_id) and member_id != excluded_id and not _is_robot_member(member)
+
+
+def search_group_members(
+    members: list[dict[str, Any]],
+    query: str = "",
+    limit: int = 20,
+    self_id: str | None = None,
+) -> list[dict[str, Any]]:
+    if isinstance(limit, bool) or not isinstance(limit, (int, str)):
+        raise ValueError("limit 必须是 1 到 50 的整数")
+    try:
+        limit_number = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit 必须是 1 到 50 的整数") from exc
+    if not 1 <= limit_number <= 50:
+        raise ValueError("limit 必须是 1 到 50 的整数")
+    needle = str(query or "").strip().casefold()
+    results: list[dict[str, Any]] = []
+    for member in members:
+        if not is_human_member(member, self_id):
+            continue
+        values = (
+            str(member.get("user_id") or ""),
+            str(member.get("card") or ""),
+            str(member.get("nickname") or ""),
+        )
+        if needle and not any(needle in value.casefold() for value in values):
+            continue
+        results.append(dict(member))
+        if len(results) >= limit_number:
+            break
+    return results
+
+
+def resolve_member_refs(
+    members: list[dict[str, Any]],
+    refs: list[str],
+    self_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Resolve IDs/cards/nicknames without guessing partial matches."""
+    if not isinstance(refs, list) or not refs:
+        raise ValueError("至少需要一个成员引用")
+    eligible = [member for member in members if is_human_member(member, self_id)]
+    resolved: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_ref in refs:
+        ref = str(raw_ref or "").strip()
+        if not ref:
+            raise ValueError("成员引用不能为空")
+        ref_folded = ref.casefold()
+        matches = [
+            member for member in eligible
+            if str(member.get("user_id") or "").strip() == ref
+        ]
+        if not matches:
+            matches = [
+                member for member in eligible
+                if str(member.get("card") or "").strip().casefold() == ref_folded
+            ]
+        if not matches:
+            matches = [
+                member for member in eligible
+                if str(member.get("nickname") or "").strip().casefold() == ref_folded
+            ]
+        if not matches:
+            raise ValueError(f"未找到成员：{ref}")
+        unique_matches = {
+            str(member.get("user_id") or "").strip(): member for member in matches
+        }
+        if len(unique_matches) > 1:
+            details = "、".join(
+                f"{user_id} {member_display_name(member)}"
+                for user_id, member in unique_matches.items()
+            )
+            raise ValueError(
+                f"“{ref}”匹配到多个成员：{details}，请使用 QQ 号明确指定。",
+            )
+        member = next(iter(unique_matches.values()))
+        member_id = str(member["user_id"]).strip()
+        if member_id not in seen:
+            resolved.append(dict(member))
+            seen.add(member_id)
+    return resolved
+
+
+def validate_moderation_preflight(
+    bot_member: dict[str, Any],
+    target_member: dict[str, Any],
+    bot_id: str,
+    target_id: str,
+) -> str | None:
+    bot_role = member_role(bot_member)
+    target_role = member_role(target_member)
+    if str(bot_id).strip() == str(target_id).strip():
+        return "不能对机器人自己执行群管理操作。"
+    if _is_robot_member(target_member):
+        return "不能对机器人账号执行群管理操作。"
+    if bot_role not in {"owner", "admin"}:
+        return "机器人不是该群管理员，不能执行群管理操作。"
+    if target_role == "owner":
+        return "不能操作群主。"
+    if bot_role == "admin" and target_role == "admin":
+        return "不能操作管理员目标：普通管理员机器人不能操作其他管理员。"
+    return None
+
+
 def collection_member_stats(
     members: list[dict[str, Any]],
     entries: list[dict[str, Any]],
     self_id: str | None = None,
+    target_ids: list[str] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Return member/submission sets using one consistent eligibility rule."""
     excluded_id = str(self_id or "").strip()
+    target_id_set = (
+        {str(item).strip() for item in target_ids}
+        if target_ids is not None else None
+    )
     eligible_members: dict[str, dict[str, Any]] = {}
     for member in members:
         member_id = str(member.get("user_id", "")).strip()
-        if not member_id or member_id == excluded_id or member.get("is_robot") is True:
+        if not is_human_member(member, excluded_id):
+            continue
+        if target_id_set is not None and member_id not in target_id_set:
             continue
         eligible_members[member_id] = member
     eligible_ids = set(eligible_members)
@@ -570,6 +706,7 @@ class TaskManager:
         self.lock = asyncio.Lock()
         self.storage.recover_processing_reminders(utc_now_iso())
         self.storage.recover_processing_relays(utc_now_iso())
+        self.storage.recover_processing_moderations(utc_now_iso())
 
     def _task_id(self, prefix: str) -> str:
         date_token = datetime.now(self.timezone).strftime("%Y%m%d")
@@ -614,6 +751,192 @@ class TaskManager:
     async def list_groups(self, platform_id: str) -> list[dict[str, Any]]:
         async with self.lock:
             return self.storage.list_bindings(platform_id)
+
+    async def get_binding(self, group: str, platform_id: str) -> dict[str, Any]:
+        async with self.lock:
+            return self._resolve_binding(group, platform_id)
+
+    @staticmethod
+    def _clean_member_set_name(name: str) -> str:
+        clean_name = str(name or "").strip()
+        if not 1 <= len(clean_name) <= 40:
+            raise ValueError("成员集合名称长度必须为 1 到 40 个字符")
+        return clean_name
+
+    @staticmethod
+    def _member_set_records(members: list[dict[str, Any]]) -> list[dict[str, str]]:
+        return [
+            {
+                "user_id": str(member["user_id"]).strip(),
+                "display_name": member_display_name(member),
+            }
+            for member in members
+        ]
+
+    async def set_member_set(
+        self,
+        group: str,
+        name: str,
+        members: list[str],
+        mode: str,
+        platform_id: str,
+        creator_id: str,
+        live_members: list[dict[str, Any]],
+        self_id: str | None = None,
+    ) -> dict[str, Any]:
+        clean_name = self._clean_member_set_name(name)
+        mode = str(mode or "replace").strip().casefold()
+        if mode not in {"replace", "add", "remove"}:
+            raise ValueError("成员集合 mode 只能是 replace、add 或 remove")
+        async with self.lock:
+            binding = self._resolve_binding(group, platform_id)
+            existing = self.storage.get_member_set(
+                platform_id, binding["group_id"], clean_name,
+            )
+            existing_members = (
+                self.storage.list_member_set_members(existing["id"])
+                if existing else []
+            )
+            existing_ids = {str(member["user_id"]) for member in existing_members}
+            if mode == "replace" and not members:
+                raise ValueError("replace 不能创建空成员集合，成员集合不能为空；如需清空请删除集合")
+            if mode in {"add", "remove"} and existing is None:
+                raise ValueError(f"未找到成员集合：{clean_name}")
+
+            resolved: list[dict[str, Any]] = []
+            if mode in {"replace", "add"}:
+                resolved = resolve_member_refs(live_members, members, self_id)
+                resolved_ids = {str(member["user_id"]) for member in resolved}
+                final_ids = resolved_ids if mode == "replace" else existing_ids | resolved_ids
+            else:
+                removal_ids: set[str] = set()
+                for ref in members:
+                    clean_ref = str(ref or "").strip()
+                    if clean_ref in existing_ids:
+                        removal_ids.add(clean_ref)
+                        continue
+                    current_match = resolve_member_refs(live_members, [clean_ref], self_id)
+                    candidate_id = str(current_match[0]["user_id"])
+                    if candidate_id in existing_ids:
+                        removal_ids.add(candidate_id)
+                    else:
+                        raise ValueError(f"成员不在集合中：{clean_ref}")
+                final_ids = existing_ids - removal_ids
+            if not final_ids:
+                raise ValueError("成员集合不能为空；如需清空请删除集合")
+            if len(final_ids) > 2000:
+                raise ValueError("单个成员集合最多保存 2000 名成员")
+            by_id = {
+                str(member["user_id"]): member
+                for member in live_members
+                if str(member.get("user_id") or "").strip()
+            }
+            stored_by_id = {
+                str(member["user_id"]): member for member in existing_members
+            }
+            records = []
+            for member_id in sorted(final_ids):
+                live = by_id.get(member_id)
+                records.append({
+                    "user_id": member_id,
+                    "display_name": member_display_name(live) if live else str(
+                        stored_by_id.get(member_id, {}).get("display_name") or member_id
+                    ),
+                })
+            now = utc_now_iso()
+            member_set = existing or self.storage.ensure_member_set(
+                platform_id,
+                binding["group_id"],
+                clean_name,
+                str(creator_id),
+                now,
+            )
+            self.storage.replace_member_set_members(member_set["id"], records, now)
+            return {
+                **member_set,
+                "name": clean_name,
+                "members": self.storage.list_member_set_members(member_set["id"]),
+            }
+
+    async def list_member_sets(
+        self, group: str, platform_id: str,
+    ) -> list[dict[str, Any]]:
+        async with self.lock:
+            group_id = None
+            if str(group or "").strip():
+                group_id = self._resolve_binding(group, platform_id)["group_id"]
+            sets = self.storage.list_member_sets(platform_id, group_id)
+            for member_set in sets:
+                member_set["member_count"] = len(
+                    self.storage.list_member_set_members(member_set["id"])
+                )
+            return sets
+
+    async def get_member_set(
+        self,
+        group: str,
+        name: str,
+        platform_id: str,
+        live_members: list[dict[str, Any]] | None = None,
+        self_id: str | None = None,
+    ) -> dict[str, Any]:
+        async with self.lock:
+            binding = self._resolve_binding(group, platform_id)
+            clean_name = self._clean_member_set_name(name)
+            member_set = self.storage.get_member_set(
+                platform_id, binding["group_id"], clean_name,
+            )
+            if member_set is None:
+                raise KeyError(f"未找到成员集合：{clean_name}")
+            stored = self.storage.list_member_set_members(member_set["id"])
+            live_ids = None
+            if live_members is not None:
+                live_ids = {
+                    str(member["user_id"]).strip()
+                    for member in live_members
+                    if is_human_member(member, self_id)
+                }
+            members = [
+                {
+                    **member,
+                    "present": None if live_ids is None else member["user_id"] in live_ids,
+                }
+                for member in stored
+            ]
+            return {
+                **member_set,
+                "members": members,
+                "members_by_id": {member["user_id"]: member for member in members},
+            }
+
+    async def member_set_snapshot(
+        self,
+        group: str,
+        name: str,
+        platform_id: str,
+        live_members: list[dict[str, Any]],
+        self_id: str | None = None,
+    ) -> dict[str, Any]:
+        member_set = await self.get_member_set(
+            group, name, platform_id, live_members, self_id,
+        )
+        ids = [
+            member["user_id"] for member in member_set["members"]
+            if member["present"] is True
+        ]
+        if not ids:
+            raise ValueError("成员集合当前没有可发送的群成员")
+        return {"member_set": member_set, "user_ids": ids}
+
+    async def delete_member_set(
+        self, group: str, name: str, platform_id: str,
+    ) -> int:
+        async with self.lock:
+            binding = self._resolve_binding(group, platform_id)
+            clean_name = self._clean_member_set_name(name)
+            return self.storage.delete_member_set(
+                platform_id, binding["group_id"], clean_name,
+            )
 
     async def set_archive(
         self, group: str, enabled: bool, platform_id: str,
@@ -1169,7 +1492,7 @@ class TaskManager:
             elif task["type"] in {"DDL", "RECURRING", "COURSE", "SUMMARY"}:
                 if task["status"] != "ACTIVE":
                     raise ValueError(f"任务当前不能取消：{task['status']}")
-            elif task["type"] == "RELAY":
+            elif task["type"] in {"RELAY", "MODERATION"}:
                 if task["status"] != "PENDING":
                     raise ValueError(f"任务当前不能取消：{task['status']}")
             else:
@@ -1186,6 +1509,7 @@ class TaskManager:
         platform_id: str,
         creator_id: str,
         creator_private_origin: str,
+        target_member_set: str = "",
     ) -> dict[str, Any]:
         title = str(title or "").strip()
         clean_fields = [str(field).strip() for field in (fields or []) if str(field).strip()]
@@ -1204,6 +1528,24 @@ class TaskManager:
                 "announcement": str(announcement or "").strip(),
                 "mention_all": bool(mention_all),
             }
+            clean_set_name = str(target_member_set or "").strip()
+            if clean_set_name:
+                member_set = self.storage.get_member_set(
+                    platform_id, binding["group_id"],
+                    self._clean_member_set_name(clean_set_name),
+                )
+                if member_set is None:
+                    raise KeyError(f"未找到成员集合：{clean_set_name}")
+                target_ids = [
+                    member["user_id"]
+                    for member in self.storage.list_member_set_members(member_set["id"])
+                ]
+                if not target_ids:
+                    raise ValueError("目标成员集合不能为空")
+                payload.update({
+                    "target_member_set": clean_set_name,
+                    "target_member_ids": target_ids,
+                })
             return self.storage.create_collection_task(
                 task_id=self._task_id("C"),
                 group_id=binding["group_id"],
@@ -1228,6 +1570,11 @@ class TaskManager:
             if task is None:
                 return None
             payload = json.loads(task["payload"])
+            target_ids = payload.get("target_member_ids")
+            if target_ids is not None and str(sender_id) not in {
+                str(item).strip() for item in target_ids
+            }:
+                return None
             parsed = parse_collection_submission(payload["fields"], raw_message)
             if not parsed:
                 return None
@@ -1338,15 +1685,48 @@ class TaskManager:
         platform_id: str,
         creator_id: str,
         creator_private_origin: str,
+        member_set: str = "",
+        mention_user_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         content = str(content or "").strip()
         if not content:
             raise ValueError("转述内容不能为空")
         if len(content) > 6000:
             raise ValueError("转述内容不能超过 6000 个字符")
+        member_set = str(member_set or "").strip()
+        normalized_ids = [
+            str(user_id).strip() for user_id in (mention_user_ids or [])
+            if str(user_id).strip()
+        ]
+        if mention_all and member_set:
+            raise ValueError("mention_all 与 member_set 互斥")
+        if member_set and not normalized_ids:
+            raise ValueError("成员集合当前没有可发送的群成员")
         async with self.lock:
             binding = self._resolve_binding(target_group, platform_id)
+            if member_set:
+                stored_set = self.storage.get_member_set(
+                    platform_id, binding["group_id"], self._clean_member_set_name(member_set),
+                )
+                if stored_set is None:
+                    raise KeyError(f"未找到成员集合：{member_set}")
+                stored_ids = {
+                    member["user_id"]
+                    for member in self.storage.list_member_set_members(stored_set["id"])
+                }
+                if any(user_id not in stored_ids for user_id in normalized_ids):
+                    raise ValueError("转述成员快照包含不在该成员集合中的成员")
             now = utc_now_iso()
+            payload = {
+                "content": content,
+                "mention_all": bool(mention_all),
+                "source_note": str(source_note or "").strip(),
+            }
+            if member_set:
+                payload.update({
+                    "mention_member_set": member_set,
+                    "mention_user_ids": list(dict.fromkeys(normalized_ids)),
+                })
             return self.storage.create_task(
                 task_id=self._task_id("X"),
                 task_type="RELAY",
@@ -1358,11 +1738,7 @@ class TaskManager:
                 creator_private_origin=str(creator_private_origin),
                 created_at=now,
                 run_at=None,
-                payload={
-                    "content": content,
-                    "mention_all": bool(mention_all),
-                    "source_note": str(source_note or "").strip(),
-                },
+                payload=payload,
             )
 
     async def confirm_relay(
@@ -1401,6 +1777,122 @@ class TaskManager:
             return self.storage.update_task(
                 task_id,
                 status="FAILED",
+                last_error=str(error)[:1000],
+                updated_at=now,
+                finished_at=now,
+            )
+
+    async def prepare_moderation(
+        self,
+        group: str,
+        action: str,
+        target_id: str,
+        target_display_name: str,
+        target_role: str,
+        bot_role: str,
+        duration_seconds: int,
+        reject_add_request: bool,
+        reason: str,
+        platform_id: str,
+        creator_id: str,
+        creator_private_origin: str,
+        *,
+        bot_id: str = "",
+        target_member: dict[str, Any] | None = None,
+        bot_member: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        action = str(action or "").strip().casefold()
+        if action not in {"mute", "unmute", "kick"}:
+            raise ValueError("群管理 action 只能是 mute、unmute 或 kick")
+        target_id = str(target_id or "").strip()
+        if not target_id:
+            raise ValueError("群管理目标不能为空")
+        if action == "mute":
+            duration = _coerce_nonnegative_int(duration_seconds, "禁言时长")
+            if not 60 <= duration <= 30 * 24 * 60 * 60:
+                raise ValueError("禁言时长必须在 60 到 2592000 秒之间")
+        elif action == "unmute":
+            duration = _coerce_nonnegative_int(duration_seconds, "解禁时长")
+            if duration != 0:
+                raise ValueError("unmute 的 duration_seconds 必须为 0")
+        else:
+            duration = 0
+        if target_member is not None and bot_member is not None:
+            preflight_error = validate_moderation_preflight(
+                bot_member, target_member, bot_id, target_id,
+            )
+            if preflight_error:
+                raise ValueError(preflight_error)
+        async with self.lock:
+            binding = self._resolve_binding(group, platform_id)
+            current = self._now_utc(now)
+            payload = {
+                "action": action,
+                "target_id": target_id,
+                "target_display_name": str(target_display_name or target_id),
+                "target_role_snapshot": str(target_role or "member"),
+                "bot_role_snapshot": str(bot_role or "member"),
+                "duration_seconds": duration,
+                "reject_add_request": bool(reject_add_request) if action == "kick" else False,
+                "reason": str(reason or "").strip(),
+            }
+            return self.storage.create_task(
+                task_id=self._task_id("M"),
+                task_type="MODERATION",
+                status="PENDING",
+                group_id=binding["group_id"],
+                group_alias=binding["alias"],
+                platform_id=platform_id,
+                creator_id=str(creator_id),
+                creator_private_origin=str(creator_private_origin),
+                created_at=current.isoformat(timespec="seconds"),
+                run_at=None,
+                payload=payload,
+            )
+
+    async def confirm_moderation(
+        self,
+        task_id: str,
+        platform_id: str,
+        confirmer_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        async with self.lock:
+            current = self._now_utc(now)
+            expires_before = (
+                current - timedelta(seconds=MODERATION_CONFIRM_TTL_SECONDS)
+            ).isoformat(timespec="seconds")
+            return self.storage.claim_moderation(
+                str(task_id).strip(),
+                platform_id,
+                str(confirmer_id),
+                current.isoformat(timespec="seconds"),
+                expires_before,
+            )
+
+    async def finish_moderation(
+        self,
+        task_id: str,
+        success: bool,
+        error: str = "",
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        async with self.lock:
+            now = utc_now_iso()
+            if success:
+                return self.storage.update_task(
+                    task_id,
+                    status="COMPLETED",
+                    result=result or {},
+                    updated_at=now,
+                    finished_at=now,
+                )
+            return self.storage.update_task(
+                task_id,
+                status="FAILED",
+                result=result or {},
                 last_error=str(error)[:1000],
                 updated_at=now,
                 finished_at=now,

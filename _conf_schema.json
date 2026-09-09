@@ -39,5 +39,18 @@
     "description": "群消息归档自动保留天数，0 表示不自动清理",
     "default": 90,
     "hint": "非 0 值运行时会限制在 7 到 3650 天之间。"
+  },
+  "moderation_enabled": {
+    "type": "bool",
+    "description": "是否开启单成员群管理；默认关闭，开启后仍需 moderator_ids 或 AstrBot Admin",
+    "default": false
+  },
+  "moderator_ids": {
+    "type": "list",
+    "description": "允许执行单成员群管理的 QQ 用户 ID；不会自动继承 operator_ids",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
   }
 }

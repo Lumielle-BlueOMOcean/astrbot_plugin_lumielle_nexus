@@ -2,7 +2,7 @@
 
 微光·群枢（Lumielle Nexus）是一个面向 AstrBot 的跨会话群任务编排插件，让私聊成为控制台，让群聊成为可调度的工作空间。
 
-当前版本：`0.3.1`
+当前版本：`0.4.0`
 
 ## 项目定位
 
@@ -17,6 +17,8 @@
 - 消息归档、关键词/时间范围查询、按需群聊总结。
 - 每周自动总结，并将结果私聊发给创建者。
 - 跨群转述采用 prepare → preview → explicit confirm → send 流程。
+- 按群隔离的成员搜索和成员集合，可用于定向收集和 Relay @成员集合。
+- 默认关闭的单成员 mute、unmute、kick，采用独立 moderator 权限和确认预览。
 
 ## 安装
 
@@ -37,6 +39,8 @@ pip install -r requirements.txt
 - `collection_ack`：是否确认群成员提交，默认开启。
 - `archive_max_message_chars`：单条归档文本最大 4000 字符，运行时限制在 256–20000。
 - `archive_retention_days`：默认保留 90 天；设为 0 表示不自动清理，其他值限制在 7–3650 天。
+- `moderation_enabled`：默认 `false`；必须主动开启才允许群管理。
+- `moderator_ids`：独立的群管理 QQ 用户 ID 列表，不会自动继承 `operator_ids`。
 
 所有控制型命令和工具都要求来自私聊，并由 AstrBot Admin 或 `operator_ids` 授权。
 
@@ -85,6 +89,12 @@ DDL、周期、课程和 collection chase 都会持久化，插件重载后由�
 
 同一成员再次提交会更新当前有效记录。可使用 `/nexus collect-start`、`/nexus collect-status`、`/nexus collect-stop` 作为 fallback。结束时生成包含统计结果、未提交成员和任务信息的 XLSX，并保存到 plugin data directory 的 `exports/`。
 
+## 成员集合
+
+成员集合按 QQ 群隔离，例如可以在班群建立“班委”或“实验 A 组”。成员只能通过实时群成员列表中的 QQ 号、精确群名片或精确昵称加入；同名时不会猜测。信息收集可以在创建时 snapshot 一个集合，之后名单变化不会影响这次收集；Relay 也可以在 preview 时 snapshot 当前仍在群内的集合成员并在确认时 @这些确定的 QQ 号。
+
+已退群成员不会从保存的名单历史中自动删除；新增或修改集合不会回写既有任务快照。
+
 ## 群消息归档
 
 归档默认关闭。绑定群不会自动开始记录；必须显式开启：
@@ -131,8 +141,14 @@ prepare → preview → explicit confirm → send
 
 preview 默认 1 小时有效，且只能由创建 preview 的 operator 确认。失败的 relay 不会自动重试，避免重复发送；可以重新准备。如果确认发送过程中进程异常退出，Relay 会标为 FAILED，发送结果未知，不会自动重发；请先查看目标群后再决定是否重新准备。
 
+## 群管理
+
+群管理默认完全关闭。开启 `moderation_enabled` 后，仍必须由 AstrBot Admin 或单独配置在 `moderator_ids` 的用户从私聊发起；普通 `operator_ids` 不会隐式升级。当前只支持一次针对一个群、一个成员的 mute、unmute、kick，不支持批量管理、全员禁言、设置管理员、退群或自动管理。
+
+群管理固定采用 `prepare → preview → explicit confirm → execute`，preview 有 10 分钟 TTL，确认前会重新检查 Bot 与目标成员角色；权限变化会阻止调用 OneBot。群管理不自动重试，进程在确认执行中断时会记录为 outcome unknown，需要人工检查群状态。
+
 ## 当前限制与后续规划
 
-当前归档只保存可读文本表现，不包含 OCR、语音转写、图片下载、向量检索或长期消息语义抽取。首轮也不包含 WebUI、Redis、ORM、RAG、成员集合或群管理动作。
+当前归档只保存可读文本表现，不包含 OCR、语音转写、图片下载、向量检索或长期消息语义抽取。也不包含 WebUI、Redis、ORM、RAG、批量群管理或自动根据总结创建任务。
 
-后续可考虑：recurring schedule 增强、DDL 工作流、课程表、自然语言 collection extraction、未提交成员自动催办、weekly summary 增强、message archive 扩展、relay 工作流、member sets，以及显式确认的 mute/kick/moderation。
+后续可考虑：recurring schedule 增强、DDL 工作流、课程表、自然语言 collection extraction、未提交成员自动催办、weekly summary 增强、message archive 扩展、relay 工作流、成员集合增强，以及更丰富但仍需确认的 moderation 策略。

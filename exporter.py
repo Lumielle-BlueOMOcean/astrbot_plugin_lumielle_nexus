@@ -43,6 +43,7 @@ def export_collection(
     members: list[dict[str, Any]] | None = None,
     *,
     self_id: str | None = None,
+    target_ids: list[str] | set[str] | None = None,
     timezone_name: str = "UTC",
 ) -> Path:
     export_dir = Path(export_dir)
@@ -72,7 +73,9 @@ def export_collection(
         missing_sheet.append(_safe_row(["无法获取完整群成员名单，未提交人数不可准确计算。"]))
     else:
         missing_sheet.append(_safe_row(["QQ", "群昵称"]))
-        stats = collection_member_stats(members, entries, self_id=self_id)
+        stats = collection_member_stats(
+            members, entries, self_id=self_id, target_ids=target_ids,
+        )
         for member_id in sorted(stats["missing_ids"]):
             member = stats["eligible_members"][member_id]
             missing_sheet.append(_safe_row([
@@ -93,6 +96,11 @@ def export_collection(
         ("字段", "、".join(fields)),
         ("总提交人数", len(entries)),
     ]
+    if payload.get("target_member_set"):
+        info_rows.extend([
+            ("目标成员集合", payload["target_member_set"]),
+            ("目标快照人数", len(payload.get("target_member_ids") or [])),
+        ])
     for row in info_rows:
         info_sheet.append(_safe_row(list(row)))
 

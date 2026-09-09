@@ -316,6 +316,8 @@ class StorageMigrationTests(unittest.TestCase):
             }
             self.assertIn("group_archive_settings", table_names)
             self.assertIn("group_messages", table_names)
+            self.assertIn("member_sets", table_names)
+            self.assertIn("member_set_members", table_names)
             self.assertEqual(storage.get_binding("班群", "qq-main")["group_id"], "123")
             self.assertEqual(storage.get_task("R-old")["status"], "PENDING")
             self.assertEqual(len(storage.list_entries("C-old")), 1)
@@ -1286,7 +1288,7 @@ class PluginContractTests(unittest.TestCase):
         metadata = (self.ROOT / "metadata.yaml").read_text(encoding="utf-8")
         config = json.loads((self.ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         self.assertIn("name: astrbot_plugin_lumielle_nexus", metadata)
-        self.assertIn('version: "0.3.1"', metadata)
+        self.assertIn('version: "0.4.0"', metadata)
         self.assertIn('astrbot_version: ">=4.28.0,<5"', metadata)
         self.assertIn("- aiocqhttp", metadata)
         self.assertEqual(config["operator_ids"]["default"], [])
@@ -1296,6 +1298,8 @@ class PluginContractTests(unittest.TestCase):
         self.assertTrue(config["collection_ack"]["default"])
         self.assertEqual(config["archive_max_message_chars"]["default"], 4000)
         self.assertEqual(config["archive_retention_days"]["default"], 90)
+        self.assertFalse(config["moderation_enabled"]["default"])
+        self.assertEqual(config["moderator_ids"]["default"], [])
 
     def test_main_contract_has_current_registration_points(self):
         main = (self.ROOT / "main.py").read_text(encoding="utf-8")
@@ -1323,6 +1327,13 @@ class PluginContractTests(unittest.TestCase):
             "nexus_create_weekly_summary",
             "nexus_prepare_relay",
             "nexus_confirm_relay",
+            "nexus_search_group_members",
+            "nexus_set_member_set",
+            "nexus_list_member_sets",
+            "nexus_get_member_set",
+            "nexus_delete_member_set",
+            "nexus_prepare_moderation",
+            "nexus_confirm_moderation",
         ):
             self.assertIn(tool_name, main)
         self.assertIn("event_message_type", main)
@@ -1332,7 +1343,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("1=Monday", main)
         self.assertIn("/nexus task", main)
         readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("0.3.1", readme)
+        self.assertIn("0.4.0", readme)
         self.assertIn("默认关闭", readme)
         self.assertIn("prepare", readme)
         self.assertIn("confirm", readme)

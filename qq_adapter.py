@@ -75,11 +75,44 @@ class QQAdapter:
             raise QQAdapterError("OneBot 返回的群成员列表格式不可识别")
         return [member for member in result if isinstance(member, dict)]
 
+    async def get_group_member_info(
+        self, group_id: str, user_id: str,
+    ) -> dict[str, Any]:
+        result = await self._call(
+            "get_group_member_info",
+            group_id=self._qq_id(group_id),
+            user_id=self._qq_id(user_id),
+            no_cache=True,
+        )
+        if not isinstance(result, dict):
+            raise QQAdapterError("OneBot 返回的群成员信息格式不可识别")
+        return result
+
     async def get_login_info(self) -> dict[str, Any]:
         result = await self._call("get_login_info")
         if not isinstance(result, dict):
             raise QQAdapterError("OneBot 返回的登录信息格式不可识别")
         return result
+
+    async def set_group_ban(
+        self, group_id: str, user_id: str, duration_seconds: int,
+    ) -> Any:
+        return await self._call(
+            "set_group_ban",
+            group_id=self._qq_id(group_id),
+            user_id=self._qq_id(user_id),
+            duration=int(duration_seconds),
+        )
+
+    async def set_group_kick(
+        self, group_id: str, user_id: str, reject_add_request: bool = False,
+    ) -> Any:
+        return await self._call(
+            "set_group_kick",
+            group_id=self._qq_id(group_id),
+            user_id=self._qq_id(user_id),
+            reject_add_request=bool(reject_add_request),
+        )
 
     async def send_group_message(self, group_id: str, message: list[dict[str, Any]]) -> Any:
         return await self._call(

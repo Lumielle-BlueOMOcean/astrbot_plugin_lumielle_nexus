@@ -15,6 +15,7 @@ from astrbot.api.star import Context, Star, StarTools
 
 if __package__:
     from .core import (
+        MODERATION_CONFIRM_TTL_SECONDS,
         SUMMARY_PRIVATE_CHUNK_CHARS,
         TaskManager,
         clamp_archive_max_message_chars,
@@ -24,13 +25,19 @@ if __package__:
         deliver_text_chunks,
         format_local_time,
         generate_group_summary,
+        member_display_name,
+        member_role,
         next_interval_occurrence,
+        resolve_member_refs,
+        search_group_members,
+        validate_moderation_preflight,
     )
     from .exporter import export_collection
     from .qq_adapter import QQAdapter, QQAdapterError
     from .storage import Storage
 else:
     from core import (
+        MODERATION_CONFIRM_TTL_SECONDS,
         SUMMARY_PRIVATE_CHUNK_CHARS,
         TaskManager,
         clamp_archive_max_message_chars,
@@ -40,7 +47,12 @@ else:
         deliver_text_chunks,
         format_local_time,
         generate_group_summary,
+        member_display_name,
+        member_role,
         next_interval_occurrence,
+        resolve_member_refs,
+        search_group_members,
+        validate_moderation_preflight,
     )
     from exporter import export_collection
     from qq_adapter import QQAdapter, QQAdapterError
@@ -72,6 +84,11 @@ class LumielleNexus(Star):
             self.config.get("scheduler_interval_seconds", 15),
         )
         self.collection_ack = bool(self.config.get("collection_ack", True))
+        self.moderation_enabled = bool(self.config.get("moderation_enabled", False))
+        moderator_ids = self.config.get("moderator_ids", []) or []
+        self.moderator_ids = {
+            str(value).strip() for value in moderator_ids if str(value).strip()
+        }
         self._scheduler_task: asyncio.Task[None] | None = None
 
     async def initialize(self) -> None:
@@ -112,6 +129,24 @@ class LumielleNexus(Star):
         if not self.is_authorized_operator(event):
             return False, "你没有群枢 operator 权限。"
         return True, ""
+
+    def _moderator_denial(self, event: AstrMessageEvent) -> str:
+        if not event.is_private_chat():
+            return "群内不接受群管理操作，请私聊机器人。"
+        if self._event_platform_name(event) != "aiocqhttp":
+            return "当前版本只支持通过 aiocqhttp（OneBot v11）执行群管理。"
+        if not self.moderation_enabled:
+            return "群管理功能未开启。"
+        if event.is_admin() or str(event.get_sender_id()).strip() in self.moderator_ids:
+            return ""
+        return "你没有 moderator 权限。"
+
+    def _is_authorized_moderator(self, event: AstrMessageEvent) -> bool:
+        return not self._moderator_denial(event)
+
+    def _authorized_moderator(self, event: AstrMessageEvent) -> tuple[bool, str]:
+        denial = self._moderator_denial(event)
+        return not denial, denial
 
     @staticmethod
     def _platform_id(event: AstrMessageEvent) -> str:
@@ -170,6 +205,8 @@ class LumielleNexus(Star):
             )
         elif task_type == "RELAY":
             label = f"待确认转述：{payload.get('content', '')[:80]}"
+        elif task_type == "MODERATION":
+            label = f"待确认群管理：{payload.get('action', '')} {payload.get('target_display_name', payload.get('target_id', ''))}"
         else:
             label = f"{payload.get('message', task_type)}，时间 {format_local_time(task.get('run_at'), self.manager.timezone_name, 'minutes')}"
         return f"{task['id']} [{task['status']}] {task['group_alias']}：{label}"
@@ -227,9 +264,21 @@ class LumielleNexus(Star):
                 ])
             elif task["type"] == "RELAY":
                 lines.extend([
-                    f"@全体：{'是' if payload.get('mention_all') else '否'}",
+                    f"@成员集合：{payload.get('mention_member_set')}（{len(payload.get('mention_user_ids') or [])} 人）"
+                    if payload.get("mention_member_set")
+                    else f"@全体：{'是' if payload.get('mention_all') else '否'}",
                     f"内容：{payload.get('content', '')}",
                     f"来源备注：{payload.get('source_note') or '无'}",
+                ])
+            elif task["type"] == "MODERATION":
+                lines.extend([
+                    f"动作：{payload.get('action', '')}",
+                    f"目标：{payload.get('target_display_name', '')}（{payload.get('target_id', '')}）",
+                    f"目标角色快照：{payload.get('target_role_snapshot', 'member')}",
+                    f"Bot 角色快照：{payload.get('bot_role_snapshot', 'member')}",
+                    f"时长：{payload.get('duration_seconds', 0)} 秒",
+                    f"拒绝再次加群：{'是' if payload.get('reject_add_request') else '否'}",
+                    f"原因：{payload.get('reason') or '未填写'}",
                 ])
             return "\n".join(lines)
         except (KeyError, ValueError) as exc:
@@ -259,6 +308,118 @@ class LumielleNexus(Star):
         return "已绑定群：\n" + "\n".join(
             f"- {group['alias']}：{group['group_id']}" for group in groups
         )
+
+    async def _live_members(
+        self, event: AstrMessageEvent, group: str,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+        binding = await self.manager.get_binding(group, self._platform_id(event))
+        adapter = self._adapter(event)
+        members = await adapter.get_group_member_list(binding["group_id"])
+        login = await adapter.get_login_info()
+        self_id = str(login.get("user_id") or event.get_self_id() or "")
+        return binding, members, self_id
+
+    async def _search_group_members(
+        self, event: AstrMessageEvent, group: str, query: str = "", limit: int = 20,
+    ) -> str:
+        allowed, message = self._authorized_for_control(event)
+        if not allowed:
+            return message
+        try:
+            _binding, members, self_id = await self._live_members(event, group)
+            results = search_group_members(members, query, limit, self_id)
+            if not results:
+                return "没有找到匹配的群成员。"
+            return "\n".join(
+                f"{member.get('user_id')}\t{member_display_name(member)}\t{member_role(member)}"
+                for member in results
+            )
+        except (KeyError, ValueError, QQAdapterError) as exc:
+            return f"查询群成员失败：{exc}"
+
+    async def _set_member_set(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        name: str,
+        members: list[str],
+        mode: str = "replace",
+    ) -> str:
+        allowed, message = self._authorized_for_control(event)
+        if not allowed:
+            return message
+        try:
+            _binding, live_members, self_id = await self._live_members(event, group)
+            member_set = await self.manager.set_member_set(
+                group, name, members, mode, self._platform_id(event),
+                event.get_sender_id(), live_members, self_id,
+            )
+            return (
+                f"已{('更新' if mode != 'replace' else '设置')}成员集合「{name.strip()}」："
+                f"{len(member_set['members'])} 人。"
+            )
+        except (KeyError, ValueError, QQAdapterError) as exc:
+            return f"设置成员集合失败：{exc}"
+
+    async def _list_member_sets(self, event: AstrMessageEvent, group: str = "") -> str:
+        allowed, message = self._authorized_for_control(event)
+        if not allowed:
+            return message
+        try:
+            sets = await self.manager.list_member_sets(group, self._platform_id(event))
+            if not sets:
+                return "暂无成员集合。"
+            aliases = {
+                item["group_id"]: item["group_id"] for item in sets
+            }
+            for binding in await self.manager.list_groups(self._platform_id(event)):
+                aliases[binding["group_id"]] = binding["alias"]
+            lines = []
+            current_group = None
+            for item in sets:
+                group_label = aliases.get(item["group_id"], item["group_id"])
+                if group_label != current_group:
+                    lines.append(f"{group_label}：")
+                    current_group = group_label
+                lines.append(f"- {item['name']}：{item['member_count']} 人")
+            return "\n".join(lines)
+        except (KeyError, ValueError) as exc:
+            return f"查询成员集合失败：{exc}"
+
+    async def _get_member_set(self, event: AstrMessageEvent, group: str, name: str) -> str:
+        allowed, message = self._authorized_for_control(event)
+        if not allowed:
+            return message
+        try:
+            _binding, live_members, self_id = await self._live_members(event, group)
+            member_set = await self.manager.get_member_set(
+                group, name, self._platform_id(event), live_members, self_id,
+            )
+            lines = [f"{member_set['name']}（{len(member_set['members'])} 人）"]
+            for member in member_set["members"]:
+                suffix = "" if member["present"] else " [已不在群]"
+                lines.append(f"{member['user_id']} {member['display_name']}{suffix}")
+            return "\n".join(lines)
+        except (KeyError, ValueError, QQAdapterError) as exc:
+            return f"查询成员集合失败：{exc}"
+
+    async def _delete_member_set(
+        self, event: AstrMessageEvent, group: str, name: str, confirm: bool = False,
+    ) -> str:
+        allowed, message = self._authorized_for_control(event)
+        if not allowed:
+            return message
+        if confirm is not True:
+            return "这是永久删除操作，请明确确认删除该成员名单后再执行。"
+        try:
+            count = await self.manager.delete_member_set(
+                group, name, self._platform_id(event),
+            )
+            if not count:
+                return f"未找到成员集合：{name}"
+            return f"已删除成员集合「{name.strip()}」。"
+        except (KeyError, ValueError) as exc:
+            return f"删除成员集合失败：{exc}"
 
     async def _set_archive(self, event: AstrMessageEvent, group: str, enabled: bool) -> str:
         allowed, message = self._authorized_for_control(event)
@@ -328,6 +489,15 @@ class LumielleNexus(Star):
                 end_time if scheduled_window is None else scheduled_window[1],
                 self._platform_id(event),
             )
+            metadata = (
+                "【群聊总结】\n"
+                f"时间范围：{format_local_time(snapshot['window_start'], self.manager.timezone_name, 'minutes')}"
+                f" 至 {format_local_time(snapshot['window_end'], self.manager.timezone_name, 'minutes')}\n"
+                f"消息数：{snapshot['message_count']}\n"
+                f"活跃成员数：{snapshot['unique_sender_count']}"
+            )
+            if snapshot["message_count"] == 0:
+                return f"{metadata}\n\n该时间范围内没有归档文本消息。"
             if provider_id is None:
                 provider_id = await self.context.get_current_chat_provider_id(
                     event.unified_msg_origin,
@@ -343,13 +513,6 @@ class LumielleNexus(Star):
                 snapshot["window_start"],
                 snapshot["window_end"],
                 focus,
-            )
-            metadata = (
-                "【群聊总结】\n"
-                f"时间范围：{format_local_time(snapshot['window_start'], self.manager.timezone_name, 'minutes')}"
-                f" 至 {format_local_time(snapshot['window_end'], self.manager.timezone_name, 'minutes')}\n"
-                f"消息数：{snapshot['message_count']}\n"
-                f"活跃成员数：{snapshot['unique_sender_count']}"
             )
             if snapshot["truncated"]:
                 metadata += (
@@ -402,19 +565,41 @@ class LumielleNexus(Star):
         content: str,
         mention_all: bool = False,
         source_note: str = "",
+        member_set: str = "",
     ) -> str:
         allowed, message = self._authorized_for_control(event)
         if not allowed:
             return message
+        if mention_all and str(member_set or "").strip():
+            return "准备转述失败：mention_all 与 member_set 互斥。"
         try:
+            mention_user_ids: list[str] | None = None
+            if str(member_set or "").strip():
+                _binding, live_members, self_id = await self._live_members(
+                    event, target_group,
+                )
+                snapshot = await self.manager.member_set_snapshot(
+                    target_group,
+                    member_set,
+                    self._platform_id(event),
+                    live_members,
+                    self_id,
+                )
+                mention_user_ids = snapshot["user_ids"]
             task = await self.manager.prepare_relay(
                 target_group, content, mention_all, source_note,
                 self._platform_id(event), event.get_sender_id(), event.unified_msg_origin,
+                member_set, mention_user_ids,
             )
             payload = self._payload(task)
+            mention_line = (
+                f"@成员集合：{payload.get('mention_member_set')}（{len(payload.get('mention_user_ids') or [])} 名当前成员）"
+                if payload.get("mention_member_set")
+                else f"@全体：{'是' if payload.get('mention_all') else '否'}"
+            )
             return (
                 f"待发送到：{task['group_alias']}\n"
-                f"@全体：{'是' if payload.get('mention_all') else '否'}\n\n"
+                f"{mention_line}\n\n"
                 f"内容：\n{payload.get('content', '')}\n\n"
                 f"Relay ID：{task['id']}\n确认发送后我才会真正发到目标群。"
             )
@@ -434,7 +619,11 @@ class LumielleNexus(Star):
             payload = self._payload(task)
             try:
                 adapter = self._adapter(event)
-                if payload.get("mention_all"):
+                if payload.get("mention_user_ids"):
+                    await adapter.send_group_at_members(
+                        task["group_id"], payload["mention_user_ids"], payload["content"],
+                    )
+                elif payload.get("mention_all"):
                     await adapter.send_group_at_all(task["group_id"], payload["content"])
                 else:
                     await adapter.send_group_text(task["group_id"], payload["content"])
@@ -445,6 +634,146 @@ class LumielleNexus(Star):
             return f"已将 Relay {task['id']} 发送到「{task['group_alias']}」。"
         except (KeyError, ValueError) as exc:
             return f"确认转述失败：{exc}"
+
+    @staticmethod
+    def _moderation_action_text(action: str) -> str:
+        return {"mute": "禁言", "unmute": "解除禁言", "kick": "踢出群聊"}.get(
+            str(action).casefold(), str(action),
+        )
+
+    async def _prepare_moderation(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        action: str,
+        target: str,
+        duration_seconds: int = 0,
+        reject_add_request: bool = False,
+        reason: str = "",
+    ) -> str:
+        allowed, message = self._authorized_moderator(event)
+        if not allowed:
+            return message
+        try:
+            binding, members, bot_id = await self._live_members(event, group)
+            adapter = self._adapter(event)
+            if str(target or "").strip() == bot_id:
+                raise ValueError("不能对机器人自己执行群管理操作")
+            target_member = resolve_member_refs(members, [target], bot_id)[0]
+            bot_member = await adapter.get_group_member_info(binding["group_id"], bot_id)
+            fresh_target = await adapter.get_group_member_info(
+                binding["group_id"], target_member["user_id"],
+            )
+            target_member = {**target_member, **fresh_target}
+            bot_member = {**bot_member, "user_id": bot_id}
+            task = await self.manager.prepare_moderation(
+                group,
+                action,
+                target_member["user_id"],
+                member_display_name(target_member),
+                member_role(target_member),
+                member_role(bot_member),
+                duration_seconds,
+                reject_add_request,
+                reason,
+                self._platform_id(event),
+                event.get_sender_id(),
+                event.unified_msg_origin,
+                bot_id=bot_id,
+                target_member=target_member,
+                bot_member=bot_member,
+            )
+            payload = self._payload(task)
+            lines = [
+                "【群管理操作预览】",
+                f"群：{binding['alias']}",
+                f"操作：{self._moderation_action_text(payload['action'])}",
+                f"成员：{payload['target_display_name']}（{payload['target_id']}）",
+                f"目标角色：{payload['target_role_snapshot']}",
+            ]
+            if payload["action"] == "mute":
+                lines.append(f"时长：{payload['duration_seconds'] // 60} 分钟")
+            elif payload["action"] == "unmute":
+                lines.append("时长：0 秒")
+            if payload["action"] == "kick":
+                lines.extend([
+                    "踢出群后该成员将离开群聊。",
+                    f"拒绝再次加群申请：{'是' if payload['reject_add_request'] else '否'}",
+                ])
+            lines.extend([
+                f"原因：{payload['reason'] or '未填写'}",
+                f"Action ID：{task['id']}",
+                f"预览有效期：{MODERATION_CONFIRM_TTL_SECONDS // 60} 分钟。",
+                "确认执行后才会真正调用 QQ 群管理接口。",
+            ])
+            return "\n".join(lines)
+        except (KeyError, ValueError, QQAdapterError) as exc:
+            return f"准备群管理操作失败：{exc}"
+
+    async def _confirm_moderation(self, event: AstrMessageEvent, task_id: str) -> str:
+        allowed, message = self._authorized_moderator(event)
+        if not allowed:
+            return message
+        try:
+            task = await self.manager.confirm_moderation(
+                task_id,
+                self._platform_id(event),
+                str(event.get_sender_id()),
+            )
+        except (KeyError, ValueError) as exc:
+            return f"确认群管理失败：{exc}"
+
+        payload = self._payload(task)
+        adapter = self._adapter(event)
+        try:
+            login = await adapter.get_login_info()
+            bot_id = str(login.get("user_id") or "")
+            bot_member = await adapter.get_group_member_info(task["group_id"], bot_id)
+            target_member = await adapter.get_group_member_info(
+                task["group_id"], payload["target_id"],
+            )
+            bot_member = {**bot_member, "user_id": bot_id}
+            preflight_error = validate_moderation_preflight(
+                bot_member, target_member, bot_id, payload["target_id"],
+            )
+            if preflight_error:
+                await self.manager.finish_moderation(
+                    task["id"], False, "moderation_preflight_changed", {
+                        "reason": "moderation_preflight_changed",
+                    },
+                )
+                return f"确认群管理失败：{preflight_error}操作未发送。"
+            if payload["action"] in {"mute", "unmute"}:
+                await adapter.set_group_ban(
+                    task["group_id"],
+                    payload["target_id"],
+                    int(payload["duration_seconds"]),
+                )
+            else:
+                await adapter.set_group_kick(
+                    task["group_id"],
+                    payload["target_id"],
+                    bool(payload.get("reject_add_request")),
+                )
+            await self.manager.finish_moderation(
+                task["id"], True, result={
+                    "action": payload["action"],
+                    "target_id": payload["target_id"],
+                    "executed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                },
+            )
+            return f"已执行群管理操作：{self._moderation_action_text(payload['action'])} {payload['target_display_name']}。"
+        except QQAdapterError as exc:
+            await self.manager.finish_moderation(
+                task["id"], False, str(exc), {"reason": "adapter_error"},
+            )
+            return f"群管理操作失败：{exc}。该操作不会自动重试。"
+        except Exception as exc:
+            logger.exception("群枢群管理执行失败 %s", task.get("id"))
+            await self.manager.finish_moderation(
+                task["id"], False, str(exc), {"reason": "execution_error"},
+            )
+            return f"群管理操作失败：{exc}。该操作不会自动重试。"
 
     async def _tasks(self, event: AstrMessageEvent, group: str | None = None) -> str:
         tasks = await self.manager.list_tasks(self._platform_id(event), group or None)
@@ -460,6 +789,7 @@ class LumielleNexus(Star):
         fields: list[str],
         announcement: str = "",
         mention_all: bool = False,
+        target_member_set: str = "",
     ) -> str:
         allowed, message = self._authorized_for_control(event)
         if not allowed:
@@ -474,6 +804,7 @@ class LumielleNexus(Star):
                 self._platform_id(event),
                 event.get_sender_id(),
                 event.unified_msg_origin,
+                target_member_set,
             )
             payload = self._payload(task)
             notice = payload.get("announcement") or (
@@ -504,10 +835,12 @@ class LumielleNexus(Star):
             except QQAdapterError as exc:
                 member_error = str(exc)
             if members is not None:
+                target_ids = self._payload(task).get("target_member_ids")
                 member_stats = collection_member_stats(
                     members,
                     status["entries"],
                     self_id=str(event.get_self_id()),
+                    target_ids=target_ids,
                 )
                 submitted = len(member_stats["submitted_ids"])
             else:
@@ -538,6 +871,7 @@ class LumielleNexus(Star):
         try:
             snapshot = await self.manager.stop_collection(task_id, self._platform_id(event))
             task = snapshot["task"]
+            target_ids = self._payload(task).get("target_member_ids")
             members: list[dict[str, Any]] | None = None
             member_error = ""
             try:
@@ -553,6 +887,7 @@ class LumielleNexus(Star):
                     snapshot["entries"],
                     members,
                     self_id=str(event.get_self_id()),
+                    target_ids=target_ids,
                     timezone_name=self.manager.timezone_name,
                 )
             except Exception as exc:
@@ -572,6 +907,7 @@ class LumielleNexus(Star):
                         members,
                         snapshot["entries"],
                         self_id=str(event.get_self_id()),
+                        target_ids=target_ids,
                     )["eligible_ids"])
                     if members is not None else None
                 ),
@@ -715,7 +1051,13 @@ class LumielleNexus(Star):
             self_id = str((await adapter.get_login_info()).get("user_id") or "")
         except QQAdapterError:
             self_id = None
-        stats = collection_member_stats(members, status["entries"], self_id=self_id)
+        collection_payload = self._payload(collection)
+        stats = collection_member_stats(
+            members,
+            status["entries"],
+            self_id=self_id,
+            target_ids=collection_payload.get("target_member_ids"),
+        )
         missing_ids = sorted(stats["missing_ids"])
         if not missing_ids:
             return
@@ -761,6 +1103,10 @@ class LumielleNexus(Star):
             "/nexus archive <群别名> on|off\n"
             "/nexus archive-status <群别名>\n"
             "/nexus relay-confirm <X-任务ID>\n"
+            "/nexus members <群别名> [关键词]\n"
+            "/nexus member-sets [群别名]\n"
+            "/nexus member-set <群别名> <集合名>\n"
+            "/nexus moderation-confirm <M-任务ID>\n"
             "/nexus collect-start 群别名|标题|字段1,字段2[,公告][,all]\n"
             "/nexus collect-status <任务ID>\n"
             "/nexus collect-stop <任务ID>\n"
@@ -807,6 +1153,35 @@ class LumielleNexus(Star):
         yield event.plain_result(
             await self._confirm_relay(event, args[0])
             if args else "用法：/nexus relay-confirm <X-任务ID>",
+        )
+
+    @nexus.command("members", priority=10)
+    async def cmd_members(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
+        args = self._command_args(event)
+        yield event.plain_result(
+            await self._search_group_members(event, args[0], " ".join(args[1:]))
+            if args else "用法：/nexus members <群别名> [关键词]",
+        )
+
+    @nexus.command("member-sets", priority=10)
+    async def cmd_member_sets(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
+        args = self._command_args(event)
+        yield event.plain_result(await self._list_member_sets(event, args[0] if args else ""))
+
+    @nexus.command("member-set", priority=10)
+    async def cmd_member_set(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
+        args = self._command_args(event)
+        yield event.plain_result(
+            await self._get_member_set(event, args[0], args[1])
+            if len(args) >= 2 else "用法：/nexus member-set <群别名> <集合名>",
+        )
+
+    @nexus.command("moderation-confirm", priority=10)
+    async def cmd_moderation_confirm(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
+        args = self._command_args(event)
+        yield event.plain_result(
+            await self._confirm_moderation(event, args[0])
+            if args else "用法：/nexus moderation-confirm <M-任务ID>",
         )
 
     @nexus.command("tasks", priority=10)
@@ -1135,7 +1510,7 @@ class LumielleNexus(Star):
 
     @filter.llm_tool(name="nexus_cancel_task")
     async def nexus_cancel_task(self, event: AstrMessageEvent, task_id: str) -> str:
-        """取消一个尚未执行的一次性提醒、PENDING relay，或取消 ACTIVE 的 DDL、周期、课程、每周总结父任务并级联取消其未执行子提醒。信息收集必须使用 nexus_stop_collection 结束；只能在私聊 operator 中调用。
+        """取消一个尚未执行的一次性提醒、PENDING relay 或 PENDING 群管理操作，或取消 ACTIVE 的 DDL、周期、课程、每周总结父任务并级联取消其未执行子提醒。信息收集必须使用 nexus_stop_collection 结束；只能在私聊 operator 中调用。
 
         Args:
             task_id(string): 要取消的任务 ID，例如 R-20260909-001。
@@ -1158,6 +1533,7 @@ class LumielleNexus(Star):
         fields: list[str],
         announcement: str = "",
         mention_all: bool = False,
+        target_member_set: str = "",
     ) -> str:
         """在已绑定 QQ 群启动一次信息收集。创建后插件会在群里发送标题、字段格式和说明；同一群同时只能有一个 active collection。只能在私聊 operator 中调用。
 
@@ -1167,6 +1543,7 @@ class LumielleNexus(Star):
             fields(list[string]): 要收集的字段列表，例如 ["姓名", "离校时间", "返校时间"]。
             announcement(string): 可选的群公告补充说明。
             mention_all(boolean): 是否在启动公告中 @全体成员。
+            target_member_set(string): 可选的群内成员集合名称；创建时会 snapshot 成员，后续名单变化不影响本次收集。
         """
         return await self._start_collection(
             event,
@@ -1175,6 +1552,7 @@ class LumielleNexus(Star):
             fields,
             announcement,
             mention_all,
+            target_member_set,
         )
 
     @filter.llm_tool(name="nexus_collection_status")
@@ -1314,6 +1692,7 @@ class LumielleNexus(Star):
         content: str,
         mention_all: bool = False,
         source_note: str = "",
+        member_set: str = "",
     ) -> str:
         """准备向另一个已绑定群转述内容。即使用户说“发到某群”，第一步也只能调用本工具展示 preview；绝不能在同一轮自动确认或发送。用户明确确认后，再调用 nexus_confirm_relay。只能在私聊 operator 中调用。
 
@@ -1322,9 +1701,11 @@ class LumielleNexus(Star):
             content(string): 待转述内容，最多 6000 个字符。
             mention_all(boolean): 是否在确认发送时 @全体。
             source_note(string): 可选来源备注，仅用于 preview 和记录。
+            member_set(string): 可选群内成员集合名称；会在 preview 时 snapshot 当前仍在群成员。与 mention_all 互斥。
         """
         return await self._prepare_relay(
             event, target_group, content, mention_all, source_note,
+            member_set,
         )
 
     @filter.llm_tool(name="nexus_confirm_relay")
@@ -1335,3 +1716,107 @@ class LumielleNexus(Star):
             task_id(string): nexus_prepare_relay 返回的 Relay ID，例如 X-20260909-001。
         """
         return await self._confirm_relay(event, task_id)
+
+    @filter.llm_tool(name="nexus_search_group_members")
+    async def nexus_search_group_members(
+        self, event: AstrMessageEvent, group: str, query: str = "", limit: int = 20,
+    ) -> str:
+        """实时查询已绑定 QQ 群成员。查询只使用当前群成员列表，不查询归档；只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 已绑定群别名或群号。
+            query(string): 可选关键词，对 QQ 号、群名片、昵称做不区分大小写的包含匹配。
+            limit(number): 返回 1 到 50 条，默认 20。
+        """
+        return await self._search_group_members(event, group, query, limit)
+
+    @filter.llm_tool(name="nexus_set_member_set")
+    async def nexus_set_member_set(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        name: str,
+        members: list[str],
+        mode: str = "replace",
+    ) -> str:
+        """创建或更新一个 group-scoped 成员集合。成员引用必须是当前群真实成员的 QQ 号、精确群名片或精确昵称；有歧义时必须改用 QQ 号。不能加入 Bot 或机器人；只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 已绑定群别名。
+            name(string): 成员集合名称，1 到 40 个字符。
+            members(list[string]): 成员 QQ 号、精确群名片或精确昵称列表，重复 ID 会去重。
+            mode(string): replace、add 或 remove；replace/add/remove 后集合都不能为空。
+        """
+        return await self._set_member_set(event, group, name, members, mode)
+
+    @filter.llm_tool(name="nexus_list_member_sets")
+    async def nexus_list_member_sets(
+        self, event: AstrMessageEvent, group: str = "",
+    ) -> str:
+        """列出已绑定群的成员集合及人数。留空 group 表示列出当前平台全部集合；只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 可选已绑定群别名。
+        """
+        return await self._list_member_sets(event, group)
+
+    @filter.llm_tool(name="nexus_get_member_set")
+    async def nexus_get_member_set(
+        self, event: AstrMessageEvent, group: str, name: str,
+    ) -> str:
+        """查看一个 group-scoped 成员集合，并尽力标出已退群成员；只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 已绑定群别名。
+            name(string): 成员集合名称。
+        """
+        return await self._get_member_set(event, group, name)
+
+    @filter.llm_tool(name="nexus_delete_member_set")
+    async def nexus_delete_member_set(
+        self, event: AstrMessageEvent, group: str, name: str, confirm: bool = False,
+    ) -> str:
+        """删除一个成员集合。只有用户明确确认删除该名单后才能传 confirm=true；这是永久删除集合数据的操作，不影响历史任务；只能在私聊 operator 中调用。
+
+        Args:
+            group(string): 已绑定群别名。
+            name(string): 成员集合名称。
+            confirm(boolean): 只有用户明确确认删除名单时才传 true，否则必须保持 false。
+        """
+        return await self._delete_member_set(event, group, name, confirm)
+
+    @filter.llm_tool(name="nexus_prepare_moderation")
+    async def nexus_prepare_moderation(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        action: str,
+        target: str,
+        duration_seconds: int = 0,
+        reject_add_request: bool = False,
+        reason: str = "",
+    ) -> str:
+        """准备对一个群内单独成员执行 mute、unmute 或 kick。即使用户直接说“把张三禁言”，第一步也只能调用本工具展示 preview，绝不能同一轮自动 confirm；用户明确确认后才调用 nexus_confirm_moderation。群管理默认关闭、需要独立 moderator 权限，不支持成员集合或批量操作。
+
+        Args:
+            group(string): 已绑定群别名。
+            action(string): 只能是 mute、unmute 或 kick。
+            target(string): QQ 号、精确群名片或精确昵称；歧义时必须使用 QQ 号。
+            duration_seconds(number): mute 为 60 到 2592000 秒；unmute 必须为 0；kick 忽略该值。
+            reject_add_request(boolean): kick 后是否拒绝再次加群申请。
+            reason(string): 可选操作原因，仅用于预览和审计记录。
+        """
+        return await self._prepare_moderation(
+            event, group, action, target, duration_seconds, reject_add_request, reason,
+        )
+
+    @filter.llm_tool(name="nexus_confirm_moderation")
+    async def nexus_confirm_moderation(
+        self, event: AstrMessageEvent, task_id: str,
+    ) -> str:
+        """执行此前已 prepare 且仍为 PENDING 的群管理 preview。只有创建该 preview 的 moderator 在看到预览后明确说“确认执行”才能调用；preview 只有 10 分钟有效，操作失败不会自动重试。
+
+        Args:
+            task_id(string): nexus_prepare_moderation 返回的 Action ID，例如 M-20260909-001。
+        """
+        return await self._confirm_moderation(event, task_id)

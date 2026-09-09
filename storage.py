@@ -107,6 +107,30 @@ class Storage:
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_group_messages_source
                     ON group_messages(platform_id, group_id, source_message_id)
                     WHERE source_message_id IS NOT NULL;
+
+                CREATE TABLE IF NOT EXISTS member_sets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform_id TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (platform_id, group_id, name)
+                );
+
+                CREATE TABLE IF NOT EXISTS member_set_members (
+                    set_id INTEGER NOT NULL,
+                    user_id TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    added_at TEXT NOT NULL,
+                    PRIMARY KEY (set_id, user_id),
+                    FOREIGN KEY (set_id) REFERENCES member_sets(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_member_sets_scope
+                    ON member_sets(platform_id, group_id, name);
+                CREATE INDEX IF NOT EXISTS idx_member_set_members_set
+                    ON member_set_members(set_id, user_id);
                 """,
             )
             columns = {
@@ -222,6 +246,152 @@ class Storage:
                     "SELECT * FROM group_bindings ORDER BY platform_id, alias",
                 ).fetchall()
         return self._rows(rows)
+
+    def get_member_set(
+        self, platform_id: str, group_id: str, name: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM member_sets
+                WHERE platform_id = ? AND group_id = ? AND name = ?
+                """,
+                (str(platform_id), str(group_id), str(name)),
+            ).fetchone()
+        return self._row(row)
+
+    def list_member_sets(
+        self, platform_id: str, group_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM member_sets WHERE platform_id = ?"
+        params: list[Any] = [str(platform_id)]
+        if group_id is not None:
+            query += " AND group_id = ?"
+            params.append(str(group_id))
+        query += " ORDER BY group_id, name"
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return self._rows(rows)
+
+    def list_member_set_members(self, set_id: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM member_set_members
+                WHERE set_id = ? ORDER BY added_at, user_id
+                """,
+                (int(set_id),),
+            ).fetchall()
+        return self._rows(rows)
+
+    def ensure_member_set(
+        self,
+        platform_id: str,
+        group_id: str,
+        name: str,
+        created_by: str,
+        created_at: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO member_sets
+                    (platform_id, group_id, name, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform_id, group_id, name) DO UPDATE SET updated_at = excluded.updated_at
+                """,
+                (
+                    str(platform_id), str(group_id), str(name), str(created_by),
+                    str(created_at), str(created_at),
+                ),
+            )
+            self._conn.commit()
+        return self.get_member_set(platform_id, group_id, name)
+
+    def replace_member_set_members(
+        self, set_id: int, members: list[dict[str, Any]], updated_at: str,
+    ) -> None:
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.execute(
+                    "DELETE FROM member_set_members WHERE set_id = ?", (int(set_id),),
+                )
+                self._insert_member_set_members(set_id, members, updated_at)
+                self._conn.execute(
+                    "UPDATE member_sets SET updated_at = ? WHERE id = ?",
+                    (str(updated_at), int(set_id)),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def add_member_set_members(
+        self, set_id: int, members: list[dict[str, Any]], updated_at: str,
+    ) -> None:
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._insert_member_set_members(set_id, members, updated_at, replace=True)
+                self._conn.execute(
+                    "UPDATE member_sets SET updated_at = ? WHERE id = ?",
+                    (str(updated_at), int(set_id)),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _insert_member_set_members(
+        self,
+        set_id: int,
+        members: list[dict[str, Any]],
+        added_at: str,
+        replace: bool = False,
+    ) -> None:
+        operation = "INSERT OR REPLACE" if replace else "INSERT"
+        self._conn.executemany(
+            f"""
+            {operation} INTO member_set_members(set_id, user_id, display_name, added_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (
+                    int(set_id), str(member["user_id"]),
+                    str(member.get("display_name") or member["user_id"]), str(added_at),
+                )
+                for member in members
+            ],
+        )
+
+    def remove_member_set_members(
+        self, set_id: int, user_ids: list[str], updated_at: str,
+    ) -> None:
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.executemany(
+                    "DELETE FROM member_set_members WHERE set_id = ? AND user_id = ?",
+                    [(int(set_id), str(user_id)) for user_id in user_ids],
+                )
+                self._conn.execute(
+                    "UPDATE member_sets SET updated_at = ? WHERE id = ?",
+                    (str(updated_at), int(set_id)),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def delete_member_set(self, platform_id: str, group_id: str, name: str) -> int:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM member_sets WHERE platform_id = ? AND group_id = ? AND name = ?",
+                (str(platform_id), str(group_id), str(name)),
+            )
+            self._conn.commit()
+        return int(cursor.rowcount)
 
     def create_task(
         self,
@@ -496,6 +666,30 @@ class Storage:
                     updated_at,
                     updated_at,
                     "Relay execution interrupted; delivery outcome unknown",
+                    result_json,
+                ),
+            )
+            self._conn.commit()
+        return int(cursor.rowcount)
+
+    def recover_processing_moderations(self, updated_at: str) -> int:
+        """Never replay an interrupted destructive moderation action."""
+        result_json = json.dumps({
+            "execution_outcome": "unknown",
+            "reason": "interrupted_during_confirm",
+        }, ensure_ascii=False)
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'FAILED', updated_at = ?, finished_at = ?,
+                    last_error = ?, result = ?
+                WHERE type = 'MODERATION' AND status = 'PROCESSING'
+                """,
+                (
+                    str(updated_at),
+                    str(updated_at),
+                    "Moderation execution interrupted; outcome unknown",
                     result_json,
                 ),
             )
@@ -932,4 +1126,66 @@ class Storage:
                 raise
         if expired:
             raise ValueError("该 Relay preview 已过期，请重新准备后确认。")
+        return self.get_task(str(task_id))
+
+    def claim_moderation(
+        self,
+        task_id: str,
+        platform_id: str,
+        confirmer_id: str,
+        updated_at: str,
+        expires_before: str | None = None,
+    ) -> dict[str, Any]:
+        expired = False
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT * FROM tasks WHERE id = ? AND platform_id = ?",
+                    (str(task_id), str(platform_id)),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"任务不存在：{task_id}")
+                if row["type"] != "MODERATION" or row["status"] != "PENDING":
+                    raise ValueError(f"任务当前不能确认：{row['status']}")
+                if str(row["creator_id"]) != str(confirmer_id):
+                    raise ValueError("该群管理操作只能由创建 preview 的 moderator 确认执行。")
+                if expires_before and str(row["created_at"]) < str(expires_before):
+                    self._conn.execute(
+                        """
+                        UPDATE tasks
+                        SET status = 'CANCELLED', updated_at = ?, finished_at = ?, result = ?
+                        WHERE id = ? AND platform_id = ? AND type = 'MODERATION'
+                          AND status = 'PENDING' AND creator_id = ?
+                        """,
+                        (
+                            str(updated_at), str(updated_at),
+                            json.dumps({
+                                "skipped": True,
+                                "reason": "moderation_preview_expired",
+                            }, ensure_ascii=False),
+                            str(task_id), str(platform_id), str(confirmer_id),
+                        ),
+                    )
+                    expired = True
+                else:
+                    cursor = self._conn.execute(
+                        """
+                        UPDATE tasks SET status = 'PROCESSING', updated_at = ?
+                        WHERE id = ? AND platform_id = ? AND type = 'MODERATION'
+                          AND status = 'PENDING' AND creator_id = ?
+                        """,
+                        (
+                            str(updated_at), str(task_id), str(platform_id),
+                            str(confirmer_id),
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError("任务当前不能确认：状态已改变")
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        if expired:
+            raise ValueError("该群管理操作 preview 已过期，请重新准备后确认。")
         return self.get_task(str(task_id))
