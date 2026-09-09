@@ -283,11 +283,16 @@ class _ListenerManager:
         self.apply_result = apply_result
         self.ai_context_calls = 0
         self.apply_calls = 0
+        self.capture_calls = 0
 
     async def archive_group_message(self, *args, **kwargs):
         return None
 
     async def process_collection_message(self, *args):
+        return self.process_result
+
+    async def capture_active_collection_message(self, *args, **kwargs):
+        self.capture_calls += 1
         return self.process_result
 
     async def get_collection_ai_context(self, *args):
@@ -432,7 +437,8 @@ class CollectionListenerTests(unittest.IsolatedAsyncioTestCase):
         plugin._collection_ai_cooldowns = {}
         outputs = [item async for item in plugin.on_group_message(_ListenerEvent("今天好热"))]
         self.assertEqual(outputs, [])
-        self.assertEqual(manager.ai_context_calls, 1)
+        self.assertEqual(manager.capture_calls, 1)
+        self.assertEqual(manager.ai_context_calls, 0)
         self.assertEqual(manager.apply_calls, 0)
 
     async def test_ai_trigger_calls_fixed_provider_and_echoes_applied_fields(self):
@@ -471,11 +477,10 @@ class CollectionListenerTests(unittest.IsolatedAsyncioTestCase):
         plugin._collection_ai_semaphore = asyncio.Semaphore(3)
         plugin._collection_ai_cooldowns = {}
         outputs = [item async for item in plugin.on_group_message(_ListenerEvent("提交：我是张三"))]
-        self.assertEqual(len(context.calls), 1)
-        self.assertEqual(context.calls[0]["chat_provider_id"], "provider-1")
-        self.assertNotIn("tools", context.calls[0])
-        self.assertEqual(manager.apply_calls, 1)
-        self.assertIn("姓名：张三", outputs[0])
+        self.assertEqual(outputs, [])
+        self.assertEqual(len(context.calls), 0)
+        self.assertEqual(manager.capture_calls, 1)
+        self.assertEqual(manager.apply_calls, 0)
 
     async def test_ai_provider_failure_gives_structured_fallback_without_write(self):
         main_module = _load_main_with_framework_stubs()
@@ -498,8 +503,10 @@ class CollectionListenerTests(unittest.IsolatedAsyncioTestCase):
         plugin._collection_ai_semaphore = asyncio.Semaphore(3)
         plugin._collection_ai_cooldowns = {}
         outputs = [item async for item in plugin.on_group_message(_ListenerEvent("提交：我是张三"))]
+        self.assertEqual(outputs, [])
+        self.assertEqual(manager.capture_calls, 1)
+        self.assertEqual(manager.ai_context_calls, 0)
         self.assertEqual(manager.apply_calls, 0)
-        self.assertIn("字段：值", outputs[0])
 
     async def test_ai_input_limit_skips_provider(self):
         main_module = _load_main_with_framework_stubs()
@@ -528,8 +535,9 @@ class CollectionListenerTests(unittest.IsolatedAsyncioTestCase):
         plugin._collection_ai_cooldowns = {}
         outputs = [item async for item in plugin.on_group_message(_ListenerEvent("提交：" + "x" * 1001))]
         self.assertEqual(context.calls, 0)
+        self.assertEqual(outputs, [])
+        self.assertEqual(manager.capture_calls, 1)
         self.assertEqual(manager.apply_calls, 0)
-        self.assertIn("过长", outputs[0])
 
     async def test_ai_cooldown_blocks_second_trigger_without_second_llm_call(self):
         main_module = _load_main_with_framework_stubs()
@@ -568,6 +576,8 @@ class CollectionListenerTests(unittest.IsolatedAsyncioTestCase):
         event = _ListenerEvent("提交：我是张三")
         first = [item async for item in plugin.on_group_message(event)]
         second = [item async for item in plugin.on_group_message(event)]
-        self.assertEqual(context.calls, 1)
-        self.assertEqual(manager.apply_calls, 1)
-        self.assertIn("频繁", second[0])
+        self.assertEqual(context.calls, 0)
+        self.assertEqual(manager.capture_calls, 2)
+        self.assertEqual(manager.apply_calls, 0)
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])

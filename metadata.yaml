@@ -1,7 +1,7 @@
 name: astrbot_plugin_lumielle_nexus
 display_name: 微光·群枢 / Lumielle Nexus
 desc: 通过私聊创建和管理面向 QQ 群的任务、信息收集、消息归档、成员集合与安全群管理操作。
-version: "0.5.0"
+version: "0.6.0"
 author: Lumielle-BlueOMOcean
 repo: https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_lumielle_nexus
 astrbot_version: ">=4.28.0,<5"

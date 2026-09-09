@@ -1288,7 +1288,7 @@ class PluginContractTests(unittest.TestCase):
         metadata = (self.ROOT / "metadata.yaml").read_text(encoding="utf-8")
         config = json.loads((self.ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         self.assertIn("name: astrbot_plugin_lumielle_nexus", metadata)
-        self.assertIn('version: "0.5.0"', metadata)
+        self.assertIn('version: "0.6.0"', metadata)
         self.assertIn('astrbot_version: ">=4.28.0,<5"', metadata)
         self.assertIn("- aiocqhttp", metadata)
         self.assertEqual(config["operator_ids"]["default"], [])
@@ -1332,6 +1332,9 @@ class PluginContractTests(unittest.TestCase):
             "nexus_list_member_sets",
             "nexus_get_member_set",
             "nexus_delete_member_set",
+            "nexus_set_member_identity",
+            "nexus_get_member_identity",
+            "nexus_list_member_identities",
             "nexus_prepare_moderation",
             "nexus_confirm_moderation",
         ):
@@ -1343,7 +1346,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("1=Monday", main)
         self.assertIn("/nexus task", main)
         readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("0.5.0", readme)
+        self.assertIn("0.6.0", readme)
         self.assertIn("默认关闭", readme)
         self.assertIn("prepare", readme)
         self.assertIn("confirm", readme)
@@ -1353,6 +1356,8 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("尚未执行的一次性提醒", main)
         self.assertIn("get_current_chat_provider_id", main)
         self.assertIn("llm_generate", main)
+        self.assertIn("capture_active_collection_message", main)
+        self.assertNotIn("_process_collection_ai_submission", main)
         self.assertIn("sent_chunk_count", main)
         self.assertIn("deliver_text_chunks", main)
         self.assertNotIn("get_using_provider()", main)

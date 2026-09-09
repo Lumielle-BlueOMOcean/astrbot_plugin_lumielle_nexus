@@ -2,7 +2,7 @@
 
 微光·群枢（Lumielle Nexus）是一个面向 AstrBot 的跨会话群任务编排插件，让私聊成为控制台，让群聊成为可调度的工作空间。
 
-当前版本：`0.5.0`
+当前版本：`0.6.0`
 
 ## 项目定位
 
@@ -12,14 +12,15 @@
 
 - 私聊绑定群别名、查看群和任务。
 - 持久化单次提醒、DDL 提前提醒、每周周期提醒和课程提醒。
-- 在群内启动信息收集，支持字段解析、重复提交更新、进度查询和 XLSX 导出。
+- 在群内启动信息收集，支持字段解析、重复提交更新、checkpoint 增量分析、进度查询和 XLSX 导出。
 - 收集结束后尝试通过 QQ 私聊回传 Excel；回传失败不会丢失导出文件。
 - 消息归档、关键词/时间范围查询、按需群聊总结。
 - 每周自动总结，并将结果私聊发给创建者。
 - 跨群转述采用 prepare → preview → explicit confirm → send 流程。
 - 按群隔离的成员搜索和成员集合，可用于定向收集和 Relay @成员集合。
 - 默认关闭的单成员 mute、unmute、kick，采用独立 moderator 权限和确认预览。
-- 可显式开启、带安全校验的 Collection 自然语言填写。
+- Collection workflow 会持久化捕获自然语言消息，在催办/截止/状态 refresh 时按 checkpoint 批量分析，不会逐消息调用 LLM。
+- 成员身份字段（姓名、学号）可由标准提交和 checkpoint 学习，也可由 operator/当前群管理员核验维护。
 
 ## 安装
 
@@ -43,7 +44,7 @@ pip install -r requirements.txt
 - `moderation_enabled`：默认 `false`；必须主动开启才允许群管理。
 - `moderator_ids`：独立的群管理 QQ 用户 ID 列表，不会自动继承 `operator_ids`。
 
-普通群枢控制型命令和工具要求来自私聊，并由 AstrBot Admin 或 `operator_ids` 授权；群管理操作另受独立 moderator 权限域约束。
+跨群和隐私敏感控制（绑定、归档设置/清理/查询、总结、Relay）要求来自私聊，并由 AstrBot Admin 或 `operator_ids` 授权。绑定群内的任务和成员名单控制也可以由该当前群的 QQ 群主/管理员发起，但不能跨群；群管理操作另受独立 moderator 权限域约束。
 
 ## 群绑定与提醒
 
@@ -90,25 +91,19 @@ DDL、周期、课程和 collection chase 都会持久化，插件重载后由�
 
 同一成员再次提交会更新当前有效记录。可使用 `/nexus collect-start`、`/nexus collect-status`、`/nexus collect-stop` 作为 fallback。结束时生成包含统计结果、未提交成员和任务信息的 XLSX，并保存到 plugin data directory 的 `exports/`。
 
-## 自然语言信息收集
+## Collection checkpoint 与身份
 
-自然语言填写默认关闭。创建 Collection 时必须由 operator 明确开启 `ai_extraction`；开启后也只有以 `提交：`、`填报：`、`报名：` 或 `更新：`、`修改：`、`更正：` 开头的群消息才会进入识别流程，普通群聊不会发送给 LLM。标准的 `字段：值` 格式始终优先且不消耗 LLM。
+自然语言填写默认关闭。开启 `ai_extraction` 后，群消息会先写入该 Collection 的 `workflow_messages`，不会在 `GROUP_MESSAGE` 中逐条调用 LLM；标准“字段：值”消息仍然立即解析并写入。自然语言消息只在计划 checkpoint、截止收尾或 operator 查询状态时，按新增 cursor 批量分析。
 
-自然语言提交使用创建 Collection 时绑定的 AstrBot LLM Provider，只保存 Provider ID，不保存 API key、token 或 credential。模型只返回候选 JSON，插件会检查字段白名单、原文 evidence、confidence、值长度和重复歧义后才写入；低置信度或冲突字段不会写库。成功后会 echo 实际写入的数据供成员检查，AI 解析可能出错，建议优先使用标准格式。
-
-例如创建时明确允许后，成员可以发送：
+例如可设置 19:00 催办 checkpoint、20:00 截止：
 
 ```text
-提交：我是张三，10月3日下午离校，7号晚上返校
+在班群收集返校信息，需要姓名、返校时间；19:00 批量分析，20:00 截止，缺省状态填“未提交”。
 ```
 
-需要修改已有内容时使用：
+checkpoint 使用创建 Collection 时绑定的 AstrBot LLM Provider，只保存 Provider ID，不保存 API key、token 或 credential。模型返回的字段、用户 ID、evidence 和 confidence 会经过确定性校验；失败时 cursor 不推进，也不会发送错误的催办。状态查询默认 refresh，无新增自然语言消息时不会调用 LLM。
 
-```text
-更正：返校时间改为10月8日晚上
-```
-
-`提交`/`填报`/`报名` 只填充当前为空的字段，不会覆盖已有值；`更新`/`修改`/`更正` 才允许可靠识别后覆盖，并会在识别期间记录发生变化时拒绝旧结果。
+Collection 会从标准提交和可信 checkpoint 结果学习“姓名/学号”身份字段；operator 或当前群 QQ 群主/管理员也可以用身份工具核验维护。已核验身份不会被未核验结果覆盖，导出时会尽力将身份列放在统计结果前部。
 
 ## 成员集合
 

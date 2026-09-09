@@ -45,6 +45,7 @@ def export_collection(
     self_id: str | None = None,
     target_ids: list[str] | set[str] | None = None,
     timezone_name: str = "UTC",
+    identities: list[dict[str, Any]] | None = None,
 ) -> Path:
     export_dir = Path(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -56,17 +57,67 @@ def export_collection(
     workbook = Workbook()
     result_sheet = workbook.active
     result_sheet.title = "统计结果"
-    result_sheet.append(_safe_row(["QQ", "群昵称", *fields, "提交时间", "最后更新时间", "原始提交"]))
+    identity_by_user: dict[str, dict[str, str]] = {}
+    identity_verified: dict[tuple[str, str], bool] = {}
+    for identity in identities or []:
+        user_id = str(identity.get("user_id") or "").strip()
+        field_name = str(identity.get("field_name") or "").strip()
+        value = str(identity.get("value") or "").strip()
+        if not user_id or not field_name or not value:
+            continue
+        key = (user_id, field_name)
+        verified = bool(identity.get("verified"))
+        if key not in identity_verified or verified or not identity_verified[key]:
+            identity_by_user.setdefault(user_id, {})[field_name] = value
+            identity_verified[key] = verified
+    has_identity_data = bool(identity_by_user)
+    member_by_id = {
+        str(member.get("user_id") or "").strip(): member
+        for member in (members or [])
+        if str(member.get("user_id") or "").strip()
+    }
+    if has_identity_data:
+        output_fields = [field for field in fields if field not in {"姓名", "学号"}]
+        result_sheet.append(_safe_row([
+            "QQ", "姓名", "学号", "群昵称", *output_fields,
+            "提交时间", "最后更新时间", "原始提交",
+        ]))
+    else:
+        output_fields = fields
+        result_sheet.append(_safe_row([
+            "QQ", "群昵称", *fields, "提交时间", "最后更新时间", "原始提交",
+        ]))
     for entry in entries:
         parsed = json.loads(entry.get("parsed_data") or "{}")
-        result_sheet.append(_safe_row([
+        member = member_by_id.get(str(entry.get("sender_id") or ""), {})
+        fallback_name = str(
+            entry.get("sender_name")
+            or member.get("card")
+            or member.get("nickname")
+            or ""
+        )
+        identity = identity_by_user.get(str(entry.get("sender_id") or ""), {})
+        if has_identity_data:
+            values = [
                 entry.get("sender_id", ""),
-                entry.get("sender_name", ""),
-                *[parsed.get(field, "") for field in fields],
+                identity.get("姓名") or parsed.get("姓名", "") or fallback_name,
+                identity.get("学号") or parsed.get("学号", ""),
+                fallback_name,
+                *[parsed.get(field, "") for field in output_fields],
                 format_local_time(entry.get("submitted_at"), timezone_name),
                 format_local_time(entry.get("updated_at"), timezone_name),
                 entry.get("raw_message", ""),
-            ]))
+            ]
+        else:
+            values = [
+                entry.get("sender_id", ""),
+                fallback_name,
+                *[parsed.get(field, "") for field in output_fields],
+                format_local_time(entry.get("submitted_at"), timezone_name),
+                format_local_time(entry.get("updated_at"), timezone_name),
+                entry.get("raw_message", ""),
+            ]
+        result_sheet.append(_safe_row(values))
 
     missing_sheet = workbook.create_sheet("未提交成员")
     if members is None:

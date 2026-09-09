@@ -16,27 +16,30 @@ from astrbot.api.star import Context, Star, StarTools
 if __package__:
     from .core import (
         MODERATION_CONFIRM_TTL_SECONDS,
+        COLLECTION_CHECKPOINT_CHUNK_CHARS,
+        COLLECTION_CHECKPOINT_MAX_CHUNKS,
+        COLLECTION_CHECKPOINT_MAX_MESSAGES,
+        COLLECTION_CHECKPOINT_MAX_TOTAL_CHARS,
+        COLLECTION_CHECKPOINT_TIMEOUT_SECONDS,
         SUMMARY_PRIVATE_CHUNK_CHARS,
         TaskManager,
         clamp_archive_max_message_chars,
         clamp_archive_retention_days,
         clamp_scheduler_interval,
         collection_member_stats,
-        COLLECTION_AI_COOLDOWN_SECONDS,
-        COLLECTION_AI_MAX_CONCURRENCY,
-        COLLECTION_AI_MAX_INPUT_CHARS,
-        COLLECTION_AI_TIMEOUT_SECONDS,
-        build_collection_extraction_prompt,
-        build_collection_extraction_system_prompt,
         deliver_mention_batches,
         deliver_text_chunks,
+        build_collection_checkpoint_prompt,
+        build_collection_checkpoint_system_prompt,
+        extract_collection_reference_hints,
         format_local_time,
         generate_group_summary,
         member_display_name,
         member_role,
         next_interval_occurrence,
-        parse_ai_extraction_response,
-        validate_ai_extraction_candidate,
+        is_group_admin_member,
+        parse_collection_checkpoint_response,
+        validate_collection_checkpoint_candidate,
         resolve_member_refs,
         search_group_members,
         validate_moderation_preflight,
@@ -47,27 +50,30 @@ if __package__:
 else:
     from core import (
         MODERATION_CONFIRM_TTL_SECONDS,
+        COLLECTION_CHECKPOINT_CHUNK_CHARS,
+        COLLECTION_CHECKPOINT_MAX_CHUNKS,
+        COLLECTION_CHECKPOINT_MAX_MESSAGES,
+        COLLECTION_CHECKPOINT_MAX_TOTAL_CHARS,
+        COLLECTION_CHECKPOINT_TIMEOUT_SECONDS,
         SUMMARY_PRIVATE_CHUNK_CHARS,
         TaskManager,
         clamp_archive_max_message_chars,
         clamp_archive_retention_days,
         clamp_scheduler_interval,
         collection_member_stats,
-        COLLECTION_AI_COOLDOWN_SECONDS,
-        COLLECTION_AI_MAX_CONCURRENCY,
-        COLLECTION_AI_MAX_INPUT_CHARS,
-        COLLECTION_AI_TIMEOUT_SECONDS,
-        build_collection_extraction_prompt,
-        build_collection_extraction_system_prompt,
         deliver_mention_batches,
         deliver_text_chunks,
+        build_collection_checkpoint_prompt,
+        build_collection_checkpoint_system_prompt,
+        extract_collection_reference_hints,
         format_local_time,
         generate_group_summary,
         member_display_name,
         member_role,
         next_interval_occurrence,
-        parse_ai_extraction_response,
-        validate_ai_extraction_candidate,
+        is_group_admin_member,
+        parse_collection_checkpoint_response,
+        validate_collection_checkpoint_candidate,
         resolve_member_refs,
         search_group_members,
         validate_moderation_preflight,
@@ -108,8 +114,6 @@ class LumielleNexus(Star):
             str(value).strip() for value in moderator_ids if str(value).strip()
         }
         self._scheduler_task: asyncio.Task[None] | None = None
-        self._collection_ai_semaphore = asyncio.Semaphore(COLLECTION_AI_MAX_CONCURRENCY)
-        self._collection_ai_cooldowns: dict[tuple[str, str], float] = {}
 
     async def initialize(self) -> None:
         if self._scheduler_task is None or self._scheduler_task.done():
@@ -167,6 +171,43 @@ class LumielleNexus(Star):
     def _authorized_moderator(self, event: AstrMessageEvent) -> tuple[bool, str]:
         denial = self._moderator_denial(event)
         return not denial, denial
+
+    async def _authorized_group_admin(
+        self, event: AstrMessageEvent,
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        """Authorize only a QQ-native owner/admin for the current bound group."""
+        if event.is_private_chat():
+            return False, "该权限只适用于当前 QQ 群消息。", None
+        if self._event_platform_name(event) != "aiocqhttp":
+            return False, "当前版本只支持 aiocqhttp（OneBot v11）群内控制。", None
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            return False, "无法识别当前 QQ 群。", None
+        try:
+            binding = await self.manager.get_binding(group_id, self._platform_id(event))
+            member = await self._adapter(event).get_group_member_info(
+                group_id, str(event.get_sender_id()),
+            )
+        except (KeyError, ValueError, QQAdapterError) as exc:
+            return False, f"当前群未绑定或无法读取群管理员身份：{exc}", None
+        if not is_group_admin_member(member):
+            return False, "你不是当前群的 QQ 群主/管理员，不能执行群枢控制。", None
+        return True, "", binding
+
+    async def _authorized_collection_control(
+        self, event: AstrMessageEvent, requested_group: str = "",
+    ) -> tuple[bool, str, str]:
+        """Allow private operators or current-group QQ admins for scoped controls."""
+        if event.is_private_chat():
+            allowed, message = self._authorized_for_control(event)
+            return allowed, message, str(requested_group or "")
+        allowed, message, binding = await self._authorized_group_admin(event)
+        if not allowed or binding is None:
+            return False, message, ""
+        requested = str(requested_group or "").strip()
+        if requested and requested not in {binding["alias"], binding["group_id"]}:
+            return False, "群内控制只能作用于当前群，不能跨群操作。", ""
+        return True, "", binding["alias"]
 
     @staticmethod
     def _platform_id(event: AstrMessageEvent) -> str:
@@ -254,7 +295,7 @@ class LumielleNexus(Star):
             if not allowed:
                 return message
         else:
-            allowed, message = self._authorized_for_control(event)
+            allowed, message, _effective_group = await self._authorized_collection_control(event)
             if not allowed:
                 return message
         try:
@@ -264,6 +305,8 @@ class LumielleNexus(Star):
                 str(event.get_sender_id()),
                 allow_admin_override=event.is_admin(),
             )
+            if not event.is_private_chat() and task["group_id"] != str(event.get_group_id()):
+                return "群内控制只能作用于当前群，不能跨群操作。"
             payload = self._payload(task)
             lines = [f"任务：{task['id']}", f"类型：{task['type']}", f"群：{task['group_alias']}", f"状态：{task['status']}"]
             if task["type"] == "REMINDER":
@@ -368,11 +411,13 @@ class LumielleNexus(Star):
     async def _search_group_members(
         self, event: AstrMessageEvent, group: str, query: str = "", limit: int = 20,
     ) -> str:
-        allowed, message = self._authorized_for_control(event)
+        allowed, message, effective_group = await self._authorized_collection_control(event, group)
         if not allowed:
             return message
         try:
-            _binding, members, self_id = await self._live_members(event, group)
+            _binding, members, self_id = await self._live_members(
+                event, effective_group or group,
+            )
             results = search_group_members(members, query, limit, self_id)
             if not results:
                 return "没有找到匹配的群成员。"
@@ -391,13 +436,14 @@ class LumielleNexus(Star):
         members: list[str],
         mode: str = "replace",
     ) -> str:
-        allowed, message = self._authorized_for_control(event)
+        allowed, message, effective_group = await self._authorized_collection_control(event, group)
         if not allowed:
             return message
         try:
-            _binding, live_members, self_id = await self._live_members(event, group)
+            effective_group = effective_group or group
+            _binding, live_members, self_id = await self._live_members(event, effective_group)
             member_set = await self.manager.set_member_set(
-                group, name, members, mode, self._platform_id(event),
+                effective_group, name, members, mode, self._platform_id(event),
                 event.get_sender_id(), live_members, self_id,
             )
             return (
@@ -408,11 +454,13 @@ class LumielleNexus(Star):
             return f"设置成员集合失败：{exc}"
 
     async def _list_member_sets(self, event: AstrMessageEvent, group: str = "") -> str:
-        allowed, message = self._authorized_for_control(event)
+        allowed, message, effective_group = await self._authorized_collection_control(event, group)
         if not allowed:
             return message
         try:
-            sets = await self.manager.list_member_sets(group, self._platform_id(event))
+            sets = await self.manager.list_member_sets(
+                effective_group or group, self._platform_id(event),
+            )
             if not sets:
                 return "暂无成员集合。"
             aliases = {
@@ -433,13 +481,14 @@ class LumielleNexus(Star):
             return f"查询成员集合失败：{exc}"
 
     async def _get_member_set(self, event: AstrMessageEvent, group: str, name: str) -> str:
-        allowed, message = self._authorized_for_control(event)
+        allowed, message, effective_group = await self._authorized_collection_control(event, group)
         if not allowed:
             return message
         try:
-            _binding, live_members, self_id = await self._live_members(event, group)
+            effective_group = effective_group or group
+            _binding, live_members, self_id = await self._live_members(event, effective_group)
             member_set = await self.manager.get_member_set(
-                group, name, self._platform_id(event), live_members, self_id,
+                effective_group, name, self._platform_id(event), live_members, self_id,
             )
             lines = [f"{member_set['name']}（{len(member_set['members'])} 人）"]
             for member in member_set["members"]:
@@ -452,20 +501,118 @@ class LumielleNexus(Star):
     async def _delete_member_set(
         self, event: AstrMessageEvent, group: str, name: str, confirm: bool = False,
     ) -> str:
-        allowed, message = self._authorized_for_control(event)
+        allowed, message, effective_group = await self._authorized_collection_control(event, group)
         if not allowed:
             return message
         if confirm is not True:
             return "这是永久删除操作，请明确确认删除该成员名单后再执行。"
         try:
             count = await self.manager.delete_member_set(
-                group, name, self._platform_id(event),
+                effective_group or group, name, self._platform_id(event),
             )
             if not count:
                 return f"未找到成员集合：{name}"
             return f"已删除成员集合「{name.strip()}」。"
         except (KeyError, ValueError) as exc:
             return f"删除成员集合失败：{exc}"
+
+    async def _resolve_live_member(
+        self, event: AstrMessageEvent, group: str, member: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        binding, live_members, self_id = await self._live_members(event, group)
+        resolved = resolve_member_refs(live_members, [member], self_id)
+        return binding, resolved[0], self_id
+
+    async def _set_member_identity(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        member: str,
+        name: str = "",
+        student_id: str = "",
+    ) -> str:
+        allowed, message, effective_group = await self._authorized_collection_control(event, group)
+        if not allowed:
+            return message
+        try:
+            effective_group = effective_group or group
+            _binding, target, _self_id = await self._resolve_live_member(
+                event, effective_group, member,
+            )
+            source = "group_admin" if not event.is_private_chat() else "operator"
+            rows = await self.manager.set_member_identity(
+                effective_group,
+                str(target["user_id"]),
+                name,
+                student_id,
+                self._platform_id(event),
+                str(event.get_sender_id()),
+                source=source,
+            )
+            values = "、".join(f"{row['field_name']}：{row['value']}" for row in rows)
+            return f"已保存 {member_display_name(target)}（{target['user_id']}）的身份信息：{values}。"
+        except (KeyError, ValueError, QQAdapterError) as exc:
+            return f"保存成员身份失败：{exc}"
+
+    async def _get_member_identity(
+        self, event: AstrMessageEvent, group: str, member: str,
+    ) -> str:
+        allowed, message, effective_group = await self._authorized_collection_control(event, group)
+        if not allowed:
+            return message
+        try:
+            effective_group = effective_group or group
+            _binding, target, _self_id = await self._resolve_live_member(
+                event, effective_group, member,
+            )
+            rows = await self.manager.get_member_identity(
+                effective_group, str(target["user_id"]), self._platform_id(event),
+            )
+            if not rows:
+                return f"{member_display_name(target)}（{target['user_id']}）暂无已保存的身份信息。"
+            return "\n".join([
+                f"成员：{member_display_name(target)}（{target['user_id']}）",
+                *[
+                    f"{row['field_name']}：{row['value']}（{'已核验' if row['verified'] else '未核验'}）"
+                    for row in rows
+                ],
+            ])
+        except (KeyError, ValueError, QQAdapterError) as exc:
+            return f"查询成员身份失败：{exc}"
+
+    async def _list_member_identities(
+        self, event: AstrMessageEvent, group: str = "",
+    ) -> str:
+        allowed, message, effective_group = await self._authorized_collection_control(event, group)
+        if not allowed:
+            return message
+        try:
+            bindings = await self.manager.list_groups(self._platform_id(event))
+            if effective_group or group:
+                scopes = [(effective_group or group, "")]
+            else:
+                scopes = [(item["alias"], item["alias"]) for item in bindings]
+            lines: list[str] = []
+            for scope, label in scopes:
+                rows = await self.manager.list_member_identities(
+                    scope, self._platform_id(event),
+                )
+                if not rows:
+                    continue
+                if label:
+                    lines.append(f"{label}：")
+                grouped: dict[str, list[str]] = {}
+                for row in rows:
+                    grouped.setdefault(str(row["user_id"]), []).append(
+                        f"{row['field_name']}={row['value']}"
+                    )
+                lines.extend(
+                    f"{user_id}：{'；'.join(values)}"
+                    for user_id, values in grouped.items()
+                )
+            return "\n".join(lines) if lines else "暂无已保存的成员身份信息。"
+        except (KeyError, ValueError) as exc:
+            return f"列出成员身份失败：{exc}"
 
     async def _set_archive(self, event: AstrMessageEvent, group: str, enabled: bool) -> str:
         allowed, message = self._authorized_for_control(event)
@@ -742,10 +889,18 @@ class LumielleNexus(Star):
         if is_moderation:
             allowed, message = self._authorized_moderator(event)
         else:
-            allowed, message = self._authorized_for_control(event)
+            allowed, message, _effective_group = await self._authorized_collection_control(event)
         if not allowed:
             return message
         try:
+            current_task = await self.manager.get_task(
+                task_id,
+                self._platform_id(event),
+                str(event.get_sender_id()),
+                allow_admin_override=event.is_admin(),
+            )
+            if not event.is_private_chat() and current_task["group_id"] != str(event.get_group_id()):
+                return "群内控制只能作用于当前群，不能跨群操作。"
             task = await self.manager.cancel_task(
                 task_id,
                 self._platform_id(event),
@@ -906,14 +1061,24 @@ class LumielleNexus(Star):
             return f"群管理操作失败：{exc}。该操作不会自动重试。"
 
     async def _tasks(self, event: AstrMessageEvent, group: str | None = None) -> str:
-        operator_allowed, _operator_message = self._authorized_for_control(event)
-        moderation_allowed, moderation_message = self._authorized_moderator(event)
-        if not operator_allowed and not moderation_allowed:
-            return moderation_message
-        moderation_only = moderation_allowed and not operator_allowed
+        if event.is_private_chat():
+            operator_allowed, operator_message = self._authorized_for_control(event)
+            moderation_allowed, moderation_message = self._authorized_moderator(event)
+            if not operator_allowed and not moderation_allowed:
+                return operator_message or moderation_message
+            effective_group = group or None
+            moderation_only = moderation_allowed and not operator_allowed
+        else:
+            allowed, message, effective_group = await self._authorized_collection_control(
+                event, group or "",
+            )
+            if not allowed:
+                return message
+            moderation_allowed = False
+            moderation_only = False
         tasks = await self.manager.list_tasks(
             self._platform_id(event),
-            group or None,
+            effective_group,
             requester_id=str(event.get_sender_id()),
             allow_admin_override=event.is_admin(),
             moderation_only=moderation_only,
@@ -936,8 +1101,13 @@ class LumielleNexus(Star):
         mention_all: bool = False,
         target_member_set: str = "",
         ai_extraction: bool = False,
+        chase_at: str = "",
+        deadline: str = "",
+        missing_default_field: str = "",
+        missing_default_value: str = "",
+        auto_export: bool = False,
     ) -> str:
-        allowed, message = self._authorized_for_control(event)
+        allowed, message, effective_group = await self._authorized_collection_control(event, group)
         if not allowed:
             return message
         try:
@@ -963,7 +1133,7 @@ class LumielleNexus(Star):
                         "无法开启自然语言填写。可以关闭 ai_extraction 后使用标准字段格式提交。"
                     )
             task = await self.manager.start_collection(
-                group,
+                effective_group or group,
                 title,
                 fields,
                 announcement,
@@ -971,9 +1141,14 @@ class LumielleNexus(Star):
                 self._platform_id(event),
                 event.get_sender_id(),
                 event.unified_msg_origin,
-                target_member_set,
-                ai_extraction,
-                ai_provider_id,
+                target_member_set=target_member_set,
+                ai_extraction=ai_extraction,
+                ai_provider_id=ai_provider_id,
+                chase_at=chase_at,
+                deadline=deadline,
+                missing_default_field=missing_default_field,
+                missing_default_value=missing_default_value,
+                auto_export=auto_export,
             )
             payload = self._payload(task)
             notice = payload.get("announcement") or (
@@ -983,12 +1158,15 @@ class LumielleNexus(Star):
             )
             if payload.get("ai_extraction"):
                 notice += (
-                    "\n\n也可以使用自然语言填写，但必须以“提交：”开头。\n"
-                    "例如：\n提交：我是张三，10月3日下午离校，7号晚上返校\n\n"
-                    "如需修改已提交内容，可使用：\n"
-                    "更正：返校时间改为10月8日晚上\n\n"
-                    "标准“字段：值”格式仍然最可靠。"
+                    "\n\n请在截止前直接用自然语言回复自己的情况；"
+                    "checkpoint 会批量分析新增消息。\n"
+                    "例如：我7号下午三点左右回来。\n"
+                    "标准“字段：值”格式仍然最可靠，会立即记录。"
                 )
+            if payload.get("chase_at"):
+                notice += f"\n计划催办时间：{format_local_time(payload['chase_at'], self.manager.timezone_name, 'minutes')}。"
+            if payload.get("deadline"):
+                notice += f"\n截止时间：{format_local_time(payload['deadline'], self.manager.timezone_name, 'minutes')}。"
             try:
                 if payload.get("mention_all"):
                     await self._adapter(event).send_group_at_all(task["group_id"], notice)
@@ -1001,9 +1179,43 @@ class LumielleNexus(Star):
         except (KeyError, ValueError) as exc:
             return f"创建收集任务失败：{exc}"
 
-    async def _collection_status(self, event: AstrMessageEvent, task_id: str) -> str:
+    async def _collection_status(
+        self,
+        event: AstrMessageEvent,
+        task_id: str = "",
+        group: str = "",
+        refresh: bool = True,
+    ) -> str:
+        allowed, message, effective_group = await self._authorized_collection_control(event, group)
+        if not allowed:
+            return message
+        if not isinstance(refresh, bool):
+            return "查询失败：refresh 必须是布尔值。"
         try:
-            status = await self.manager.collection_status(task_id, self._platform_id(event))
+            hints = {"task_ids": [], "aliases": []}
+            if not str(task_id or "").strip() and not str(group or "").strip() and event.is_private_chat():
+                hints = await self._conversation_hints(event)
+            current_group_id = str(event.get_group_id() or "") if not event.is_private_chat() else ""
+            task = await self.manager.resolve_collection_reference(
+                self._platform_id(event),
+                task_id,
+                effective_group or group,
+                hinted_task_ids=hints["task_ids"],
+                hinted_aliases=hints["aliases"],
+                current_group_id=current_group_id,
+            )
+            if not event.is_private_chat() and task["group_id"] != current_group_id:
+                return "群内控制只能作用于当前群，不能跨群操作。"
+            refresh_error = ""
+            payload = self._payload(task)
+            if refresh and task["status"] == "ACTIVE" and payload.get("ai_extraction"):
+                try:
+                    await self._run_collection_checkpoint(task["id"], datetime.now(timezone.utc), "manual")
+                    task = await self.manager.get_task(task["id"], self._platform_id(event))
+                except Exception as exc:
+                    refresh_error = str(exc)
+                    logger.exception("群枢 Collection 状态 refresh 失败 %s", task["id"])
+            status = await self.manager.collection_status(task["id"], self._platform_id(event))
             task = status["task"]
             members: list[dict[str, Any]] | None = None
             member_error = ""
@@ -1029,13 +1241,13 @@ class LumielleNexus(Star):
                 f"已提交：{submitted} 人",
                 f"自然语言填写：{'开启' if self._payload(task).get('ai_extraction') else '关闭'}",
             ]
+            if refresh_error:
+                lines.append(f"增量分析未完成：{refresh_error}；cursor 未推进。")
             if members is not None:
-                lines.extend(
-                    [
-                        f"群成员：{len(member_stats['eligible_ids'])} 人",
-                        f"未提交：{len(member_stats['missing_ids'])} 人",
-                    ],
-                )
+                lines.extend([
+                    f"群成员：{len(member_stats['eligible_ids'])} 人",
+                    f"未提交：{len(member_stats['missing_ids'])} 人",
+                ])
             else:
                 lines.append(f"群成员数：暂时无法获取（{member_error}）")
             return "\n".join(lines)
@@ -1043,10 +1255,15 @@ class LumielleNexus(Star):
             return f"查询失败：{exc}"
 
     async def _stop_collection(self, event: AstrMessageEvent, task_id: str) -> str:
-        allowed, message = self._authorized_for_control(event)
+        allowed, message, _effective_group = await self._authorized_collection_control(event)
         if not allowed:
             return message
         try:
+            current_task = await self.manager.get_task(
+                task_id, self._platform_id(event),
+            )
+            if not event.is_private_chat() and current_task["group_id"] != str(event.get_group_id()):
+                return "群内控制只能作用于当前群，不能跨群操作。"
             snapshot = await self.manager.stop_collection(task_id, self._platform_id(event))
             task = snapshot["task"]
             target_ids = self._payload(task).get("target_member_ids")
@@ -1058,6 +1275,9 @@ class LumielleNexus(Star):
                 member_error = str(exc)
             export_task = dict(task)
             export_task["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            identities = await self.manager.list_member_identities(
+                task["group_alias"], self._platform_id(event),
+            )
             try:
                 output = export_collection(
                     self.data_dir / "exports",
@@ -1067,6 +1287,7 @@ class LumielleNexus(Star):
                     self_id=str(event.get_self_id()),
                     target_ids=target_ids,
                     timezone_name=self.manager.timezone_name,
+                    identities=identities,
                 )
             except Exception as exc:
                 await self.manager.fail_collection(task["id"], f"Excel 导出失败：{exc}")
@@ -1100,6 +1321,276 @@ class LumielleNexus(Star):
         except (KeyError, ValueError) as exc:
             return f"结束失败：{exc}"
 
+    async def _conversation_hints(self, event: AstrMessageEvent) -> dict[str, list[str]]:
+        conversation_manager = getattr(self.context, "conversation_manager", None)
+        if conversation_manager is None:
+            return {"task_ids": [], "aliases": []}
+        try:
+            conversations = await conversation_manager.get_conversations(
+                unified_msg_origin=event.unified_msg_origin,
+                platform_id=self._platform_id(event),
+            )
+        except Exception:
+            logger.exception("群枢读取 ConversationManager 线索失败")
+            return {"task_ids": [], "aliases": []}
+        parts: list[str] = []
+        total = 0
+        for conversation in list(conversations or [])[:5]:
+            title = getattr(conversation, "title", "")
+            history = getattr(conversation, "history", "")
+            if isinstance(conversation, dict):
+                title = conversation.get("title", "")
+                history = conversation.get("history", conversation.get("content", ""))
+            if not isinstance(history, str):
+                history = json.dumps(history, ensure_ascii=False)
+            text = f"{title}\n{history}"
+            remaining = 20000 - total
+            if remaining <= 0:
+                break
+            parts.append(text[:remaining])
+            total += min(len(text), remaining)
+        try:
+            groups = await self.manager.list_groups(self._platform_id(event))
+            aliases = [str(item["alias"]) for item in groups]
+        except Exception:
+            aliases = []
+        return extract_collection_reference_hints("\n".join(parts), aliases)
+
+    @staticmethod
+    def _checkpoint_member_records(
+        snapshot: dict[str, Any], rows: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        rows = snapshot.get("messages") if rows is None else rows
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows or []:
+            grouped.setdefault(str(row["sender_id"]), []).append(row)
+        records: list[dict[str, Any]] = []
+        for user_id, user_rows in grouped.items():
+            identity = {
+                str(item["field_name"]): str(item["value"])
+                for item in snapshot.get("identities", {}).get(user_id, [])
+            }
+            records.append({
+                "user_id": user_id,
+                "identity": identity,
+                "current_entry": snapshot.get("current_entries", {}).get(user_id, {}),
+                "messages": [
+                    {
+                        "sent_at": row["sent_at"],
+                        "message_text": row["message_text"],
+                    }
+                    for row in user_rows
+                ],
+            })
+        return records
+
+    @staticmethod
+    def _checkpoint_chunks(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        chunks: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        current_chars = 0
+        for row in rows:
+            row_chars = len(str(row.get("message_text") or "")) + 32
+            if current and current_chars + row_chars > COLLECTION_CHECKPOINT_CHUNK_CHARS:
+                chunks.append(current)
+                current = []
+                current_chars = 0
+            current.append(row)
+            current_chars += row_chars
+        if current:
+            chunks.append(current)
+        if len(chunks) <= COLLECTION_CHECKPOINT_MAX_CHUNKS:
+            return chunks
+        return chunks[:COLLECTION_CHECKPOINT_MAX_CHUNKS]
+
+    async def _call_collection_checkpoint_llm(
+        self,
+        snapshot: dict[str, Any],
+        members: list[dict[str, Any]],
+        *,
+        notes: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        payload = snapshot["payload"]
+        provider_id = str(payload.get("ai_provider_id") or "").strip()
+        if not provider_id:
+            raise ValueError("Collection 没有可用的固定 LLM Provider")
+        prompt = build_collection_checkpoint_prompt(
+            payload.get("title", ""),
+            payload.get("fields", []),
+            payload.get("announcement", ""),
+            snapshot["cutoff"],
+            self.manager.timezone_name,
+            members,
+            notes=notes,
+        )
+        response = await asyncio.wait_for(
+            self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                system_prompt=build_collection_checkpoint_system_prompt(),
+            ),
+            timeout=COLLECTION_CHECKPOINT_TIMEOUT_SECONDS,
+        )
+        return parse_collection_checkpoint_response(self._llm_response_text(response))
+
+    async def _generate_collection_checkpoint_candidate(
+        self, snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        rows = snapshot.get("messages") or []
+        if not rows:
+            return {"members": []}
+        chunks = self._checkpoint_chunks(rows)
+        if len(chunks) == 1:
+            return await self._call_collection_checkpoint_llm(
+                snapshot, self._checkpoint_member_records(snapshot, chunks[0]),
+            )
+        notes: list[dict[str, Any]] = []
+        for chunk in chunks:
+            notes.append(await self._call_collection_checkpoint_llm(
+                snapshot, self._checkpoint_member_records(snapshot, chunk),
+            ))
+        if len(notes) >= 3:
+            return self._merge_checkpoint_candidates(notes)
+        return await self._call_collection_checkpoint_llm(
+            snapshot,
+            self._checkpoint_member_records(snapshot, rows),
+            notes=notes,
+        )
+
+    @staticmethod
+    def _merge_checkpoint_candidates(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        by_user: dict[str, dict[str, Any]] = {}
+        for candidate in candidates:
+            for member in candidate.get("members", []) if isinstance(candidate, dict) else []:
+                if not isinstance(member, dict):
+                    continue
+                user_id = str(member.get("user_id") or "").strip()
+                if not user_id:
+                    continue
+                target = by_user.setdefault(user_id, {"user_id": user_id, "status": "ok", "items": []})
+                items_by_field = {str(item.get("field")): item for item in target["items"]}
+                for item in member.get("items", []) if isinstance(member.get("items"), list) else []:
+                    if isinstance(item, dict):
+                        items_by_field[str(item.get("field"))] = item
+                target["items"] = list(items_by_field.values())
+        return {"members": list(by_user.values())}
+
+    async def _run_collection_checkpoint(
+        self,
+        task_id: str,
+        cutoff: str | datetime,
+        reason: str,
+    ) -> dict[str, Any]:
+        snapshot = await self.manager.prepare_collection_checkpoint(task_id, cutoff, reason)
+        if not snapshot["messages"] or not snapshot["payload"].get("ai_extraction"):
+            await self.manager.advance_collection_checkpoint(task_id, snapshot)
+            return {"snapshot": snapshot, "llm_called": False, "applied": []}
+        candidate = await self._generate_collection_checkpoint_candidate(snapshot)
+        applied = await self.manager.apply_collection_checkpoint(task_id, snapshot, candidate)
+        return {"snapshot": snapshot, "llm_called": True, **applied}
+
+    async def _execute_collection_checkpoint(
+        self, task: dict[str, Any], payload: dict[str, Any],
+    ) -> None:
+        status = await self.manager.collection_status(
+            payload["collection_task_id"], task["platform_id"],
+        )
+        if status["task"]["status"] != "ACTIVE":
+            return
+        await self._run_collection_checkpoint(
+            payload["collection_task_id"],
+            payload.get("scheduled_run_at") or task["run_at"],
+            payload.get("checkpoint_type", "chase"),
+        )
+        if payload.get("checkpoint_type") == "chase":
+            collection = (await self.manager.collection_status(
+                payload["collection_task_id"], task["platform_id"],
+            ))["task"]
+            collection_payload = self._payload(collection)
+            if collection_payload.get("deadline"):
+                deadline = datetime.fromisoformat(collection_payload["deadline"])
+                if datetime.now(timezone.utc) >= deadline.astimezone(timezone.utc):
+                    return
+            await self._execute_collection_chase(task, payload)
+
+    async def _execute_collection_finalize(
+        self, task: dict[str, Any], payload: dict[str, Any],
+    ) -> None:
+        status = await self.manager.collection_status(
+            payload["collection_task_id"], task["platform_id"],
+        )
+        collection = status["task"]
+        if collection["status"] != "ACTIVE":
+            return
+        collection_payload = self._payload(collection)
+        analysis_incomplete = False
+        analysis_error = ""
+        try:
+            await self._run_collection_checkpoint(
+                collection["id"],
+                collection_payload.get("deadline") or payload.get("scheduled_run_at") or task["run_at"],
+                "finalize",
+            )
+        except Exception as exc:
+            analysis_incomplete = True
+            analysis_error = str(exc)
+            logger.exception("群枢 Collection 最终 checkpoint 失败 %s", collection["id"])
+
+        adapter = QQAdapter(self.context, task["platform_id"])
+        members: list[dict[str, Any]] | None = None
+        self_id: str | None = None
+        try:
+            members = await adapter.get_group_member_list(collection["group_id"])
+            self_id = str((await adapter.get_login_info()).get("user_id") or "")
+        except QQAdapterError:
+            logger.exception("群枢 Collection 最终群成员读取失败 %s", collection["id"])
+        if not analysis_incomplete and collection_payload.get("missing_default_field") and members is not None:
+            latest_status = await self.manager.collection_status(
+                collection["id"], task["platform_id"],
+            )
+            eligible = collection_member_stats(
+                members,
+                latest_status["entries"],
+                self_id=self_id,
+                target_ids=collection_payload.get("target_member_ids"),
+            )["eligible_ids"]
+            await self.manager.apply_missing_default(
+                collection["id"], eligible,
+                collection_payload["missing_default_field"],
+                collection_payload["missing_default_value"],
+            )
+        snapshot = await self.manager.stop_collection(collection["id"], task["platform_id"])
+        export_path = None
+        upload_error = ""
+        if collection_payload.get("auto_export"):
+            export_task = dict(snapshot["task"])
+            export_task["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            try:
+                identities = await self.manager.list_member_identities(
+                    collection["group_alias"], task["platform_id"],
+                )
+                export_path = export_collection(
+                    self.data_dir / "exports", export_task, snapshot["entries"], members,
+                    self_id=self_id, target_ids=collection_payload.get("target_member_ids"),
+                    timezone_name=self.manager.timezone_name, identities=identities,
+                )
+                try:
+                    await adapter.upload_private_file(collection["creator_id"], export_path)
+                except QQAdapterError as exc:
+                    upload_error = str(exc)
+            except Exception as exc:
+                analysis_error = analysis_error or f"Excel 导出失败：{exc}"
+                logger.exception("群枢 Collection 自动导出失败 %s", collection["id"])
+        result = {
+            "submitted_count": len(snapshot["entries"]),
+            "auto_export": bool(collection_payload.get("auto_export")),
+            "export_path": str(export_path) if export_path else None,
+            "upload_error": upload_error or None,
+            "analysis_incomplete": analysis_incomplete,
+            "analysis_error": analysis_error or None,
+        }
+        await self.manager.complete_collection(collection["id"], result)
+
     async def _scheduler_loop(self) -> None:
         while True:
             try:
@@ -1132,6 +1623,12 @@ class LumielleNexus(Star):
             )
             return False
         payload = self._payload(task)
+        if payload.get("kind") == "collection_checkpoint":
+            await self._execute_collection_checkpoint(task, payload)
+            return True
+        if payload.get("kind") == "collection_finalize":
+            await self._execute_collection_finalize(task, payload)
+            return True
         if payload.get("kind") == "collection_chase":
             await self._execute_collection_chase(task, payload)
             return True
@@ -1223,13 +1720,17 @@ class LumielleNexus(Star):
         collection = status["task"]
         if collection["status"] != "ACTIVE":
             return
+        collection_payload = self._payload(collection)
+        if collection_payload.get("deadline"):
+            deadline = datetime.fromisoformat(collection_payload["deadline"])
+            if datetime.now(timezone.utc) >= deadline.astimezone(timezone.utc):
+                return
         adapter = QQAdapter(self.context, task["platform_id"])
         members = await adapter.get_group_member_list(task["group_id"])
         try:
             self_id = str((await adapter.get_login_info()).get("user_id") or "")
         except QQAdapterError:
             self_id = None
-        collection_payload = self._payload(collection)
         stats = collection_member_stats(
             members,
             status["entries"],
@@ -1442,13 +1943,10 @@ class LumielleNexus(Star):
 
     @nexus.command("collect-status", priority=10)
     async def cmd_collect_status(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
-        allowed, message = self._authorized_for_control(event)
         args = self._command_args(event)
         yield event.plain_result(
-            message if not allowed else (
-                await self._collection_status(event, args[0])
-                if args else "用法：/nexus collect-status <任务ID>"
-            ),
+            await self._collection_status(event, args[0], "", True)
+            if args else "用法：/nexus collect-status <任务ID>",
         )
 
     @nexus.command("collect-stop", priority=10)
@@ -1459,126 +1957,6 @@ class LumielleNexus(Star):
             if args
             else "用法：/nexus collect-stop <任务ID>",
         )
-
-    @staticmethod
-    def _collection_ai_feedback(result: dict[str, Any]) -> str:
-        status = result.get("status")
-        if status == "saved":
-            applied = result.get("applied") or []
-            lines = ["已从自然语言提交中识别并记录："]
-            lines.extend(f"{item['field']}：{item['value']}" for item in applied)
-            ignored = list(dict.fromkeys(result.get("ignored_existing") or []))
-            if ignored:
-                lines.append(
-                    "以下字段已有记录，提交模式未覆盖：" + "、".join(ignored)
-                )
-            rejected = [
-                str(item.get("field")) for item in result.get("rejected", [])
-                if item.get("field")
-            ]
-            if rejected:
-                lines.append(
-                    "以下内容未可靠识别，未写入：" + "、".join(dict.fromkeys(rejected))
-                )
-            lines.append("如有识别错误，可使用：更正：……，或直接发送标准“字段：值”格式。")
-            return "\n".join(lines)
-        if status == "changed":
-            return (
-                "你的提交记录在识别期间已经发生变化，本次自然语言更正未自动写入。"
-                "请重新发送更正，或使用“字段：值”格式。"
-            )
-        if status == "no_change" and result.get("ignored_existing"):
-            return (
-                "已有字段未被提交模式覆盖："
-                + "、".join(dict.fromkeys(result["ignored_existing"]))
-                + "。如需修改，请使用“更正：……”或标准“字段：值”格式。"
-            )
-        return (
-            "没有可靠识别到可提交字段，本次未写入。\n"
-            "请使用例如：\n姓名：张三\n离校时间：10月3日下午"
-        )
-
-    async def _process_collection_ai_submission(
-        self,
-        event: AstrMessageEvent,
-        ai_context: dict[str, Any],
-        raw_message: str,
-    ) -> str | None:
-        body = str(ai_context.get("body") or "")
-        if not body:
-            return self._collection_ai_feedback({"status": "no_data", "rejected": []})
-        if len(body) > COLLECTION_AI_MAX_INPUT_CHARS:
-            return "自然语言提交内容过长，请缩短内容，或使用“字段：值”格式提交。"
-        task_id = str(ai_context.get("task_id") or "")
-        sender_id = str(event.get_sender_id())
-        cooldown_key = (task_id, sender_id)
-        now = asyncio.get_running_loop().time()
-        previous = self._collection_ai_cooldowns.get(cooldown_key)
-        if previous is not None and now - previous < COLLECTION_AI_COOLDOWN_SECONDS:
-            return "自然语言识别请求过于频繁，请稍后再试，或使用“字段：值”格式提交。"
-        self._collection_ai_cooldowns[cooldown_key] = now
-        payload = ai_context["payload"]
-        provider_id = str(payload.get("ai_provider_id") or "").strip()
-        if not provider_id:
-            return "当前自然语言识别服务不可用，请使用“字段：值”格式提交。"
-        try:
-            async with self._collection_ai_semaphore:
-                response = await asyncio.wait_for(
-                    self.context.llm_generate(
-                        chat_provider_id=provider_id,
-                        prompt=build_collection_extraction_prompt(
-                            payload["fields"], body, ai_context["mode"],
-                        ),
-                        system_prompt=build_collection_extraction_system_prompt(),
-                    ),
-                    timeout=COLLECTION_AI_TIMEOUT_SECONDS,
-                )
-        except asyncio.TimeoutError:
-            return "自然语言识别暂时超时，请重试，或使用“字段：值”格式提交。"
-        except Exception:
-            logger.exception("群枢自然语言收集 Provider 调用失败 %s/%s", task_id, sender_id)
-            return "当前自然语言识别服务暂不可用，请使用“字段：值”格式提交。"
-
-        try:
-            candidate = parse_ai_extraction_response(
-                self._llm_response_text(response),
-            )
-            validation = validate_ai_extraction_candidate(
-                candidate, payload["fields"], body,
-            )
-        except ValueError:
-            logger.info("群枢自然语言收集候选 JSON 无效 task=%s sender=%s", task_id, sender_id)
-            return self._collection_ai_feedback({"status": "invalid", "rejected": []})
-
-        accepted = validation["accepted"]
-        if not accepted:
-            logger.info(
-                "群枢自然语言收集候选未接受 task=%s sender=%s rejected=%s",
-                task_id,
-                sender_id,
-                [item.get("reason") for item in validation["rejected"]],
-            )
-            return self._collection_ai_feedback(validation)
-        try:
-            result = await self.manager.apply_collection_ai_candidate(
-                ai_context,
-                accepted,
-                raw_message,
-                event.get_sender_name(),
-            )
-        except Exception:
-            logger.exception("群枢自然语言收集候选保存失败 %s/%s", task_id, sender_id)
-            return "自然语言识别结果暂时无法保存，请使用“字段：值”格式提交。"
-        logger.info(
-            "群枢自然语言收集审计 task=%s sender=%s accepted=%s rejected=%s",
-            task_id,
-            sender_id,
-            [item["field"] for item in result.get("applied", [])],
-            [item.get("reason") for item in validation["rejected"]],
-        )
-        if result.get("status") == "saved" and not self.collection_ack:
-            return None
-        return self._collection_ai_feedback({**result, "rejected": validation["rejected"]})
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
@@ -1598,27 +1976,19 @@ class LumielleNexus(Star):
             )
         except Exception:
             logger.exception("群枢归档群消息失败")
-        result = await self.manager.process_collection_message(
-            self._platform_id(event),
-            group_id,
-            sender_id,
-            event.get_sender_name(),
-            message_text,
-        )
-        if result is None:
-            ai_context = await self.manager.get_collection_ai_context(
+        try:
+            result = await self.manager.capture_active_collection_message(
                 self._platform_id(event),
                 group_id,
                 sender_id,
+                event.get_sender_name(),
                 message_text,
+                source_message_id=self._event_source_message_id(event),
             )
-            if ai_context is None:
-                return
-            feedback = await self._process_collection_ai_submission(
-                event, ai_context, message_text,
-            )
-            if feedback is not None:
-                yield event.plain_result(feedback)
+        except Exception:
+            logger.exception("群枢捕获 Collection 群消息失败")
+            return
+        if result is None or not result.get("deterministic_handled"):
             return
         if self.collection_ack:
             missing = result["missing"]
@@ -1650,7 +2020,7 @@ class LumielleNexus(Star):
         message: str,
         mention_all: bool = False,
     ) -> str:
-        """创建一个持久化的一次性 QQ 群提醒。先把自然语言时间转换为 YYYY-MM-DD HH:MM，再调用本工具；例如“明天下午三点”应转换为明确时间。只能在私聊 operator 中调用。
+        """创建一个持久化的一次性 QQ 群提醒。先把自然语言时间转换为 YYYY-MM-DD HH:MM，再调用本工具；例如“明天下午三点”应转换为明确时间。只能由私聊 operator 或当前群 QQ 群主/管理员调用；群内只能作用于当前群。
 
         Args:
             group(string): 已绑定群别名或群号。
@@ -1658,12 +2028,12 @@ class LumielleNexus(Star):
             message(string): 到期时发送到群里的提醒内容。
             mention_all(boolean): 是否在提醒前 @全体成员。
         """
-        allowed, denied = self._authorized_for_control(event)
+        allowed, denied, effective_group = await self._authorized_collection_control(event, group)
         if not allowed:
             return denied
         try:
             task = await self.manager.create_reminder(
-                group,
+                effective_group or group,
                 run_at,
                 message,
                 mention_all,
@@ -1683,7 +2053,7 @@ class LumielleNexus(Star):
 
     @filter.llm_tool(name="nexus_list_tasks")
     async def nexus_list_tasks(self, event: AstrMessageEvent, group: str = "") -> str:
-        """列出当前 operator 的群枢任务，可按已绑定群别名筛选。只能在私聊中调用。
+        """列出群枢任务，可按已绑定群别名筛选。私聊 operator 可跨群查看；群内只允许当前群 QQ 群主/管理员查看当前群任务。
 
         Args:
             group(string): 可选的群别名或群号；留空表示全部任务。
@@ -1692,7 +2062,7 @@ class LumielleNexus(Star):
 
     @filter.llm_tool(name="nexus_get_task")
     async def nexus_get_task(self, event: AstrMessageEvent, task_id: str) -> str:
-        """查看一个群枢任务的详细信息。普通任务只能在私聊 operator 中调用；MODERATION 只能由创建者 moderator 或 AstrBot Admin 查看，不返回原始 JSON 或服务器文件路径。
+        """查看一个群枢任务的详细信息。普通任务可由私聊 operator 或当前群 QQ 群主/管理员查看当前群任务；MODERATION 只能由创建者 moderator 或 AstrBot Admin 查看，不返回原始 JSON 或服务器文件路径。
 
         Args:
             task_id(string): 任务 ID，例如 D-20260909-001、S-20260909-001 或 K-20260909-001。
@@ -1710,7 +2080,7 @@ class LumielleNexus(Star):
         message: str = "",
         mention_all: bool = False,
     ) -> str:
-        """创建带多个提前提醒的持久化 DDL。只能在私聊 operator 中调用。
+        """创建带多个提前提醒的持久化 DDL。只能由私聊 operator 或当前群 QQ 群主/管理员调用；群内只能作用于当前群。
 
         Args:
             group(string): 已绑定群别名。
@@ -1720,12 +2090,12 @@ class LumielleNexus(Star):
             message(string): 可选的群提醒内容；留空由插件生成。
             mention_all(boolean): 是否 @全体成员。
         """
-        allowed, denied = self._authorized_for_control(event)
+        allowed, denied, effective_group = await self._authorized_collection_control(event, group)
         if not allowed:
             return denied
         try:
             task = await self.manager.create_ddl(
-                group, title, deadline, remind_before_minutes, message, mention_all,
+                effective_group or group, title, deadline, remind_before_minutes, message, mention_all,
                 self._platform_id(event), event.get_sender_id(), event.unified_msg_origin,
             )
             skipped = self._payload(task).get("skipped_offsets", [])
@@ -1746,7 +2116,7 @@ class LumielleNexus(Star):
         start_date: str = "",
         end_date: str = "",
     ) -> str:
-        """创建每周周期提醒。仅支持明确的 weekly weekday/time 规则，1=Monday、2=Tuesday、3=Wednesday、4=Thursday、5=Friday、6=Saturday、7=Sunday；只能在私聊 operator 中调用。
+        """创建每周周期提醒。仅支持明确的 weekly weekday/time 规则，1=Monday、2=Tuesday、3=Wednesday、4=Thursday、5=Friday、6=Saturday、7=Sunday；只能由私聊 operator 或当前群 QQ 群主/管理员调用；群内只能作用于当前群。
 
         Args:
             group(string): 已绑定群别名。
@@ -1757,12 +2127,12 @@ class LumielleNexus(Star):
             start_date(string): 可选的 YYYY-MM-DD 起始日期。
             end_date(string): 可选的 YYYY-MM-DD 结束日期。
         """
-        allowed, denied = self._authorized_for_control(event)
+        allowed, denied, effective_group = await self._authorized_collection_control(event, group)
         if not allowed:
             return denied
         try:
             task = await self.manager.create_recurring_reminder(
-                group, weekdays, time_of_day, message, mention_all, start_date, end_date,
+                effective_group or group, weekdays, time_of_day, message, mention_all, start_date, end_date,
                 self._platform_id(event), event.get_sender_id(), event.unified_msg_origin,
             )
             return (
@@ -1787,7 +2157,7 @@ class LumielleNexus(Star):
         end_date: str = "",
         mention_all: bool = False,
     ) -> str:
-        """创建每周课程提醒。weekdays 使用 1=Monday 到 7=Sunday；所有时间按插件时区解释，只能在私聊 operator 中调用。
+        """创建每周课程提醒。weekdays 使用 1=Monday 到 7=Sunday；所有时间按插件时区解释，只能由私聊 operator 或当前群 QQ 群主/管理员调用；群内只能作用于当前群。
 
         Args:
             group(string): 已绑定群别名。
@@ -1800,12 +2170,12 @@ class LumielleNexus(Star):
             end_date(string): 可选课程结束日期 YYYY-MM-DD。
             mention_all(boolean): 是否 @全体成员。
         """
-        allowed, denied = self._authorized_for_control(event)
+        allowed, denied, effective_group = await self._authorized_collection_control(event, group)
         if not allowed:
             return denied
         try:
             task = await self.manager.create_course(
-                group, course_name, weekdays, start_time, location, remind_before_minutes,
+                effective_group or group, course_name, weekdays, start_time, location, remind_before_minutes,
                 start_date, end_date, mention_all, self._platform_id(event),
                 event.get_sender_id(), event.unified_msg_origin,
             )
@@ -1826,7 +2196,7 @@ class LumielleNexus(Star):
         message: str = "",
         repeat_interval_minutes: int = 0,
     ) -> str:
-        """为 ACTIVE 信息收集安排未提交成员催办。到时只 @当前未提交成员，不 @全体；repeat_interval_minutes 为 0 表示单次，否则必须至少 60 分钟且不超过 7 天。只能在私聊 operator 中调用。
+        """为 ACTIVE 信息收集安排未提交成员催办。到时只 @当前未提交成员，不 @全体；repeat_interval_minutes 为 0 表示单次，否则必须至少 60 分钟且不超过 7 天。只能由私聊 operator 或当前群 QQ 群主/管理员调用；群内只能作用于当前群。
 
         Args:
             task_id(string): ACTIVE COLLECTION 任务 ID。
@@ -1834,10 +2204,15 @@ class LumielleNexus(Star):
             message(string): 可选催办内容。
             repeat_interval_minutes(number): 重复间隔分钟数，必须为整数，0 或至少 60。
         """
-        allowed, denied = self._authorized_for_control(event)
+        allowed, denied, _effective_group = await self._authorized_collection_control(event)
         if not allowed:
             return denied
         try:
+            current_task = await self.manager.get_task(
+                task_id, self._platform_id(event),
+            )
+            if not event.is_private_chat() and current_task["group_id"] != str(event.get_group_id()):
+                return "群内控制只能作用于当前群，不能跨群操作。"
             task = await self.manager.schedule_collection_chase(
                 task_id, run_at, message, repeat_interval_minutes,
                 self._platform_id(event), event.get_sender_id(), event.unified_msg_origin,
@@ -1851,7 +2226,7 @@ class LumielleNexus(Star):
 
     @filter.llm_tool(name="nexus_cancel_task")
     async def nexus_cancel_task(self, event: AstrMessageEvent, task_id: str) -> str:
-        """取消一个尚未执行的一次性提醒、PENDING relay 或 PENDING 群管理操作，或取消 ACTIVE 的 DDL、周期、课程、每周总结父任务并级联取消其未执行子提醒。信息收集必须使用 nexus_stop_collection 结束；普通任务只能在私聊 operator 中调用，MODERATION 只能由创建者 moderator 或 AstrBot Admin 取消。
+        """取消一个尚未执行的一次性提醒、PENDING relay 或 PENDING 群管理操作，或取消 ACTIVE 的 DDL、周期、课程、每周总结父任务并级联取消其未执行子提醒。信息收集必须使用 nexus_stop_collection 结束；普通任务可由私聊 operator 或当前群 QQ 群主/管理员操作当前群任务，MODERATION 只能由创建者 moderator 或 AstrBot Admin 取消。
 
         Args:
             task_id(string): 要取消的任务 ID，例如 R-20260909-001。
@@ -1869,8 +2244,13 @@ class LumielleNexus(Star):
         mention_all: bool = False,
         target_member_set: str = "",
         ai_extraction: bool = False,
+        chase_at: str = "",
+        deadline: str = "",
+        missing_default_field: str = "",
+        missing_default_value: str = "",
+        auto_export: bool = False,
     ) -> str:
-        """在已绑定 QQ 群启动一次信息收集。创建后插件会在群里发送标题、字段格式和说明；同一群同时只能有一个 active collection。只能在私聊 operator 中调用。自然语言填写默认关闭；只有用户明确要求允许自然语言填写、直接说人话提交或开启 AI 识别时才传 ai_extraction=true。开启后群成员仍必须以“提交：”或“更正：”开头，普通群聊不会调用 LLM。
+        """在已绑定 QQ 群启动一次信息收集。群消息会先持久化到 workflow history，标准字段立即写入；开启 ai_extraction 后由 chase/deadline 或状态 refresh 批量增量分析，不会逐消息调用 LLM。只能由私聊 operator 或当前群 QQ 群主/管理员调用；群内 group 参数必须是当前群。
 
         Args:
             group(string): 已绑定群别名或群号，例如“班群”。
@@ -1879,7 +2259,12 @@ class LumielleNexus(Star):
             announcement(string): 可选的群公告补充说明。
             mention_all(boolean): 是否在启动公告中 @全体成员。
             target_member_set(string): 可选的群内成员集合名称；创建时会 snapshot 成员，后续名单变化不影响本次收集。
-            ai_extraction(boolean): 是否显式开启带固定 AstrBot LLM Provider 的自然语言填写；默认 false，除非用户明确要求，否则不要传 true。
+            ai_extraction(boolean): 是否开启 checkpoint semantic analysis；默认 false。开启后创建时绑定当前 AstrBot LLM Provider ID，只保存 ID，不保存凭据。
+            chase_at(string): 可选的 checkpoint 时间，按插件时区解释的 YYYY-MM-DD HH:MM，必须早于 deadline。
+            deadline(string): 可选的截止时间，按插件时区解释的 YYYY-MM-DD HH:MM。
+            missing_default_field(string): 截止时对完全没有 entry 的成员使用的字段，必须属于 fields。
+            missing_default_value(string): 与 missing_default_field 同时提供的缺省值。
+            auto_export(boolean): 是否在 deadline 自动生成 XLSX 并尝试私聊回传；没有 deadline 时不能为 true。
         """
         return await self._start_collection(
             event,
@@ -1890,21 +2275,33 @@ class LumielleNexus(Star):
             mention_all,
             target_member_set,
             ai_extraction,
+            chase_at,
+            deadline,
+            missing_default_field,
+            missing_default_value,
+            auto_export,
         )
 
     @filter.llm_tool(name="nexus_collection_status")
-    async def nexus_collection_status(self, event: AstrMessageEvent, task_id: str) -> str:
-        """查看信息收集任务的提交人数、尽力获取的群成员数、未提交人数和状态。只能在私聊 operator 中调用。
+    async def nexus_collection_status(
+        self,
+        event: AstrMessageEvent,
+        task_id: str = "",
+        group: str = "",
+        refresh: bool = True,
+    ) -> str:
+        """查看信息收集任务的提交人数、群成员数、未提交人数和状态；默认会先对 cursor 后的新 workflow messages 做一次增量 refresh。可用 task_id、group 或当前会话中的 Collection 线索定位；只能由私聊 operator 或当前群 QQ 群主/管理员调用。
 
         Args:
-            task_id(string): 收集任务 ID，例如 C-20260909-001。
+            task_id(string): 可选的收集任务 ID，例如 C-20260909-001。
+            group(string): 可选的已绑定群别名；群内调用时只能是当前群。
+            refresh(boolean): 是否先执行一次增量 checkpoint，默认 true；无新增消息时不会调用 LLM。
         """
-        allowed, message = self._authorized_for_control(event)
-        return message if not allowed else await self._collection_status(event, task_id)
+        return await self._collection_status(event, task_id, group, refresh)
 
     @filter.llm_tool(name="nexus_stop_collection")
     async def nexus_stop_collection(self, event: AstrMessageEvent, task_id: str) -> str:
-        """结束信息收集，生成 XLSX，并尝试通过 QQ 私聊回传给任务创建者。文件回传失败不会回滚导出结果。只能在私聊 operator 中调用。
+        """结束信息收集，生成 XLSX，并尝试通过 QQ 私聊回传给任务创建者。文件回传失败不会回滚导出结果。只能由私聊 operator 或当前群 QQ 群主/管理员调用，群内只能结束当前群任务。
 
         Args:
             task_id(string): 要结束的收集任务 ID。
@@ -2058,7 +2455,7 @@ class LumielleNexus(Star):
     async def nexus_search_group_members(
         self, event: AstrMessageEvent, group: str, query: str = "", limit: int = 20,
     ) -> str:
-        """实时查询已绑定 QQ 群成员。查询只使用当前群成员列表，不查询归档；只能在私聊 operator 中调用。
+        """实时查询已绑定 QQ 群成员。查询只使用当前群成员列表，不查询归档；只能由私聊 operator 或当前群 QQ 群主/管理员调用，群内只能查询当前群。
 
         Args:
             group(string): 已绑定群别名或群号。
@@ -2076,7 +2473,7 @@ class LumielleNexus(Star):
         members: list[str],
         mode: str = "replace",
     ) -> str:
-        """创建或更新一个 group-scoped 成员集合。成员引用必须是当前群真实成员的 QQ 号、精确群名片或精确昵称；有歧义时必须改用 QQ 号。不能加入 Bot 或机器人；只能在私聊 operator 中调用。
+        """创建或更新一个 group-scoped 成员集合。成员引用必须是当前群真实成员的 QQ 号、精确群名片或精确昵称；有歧义时必须改用 QQ 号。不能加入 Bot 或机器人；只能由私聊 operator 或当前群 QQ 群主/管理员调用，群内只能作用于当前群。
 
         Args:
             group(string): 已绑定群别名。
@@ -2090,7 +2487,7 @@ class LumielleNexus(Star):
     async def nexus_list_member_sets(
         self, event: AstrMessageEvent, group: str = "",
     ) -> str:
-        """列出已绑定群的成员集合及人数。留空 group 表示列出当前平台全部集合；只能在私聊 operator 中调用。
+        """列出已绑定群的成员集合及人数。留空 group 表示私聊 operator 列出当前平台全部集合；群内只能列出当前群，且需要 QQ 群主/管理员权限。
 
         Args:
             group(string): 可选已绑定群别名。
@@ -2101,7 +2498,7 @@ class LumielleNexus(Star):
     async def nexus_get_member_set(
         self, event: AstrMessageEvent, group: str, name: str,
     ) -> str:
-        """查看一个 group-scoped 成员集合，并尽力标出已退群成员；只能在私聊 operator 中调用。
+        """查看一个 group-scoped 成员集合，并尽力标出已退群成员；只能由私聊 operator 或当前群 QQ 群主/管理员调用，群内只能作用于当前群。
 
         Args:
             group(string): 已绑定群别名。
@@ -2113,7 +2510,7 @@ class LumielleNexus(Star):
     async def nexus_delete_member_set(
         self, event: AstrMessageEvent, group: str, name: str, confirm: bool = False,
     ) -> str:
-        """删除一个成员集合。只有用户明确确认删除该名单后才能传 confirm=true；这是永久删除集合数据的操作，不影响历史任务；只能在私聊 operator 中调用。
+        """删除一个成员集合。只有用户明确确认删除该名单后才能传 confirm=true；这是永久删除集合数据的操作，不影响历史任务；只能由私聊 operator 或当前群 QQ 群主/管理员调用，群内只能作用于当前群。
 
         Args:
             group(string): 已绑定群别名。
@@ -2121,6 +2518,48 @@ class LumielleNexus(Star):
             confirm(boolean): 只有用户明确确认删除名单时才传 true，否则必须保持 false。
         """
         return await self._delete_member_set(event, group, name, confirm)
+
+    @filter.llm_tool(name="nexus_set_member_identity")
+    async def nexus_set_member_identity(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        member: str,
+        name: str = "",
+        student_id: str = "",
+    ) -> str:
+        """保存一个当前群成员的姓名或学号。仅允许已绑定群的私聊 operator 或当前群 QQ 群主/管理员调用；成员必须实时存在于该群，且只能按 QQ 号、精确群名片或精确昵称解析。
+
+        Args:
+            group(string): 已绑定群别名或群号；群内调用时只能是当前群。
+            member(string): 成员 QQ 号、精确群名片或精确昵称；歧义时请使用 QQ 号。
+            name(string): 可选的姓名。
+            student_id(string): 可选的学号。
+        """
+        return await self._set_member_identity(event, group, member, name, student_id)
+
+    @filter.llm_tool(name="nexus_get_member_identity")
+    async def nexus_get_member_identity(
+        self, event: AstrMessageEvent, group: str, member: str,
+    ) -> str:
+        """查询一个已绑定群成员的姓名/学号身份信息。仅允许私聊 operator 或当前群 QQ 群主/管理员调用，不查询未绑定群。
+
+        Args:
+            group(string): 已绑定群别名或群号；群内调用时只能是当前群。
+            member(string): 成员 QQ 号、精确群名片或精确昵称；歧义时请使用 QQ 号。
+        """
+        return await self._get_member_identity(event, group, member)
+
+    @filter.llm_tool(name="nexus_list_member_identities")
+    async def nexus_list_member_identities(
+        self, event: AstrMessageEvent, group: str = "",
+    ) -> str:
+        """列出已绑定群中已保存的成员身份信息。留空 group 时仅私聊 operator 可列出当前平台各绑定群；群内调用只能列出当前群。
+
+        Args:
+            group(string): 可选的已绑定群别名或群号。
+        """
+        return await self._list_member_identities(event, group)
 
     @filter.llm_tool(name="nexus_prepare_moderation")
     async def nexus_prepare_moderation(

@@ -80,6 +80,41 @@ class Storage:
                     FOREIGN KEY (task_id) REFERENCES tasks(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS workflow_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    source_message_id TEXT,
+                    sender_id TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    message_text TEXT NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    deterministic_handled INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_workflow_messages_task
+                    ON workflow_messages(task_id, id);
+                CREATE INDEX IF NOT EXISTS idx_workflow_messages_sender
+                    ON workflow_messages(task_id, sender_id, id);
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_workflow_messages_source
+                    ON workflow_messages(task_id, source_message_id)
+                    WHERE source_message_id IS NOT NULL;
+
+                CREATE TABLE IF NOT EXISTS member_identity_fields (
+                    platform_id TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    verified INTEGER NOT NULL DEFAULT 0,
+                    updated_by TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (platform_id, group_id, user_id, field_name)
+                );
+                CREATE INDEX IF NOT EXISTS idx_member_identity_scope
+                    ON member_identity_fields(platform_id, group_id, field_name);
+
                 CREATE TABLE IF NOT EXISTS group_archive_settings (
                     platform_id TEXT NOT NULL,
                     group_id TEXT NOT NULL,
@@ -931,6 +966,135 @@ class Storage:
             rows = self._conn.execute(
                 "SELECT * FROM collection_entries WHERE task_id = ? ORDER BY sender_id",
                 (task_id,),
+            ).fetchall()
+        return self._rows(rows)
+
+    def insert_workflow_message(
+        self,
+        task_id: str,
+        source_message_id: str | None,
+        sender_id: str,
+        sender_name: str,
+        message_text: str,
+        sent_at: str,
+        captured_at: str,
+        deterministic_handled: bool = False,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                INSERT OR IGNORE INTO workflow_messages
+                    (task_id, source_message_id, sender_id, sender_name,
+                     message_text, sent_at, captured_at, deterministic_handled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(task_id), source_message_id, str(sender_id),
+                    str(sender_name), str(message_text), str(sent_at),
+                    str(captured_at), int(bool(deterministic_handled)),
+                ),
+            )
+            self._conn.commit()
+            if cursor.rowcount == 0:
+                return None
+            row = self._conn.execute(
+                "SELECT * FROM workflow_messages WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+        return self._row(row)
+
+    def list_workflow_messages(
+        self,
+        task_id: str,
+        after_id: int = 0,
+        cutoff: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["task_id = ?", "id > ?"]
+        params: list[Any] = [str(task_id), int(after_id)]
+        if cutoff:
+            clauses.append("sent_at <= ?")
+            params.append(str(cutoff))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM workflow_messages WHERE {' AND '.join(clauses)} ORDER BY id",
+                params,
+            ).fetchall()
+        return self._rows(rows)
+
+    def mark_workflow_message_handled(self, message_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE workflow_messages SET deterministic_handled = 1 WHERE id = ?",
+                (int(message_id),),
+            )
+            self._conn.commit()
+
+    def upsert_identity_field(
+        self,
+        platform_id: str,
+        group_id: str,
+        user_id: str,
+        field_name: str,
+        value: str,
+        source: str,
+        verified: bool,
+        updated_by: str,
+        updated_at: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            existing = self._conn.execute(
+                """
+                SELECT * FROM member_identity_fields
+                WHERE platform_id = ? AND group_id = ? AND user_id = ? AND field_name = ?
+                """,
+                (str(platform_id), str(group_id), str(user_id), str(field_name)),
+            ).fetchone()
+            if existing is not None and existing["verified"] and not verified:
+                return self._row(existing)
+            self._conn.execute(
+                """
+                INSERT INTO member_identity_fields
+                    (platform_id, group_id, user_id, field_name, value, source,
+                     verified, updated_by, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform_id, group_id, user_id, field_name) DO UPDATE SET
+                    value = excluded.value,
+                    source = excluded.source,
+                    verified = excluded.verified,
+                    updated_by = excluded.updated_by,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(platform_id), str(group_id), str(user_id), str(field_name),
+                    str(value), str(source), int(bool(verified)), str(updated_by),
+                    str(updated_at),
+                ),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                """
+                SELECT * FROM member_identity_fields
+                WHERE platform_id = ? AND group_id = ? AND user_id = ? AND field_name = ?
+                """,
+                (str(platform_id), str(group_id), str(user_id), str(field_name)),
+            ).fetchone()
+        return self._row(row)
+
+    def list_identity_fields(
+        self,
+        platform_id: str,
+        group_id: str,
+        user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["platform_id = ?", "group_id = ?"]
+        params: list[Any] = [str(platform_id), str(group_id)]
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(str(user_id))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM member_identity_fields WHERE {' AND '.join(clauses)} ORDER BY user_id, field_name",
+                params,
             ).fetchall()
         return self._rows(rows)
 
