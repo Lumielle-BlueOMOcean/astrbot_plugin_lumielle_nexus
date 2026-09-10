@@ -1,5 +1,10 @@
 __pycache__/
 *.py[cod]
+.DS_Store
+*.log
+*.tmp
+*.bak
+*.bak_*
 .pytest_cache/
 .ruff_cache/
 *.db
