@@ -2,7 +2,7 @@
 
 > 一个面向 AstrBot + QQ 的跨会话群事务编排插件。
 
-[![Version](https://img.shields.io/badge/version-0.6.0-7c5cff.svg)](metadata.yaml)
+[![Version](https://img.shields.io/badge/version-0.8.0-7c5cff.svg)](metadata.yaml)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.25.5%2C%3C5-4b8bbe.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![Platform](https://img.shields.io/badge/platform-aiocqhttp%20%2F%20OneBot%20v11-12a594.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
@@ -11,7 +11,7 @@
 
 | 项目 | 当前版本 |
 | --- | --- |
-| Version | `0.6.0` |
+| Version | `0.8.0` |
 | AstrBot | `>=4.25.5,<5` |
 | Platform | `aiocqhttp` / OneBot v11（QQ，主要面向 NapCat） |
 | License | MIT |
