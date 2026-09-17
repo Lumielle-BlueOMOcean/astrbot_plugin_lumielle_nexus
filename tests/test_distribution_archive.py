@@ -13,7 +13,6 @@ REQUIRED_RUNTIME_FILES = {
     "qq_adapter.py",
     "exporter.py",
     "poll_service.py",
-    "poll_web.py",
     "metadata.yaml",
     "_conf_schema.json",
     "requirements.txt",
@@ -50,6 +49,7 @@ class DistributionArchiveTests(unittest.TestCase):
         files = set(archive_files())
 
         self.assertTrue(REQUIRED_RUNTIME_FILES <= files)
+        self.assertNotIn("poll_web.py", files)
         self.assertNotIn("AGENTS.md", files)
         self.assertFalse(any(path.startswith("docs/") for path in files))
         self.assertFalse(any(path.startswith("tests/") for path in files))

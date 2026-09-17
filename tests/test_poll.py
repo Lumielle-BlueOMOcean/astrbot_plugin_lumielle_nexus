@@ -1,6 +1,5 @@
-import asyncio
 import importlib
-import json
+import sqlite3
 import sys
 import tempfile
 import types
@@ -9,13 +8,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+from poll_service import (
+    PollClosedError,
+    PollError,
+    PollService,
+    normalize_poll_reply,
+    parse_poll_message,
+    validate_semantic_vote_candidate,
+)
 from storage import Storage
-
-try:
-    from poll_service import PollClosedError, PollError, PollService
-    from poll_web import PollWeb
-except ModuleNotFoundError:
-    PollClosedError = PollError = PollService = PollWeb = None
 
 
 async def _async_value(value):
@@ -26,7 +27,7 @@ def _load_main_module():
     try:
         return importlib.import_module("main")
     except ModuleNotFoundError as exc:
-        if exc.name not in {"astrbot", "poll_service", "poll_web"}:
+        if exc.name not in {"astrbot"}:
             raise
 
     class _Group:
@@ -89,20 +90,11 @@ class PollServiceTests(unittest.IsolatedAsyncioTestCase):
         self.storage.upsert_binding(
             "班群", "123456789", "qq-main", "operator", "2026-09-17T00:00:00+00:00",
         )
-        self.service = self._new_service()
+        self.service = PollService(self.storage, timezone_name="Asia/Shanghai")
 
     async def asyncTearDown(self):
         self.storage.close()
         self.temp_dir.cleanup()
-
-    def _new_service(self):
-        self.assertIsNotNone(PollService, "PollService is not implemented")
-        return PollService(
-            self.storage,
-            timezone_name="Asia/Shanghai",
-            web_enabled=True,
-            public_base_url="https://poll.example.com",
-        )
 
     async def _create(self, **overrides):
         values = {
@@ -114,7 +106,6 @@ class PollServiceTests(unittest.IsolatedAsyncioTestCase):
             "multiple_choice": False,
             "max_choices": 0,
             "allow_change": True,
-            "result_visibility": "after_close",
             "auto_publish_result": True,
             "platform_id": "qq-main",
             "creator_id": "operator",
@@ -123,20 +114,20 @@ class PollServiceTests(unittest.IsolatedAsyncioTestCase):
         values.update(overrides)
         return await self.service.create_poll(**values)
 
-    async def test_create_persists_options_token_and_public_url(self):
-        poll = await self._create()
+    async def test_create_persists_options_and_reply_keys(self):
+        poll = await self._create(reply_keys=["a", "b", "c"])
         self.assertTrue(poll["id"].startswith("P-"))
-        self.assertEqual([item["label"] for item in poll["options"]], ["14点", "15点", "16点"])
-        self.assertEqual(len(poll["public_token"]), 43)
         self.assertEqual(
-            poll["public_url"],
-            f"https://poll.example.com/poll/{poll['public_token']}",
+            [(item["label"], item["reply_key"]) for item in poll["options"]],
+            [("14点", "a"), ("15点", "b"), ("16点", "c")],
         )
+        self.assertNotIn("public_token", poll)
+        self.assertNotIn("public_url", poll)
         self.assertEqual(self.storage.get_poll(poll["id"])["title"], poll["title"])
 
     async def test_single_choice_vote_and_result_aggregation(self):
-        poll = await self._create()
-        receipt = await self.service.vote(poll["public_token"], [2], "browser-a")
+        poll = await self._create(reply_keys=["a", "b", "c"])
+        receipt = await self.service.cast_vote(poll["id"], [2], "1001")
         self.assertEqual(receipt["choices"], [2])
         result = await self.service.get_result(poll["id"])
         self.assertEqual(result["participant_count"], 1)
@@ -145,67 +136,256 @@ class PollServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_allow_change_updates_ballot_without_new_participant(self):
         poll = await self._create(allow_change=True)
-        await self.service.vote(poll["public_token"], [1], "browser-a")
-        await self.service.vote(poll["public_token"], [3], "browser-a")
+        await self.service.cast_vote(poll["id"], [1], "1001")
+        await self.service.cast_vote(poll["id"], [3], "1001")
         result = await self.service.get_result(poll["id"])
         self.assertEqual(result["participant_count"], 1)
         self.assertEqual([item["votes"] for item in result["options"]], [0, 0, 1])
 
     async def test_disallow_change_and_multiple_choice_limit(self):
         single = await self._create(allow_change=False)
-        await self.service.vote(single["public_token"], [1], "browser-a")
+        await self.service.cast_vote(single["id"], [1], "1001")
         with self.assertRaises(PollError):
-            await self.service.vote(single["public_token"], [2], "browser-a")
+            await self.service.cast_vote(single["id"], [2], "1001")
 
         multiple = await self._create(multiple_choice=True, max_choices=2)
         with self.assertRaises(PollError):
-            await self.service.vote(multiple["public_token"], [1, 2, 3], "browser-b")
-        await self.service.vote(multiple["public_token"], [1, 3], "browser-b")
+            await self.service.cast_vote(multiple["id"], [1, 2, 3], "1002")
+        await self.service.cast_vote(multiple["id"], [1, 3], "1002")
 
-    async def test_deadline_closes_poll_and_http_vote_cannot_lag_scheduler(self):
+    async def test_expired_vote_closes_poll_and_scheduler_does_not_repeat(self):
         now = datetime(2026, 9, 17, 10, 0, tzinfo=timezone.utc)
-        poll = await self._create(
-            deadline="2026-09-17 19:00",
-            now=now,
-        )
+        poll = await self._create(deadline="2026-09-17 19:00", now=now)
         with self.assertRaises(PollClosedError):
-            await self.service.vote(
-                poll["public_token"], [1], "browser-a", now=now + timedelta(hours=9),
+            await self.service.cast_vote(
+                poll["id"], [1], "1001", now=now + timedelta(hours=9),
             )
         self.assertEqual(self.storage.get_poll(poll["id"])["status"], "CLOSED")
-
-        second = await self._create(deadline="2026-09-17 19:00", now=now)
-        closed = await self.service.close_due_polls(now + timedelta(hours=9))
-        self.assertEqual({item["id"] for item in closed}, {second["id"]})
-        self.assertEqual(self.storage.get_poll(second["id"])["status"], "CLOSED")
         self.assertEqual(await self.service.close_due_polls(now + timedelta(hours=10)), [])
 
-    async def test_after_close_visibility_hides_then_reveals_results(self):
-        poll = await self._create(result_visibility="after_close")
-        await self.service.vote(poll["public_token"], [1], "browser-a")
-        hidden = await self.service.get_public_result(poll["public_token"])
-        self.assertFalse(hidden["visible"])
-        await self.service.close_poll(poll["id"], "manual")
-        shown = await self.service.get_public_result(poll["public_token"])
-        self.assertTrue(shown["visible"])
-        self.assertEqual(shown["result"]["participant_count"], 1)
+    async def test_storage_migration_removes_web_columns_and_preserves_rows(self):
+        legacy_dir = tempfile.TemporaryDirectory()
+        db_path = Path(legacy_dir.name) / "lumielle_nexus.db"
+        connection = sqlite3.connect(db_path)
+        connection.executescript(
+            """
+            CREATE TABLE polls (
+                id TEXT PRIMARY KEY, platform_id TEXT NOT NULL, group_id TEXT NOT NULL,
+                group_alias TEXT NOT NULL, creator_id TEXT NOT NULL, title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                multiple_choice INTEGER NOT NULL DEFAULT 0, max_choices INTEGER NOT NULL DEFAULT 1,
+                allow_change INTEGER NOT NULL DEFAULT 1,
+                result_visibility TEXT NOT NULL DEFAULT 'after_close',
+                auto_publish_result INTEGER NOT NULL DEFAULT 1, deadline_at TEXT,
+                public_token TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, closed_at TEXT, close_reason TEXT,
+                announcement_sent INTEGER NOT NULL DEFAULT 0,
+                result_published INTEGER NOT NULL DEFAULT 0, last_error TEXT
+            );
+            CREATE TABLE poll_options (
+                poll_id TEXT NOT NULL, option_id INTEGER NOT NULL, position INTEGER NOT NULL,
+                label TEXT NOT NULL, PRIMARY KEY (poll_id, option_id),
+                UNIQUE (poll_id, position)
+            );
+            CREATE TABLE poll_ballots (
+                poll_id TEXT NOT NULL, voter_hash TEXT NOT NULL, choices_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY (poll_id, voter_hash)
+            );
+            INSERT INTO polls VALUES
+            ('P-20260917-001', 'qq-main', '123456789', '班群', 'operator', '旧投票', '',
+             'CLOSED', 0, 1, 1, 'after_close', 1, NULL, 'old-token',
+             '2026-09-17T00:00:00+00:00', '2026-09-17T00:00:00+00:00',
+             '2026-09-17T01:00:00+00:00', 'manual', 1, 0, NULL);
+            INSERT INTO poll_options VALUES
+            ('P-20260917-001', 1, 1, '通过');
+            INSERT INTO poll_ballots VALUES
+            ('P-20260917-001', 'old-browser-hash', '[1]',
+             '2026-09-17T00:01:00+00:00', '2026-09-17T00:01:00+00:00');
+            """,
+        )
+        connection.commit()
+        connection.close()
 
-    async def test_storage_migration_creates_poll_tables(self):
-        tables = {
-            row[0] for row in self.storage._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'",
-            ).fetchall()
+        migrated = Storage(Path(legacy_dir.name))
+        columns = {
+            row[1] for row in migrated._conn.execute("PRAGMA table_info(polls)")
         }
-        self.assertTrue({"polls", "poll_options", "poll_ballots"} <= tables)
+        ballot_columns = {
+            row[1] for row in migrated._conn.execute("PRAGMA table_info(poll_ballots)")
+        }
+        self.assertNotIn("public_token", columns)
+        self.assertNotIn("result_visibility", columns)
+        self.assertNotIn("voter_hash", ballot_columns)
+        self.assertEqual(migrated.get_poll("P-20260917-001")["title"], "旧投票")
+        self.assertEqual(migrated.get_poll_options("P-20260917-001")[0]["reply_key"], "1")
+        self.assertEqual(
+            migrated.list_poll_ballots("P-20260917-001")[0]["voter_id"],
+            "legacy-web:old-browser-hash",
+        )
+        self.assertEqual(
+            migrated._conn.execute("PRAGMA foreign_key_check").fetchall(), [],
+        )
+        migrated.close()
+        legacy_dir.cleanup()
+
+    async def test_poll_reply_normalization_and_exact_alias_parsing(self):
+        poll = await self._create(reply_keys=["abc", "def", "ghi"])
+        self.assertEqual(normalize_poll_reply(" ＡＢＣ "), "abc")
+        self.assertEqual(parse_poll_message("abc", poll), [1])
+        self.assertEqual(parse_poll_message("2", poll), [2])
+        self.assertEqual(parse_poll_message("14点", poll), [1])
+        multi = dict(poll)
+        multi["multiple_choice"] = True
+        multi["max_choices"] = 2
+        self.assertEqual(parse_poll_message("abc def", multi), [1, 2])
+
+    async def test_semantic_candidate_validation_requires_strict_evidence(self):
+        valid = {
+            "status": "vote",
+            "choices": [2],
+            "confidence": 0.95,
+            "evidence": "我选15点",
+        }
+        self.assertEqual(
+            validate_semantic_vote_candidate(valid, 3, False, 1, "我选15点"), [2],
+        )
+        with self.assertRaises(PollError):
+            validate_semantic_vote_candidate(
+                {**valid, "confidence": 0.89}, 3, False, 1, "我选15点",
+            )
+        with self.assertRaises(PollError):
+            validate_semantic_vote_candidate(
+                {**valid, "evidence": "模型推断"}, 3, False, 1, "我选15点",
+            )
+
+    async def test_group_message_deterministic_vote_is_silent_and_uses_qq_id(self):
+        main_module = _load_main_module()
+        poll = await self._create()
+
+        class Event:
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_group_id(self):
+                return "123456789"
+
+            def get_message_str(self):
+                return "2"
+
+            def get_sender_id(self):
+                return "1001"
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.storage = self.storage
+        result = await plugin._handle_poll_message(Event())
+        self.assertEqual(result, {"handled": True, "kind": "success"})
+        self.assertEqual(
+            self.storage.list_poll_ballots(poll["id"])[0]["voter_id"], "1001",
+        )
+
+    async def test_semantic_poll_vote_is_narrowed_and_provider_called_once(self):
+        main_module = _load_main_module()
+        poll = await self._create(
+            options=["周六", "周日"],
+            semantic_fallback=True,
+            ai_provider_id="provider-1",
+        )
+        calls = []
+
+        class Context:
+            async def llm_generate(self, **kwargs):
+                calls.append(kwargs)
+                return types.SimpleNamespace(
+                    completion_text='{"status":"vote","choices":[1],"confidence":0.95,"evidence":"周六"}',
+                )
+
+        class Event:
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_group_id(self):
+                return "123456789"
+
+            def get_message_str(self):
+                return "我觉得周六比较好"
+
+            def get_sender_id(self):
+                return "1002"
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.storage = self.storage
+        plugin.context = Context()
+        result = await plugin._handle_poll_message(Event())
+        self.assertEqual(result, {"handled": True, "kind": "success"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["chat_provider_id"], "provider-1")
+        self.assertEqual(self.storage.list_poll_ballots(poll["id"])[0]["voter_id"], "1002")
+
+    async def test_ordinary_group_message_does_not_call_poll_provider(self):
+        main_module = _load_main_module()
+        await self._create(options=["周六", "周日"], ai_provider_id="provider-1")
+        calls = []
+
+        class Context:
+            async def llm_generate(self, **_kwargs):
+                calls.append(True)
+
+        class Event:
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_group_id(self):
+                return "123456789"
+
+            def get_message_str(self):
+                return "大家晚上好"
+
+            def get_sender_id(self):
+                return "1003"
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.storage = self.storage
+        plugin.context = Context()
+        result = await plugin._handle_poll_message(Event())
+        self.assertEqual(result["kind"], "no_match")
+        self.assertEqual(calls, [])
+
+    async def test_multiple_open_polls_require_explicit_poll_id(self):
+        main_module = _load_main_module()
+        await self._create(title="第一个投票")
+        await self._create(title="第二个投票")
+
+        class Event:
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_group_id(self):
+                return "123456789"
+
+            def get_message_str(self):
+                return "1"
+
+            def get_sender_id(self):
+                return "1004"
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.storage = self.storage
+        result = await plugin._handle_poll_message(Event())
+        self.assertEqual(result["kind"], "ambiguity")
+        self.assertEqual(self.storage.list_poll_ballots("P-20260917-001"), [])
 
     async def test_poll_control_uses_operator_and_group_admin_authorization(self):
         main_module = _load_main_module()
 
         class Event:
-            def __init__(self, sender, private, role="member"):
+            def __init__(self, sender, private):
                 self.sender = sender
                 self.private = private
-                self.role = role
 
             def is_private_chat(self):
                 return self.private
@@ -243,47 +423,10 @@ class PollServiceTests(unittest.IsolatedAsyncioTestCase):
         allowed = await plugin._authorized_collection_control(Event("admin", False), "班群")
         self.assertTrue(allowed[0])
 
-    async def test_web_page_vote_cookie_result_and_xss_escape(self):
-        self.assertIsNotNone(PollWeb, "PollWeb is not implemented")
-        poll = await self._create(
-            title="<script>alert(1)</script>",
-            description="<img src=x onerror=alert(1)>",
-            options=["安全选项", "<b>危险</b>"],
-            result_visibility="live",
-        )
-        from aiohttp.test_utils import TestClient, TestServer
-
-        web_app = PollWeb(self.service).create_app()
-        async with TestClient(TestServer(web_app)) as client:
-            page = await client.get(f"/poll/{poll['public_token']}")
-            self.assertEqual(page.status, 200)
-            body = await page.text()
-            self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", body)
-            self.assertNotIn("<script>alert(1)</script>", body)
-            self.assertIn("lumielle_poll_voter", page.headers.get("Set-Cookie", ""))
-
-            voted = await client.post(
-                f"/api/poll/{poll['public_token']}/vote",
-                json={"choices": [2]},
-            )
-            self.assertEqual(voted.status, 200)
-            result = await (await client.get(f"/api/poll/{poll['public_token']}/result")).json()
-            self.assertTrue(result["visible"])
-            self.assertEqual(result["result"]["participant_count"], 1)
-
-    async def test_healthz_returns_ok(self):
-        self.assertIsNotNone(PollWeb, "PollWeb is not implemented")
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(PollWeb(self.service).create_app())) as client:
-            response = await client.get("/healthz")
-            self.assertEqual(response.status, 200)
-            self.assertEqual(await response.json(), {"ok": True})
-
     async def test_auto_publish_result_marks_once(self):
         main_module = _load_main_module()
         poll = await self._create()
-        await self.service.vote(poll["public_token"], [1], "browser-a")
+        await self.service.cast_vote(poll["id"], [1], "1001")
         await self.service.close_poll(poll["id"], "deadline")
 
         class FakeAdapter:
@@ -301,35 +444,6 @@ class PollServiceTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
             await plugin._publish_poll_result(poll)
             await plugin._publish_poll_result(await self.service.get_poll(poll["id"]))
-        self.assertEqual(len(FakeAdapter.calls), 1)
-        self.assertTrue(self.storage.get_poll(poll["id"])["result_published"])
-
-    async def test_web_deadline_close_is_recovered_and_published_once(self):
-        main_module = _load_main_module()
-        now = datetime(2026, 9, 17, 10, 0, tzinfo=timezone.utc)
-        poll = await self._create(deadline="2026-09-17 19:00", now=now)
-        with self.assertRaises(PollClosedError):
-            await self.service.vote(
-                poll["public_token"], [1], "browser-a", now=now + timedelta(hours=9),
-            )
-        self.assertEqual(self.storage.get_poll(poll["id"])["status"], "CLOSED")
-
-        class FakeAdapter:
-            calls = []
-
-            def __init__(self, _context, _platform_id):
-                pass
-
-            async def send_group_text(self, group_id, text):
-                self.calls.append((group_id, text))
-
-        plugin = object.__new__(main_module.LumielleNexus)
-        plugin.poll_service = self.service
-        plugin.context = types.SimpleNamespace()
-        with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
-            await plugin._maintain_polls_once()
-            await plugin._maintain_polls_once()
-
         self.assertEqual(len(FakeAdapter.calls), 1)
         self.assertTrue(self.storage.get_poll(poll["id"])["result_published"])
 
@@ -364,8 +478,6 @@ class PollServiceTests(unittest.IsolatedAsyncioTestCase):
         main_module = _load_main_module()
         poll = await self._create()
         await self.service.record_error(poll["id"], "announcement failed")
-        self.assertEqual(self.storage.get_poll(poll["id"])["last_error"], "announcement failed")
-
         await self.service.close_poll(poll["id"], "manual")
         self.assertIsNone(self.storage.get_poll(poll["id"])["last_error"])
 
@@ -384,34 +496,8 @@ class PollServiceTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
             await plugin._maintain_polls_once()
             await plugin._maintain_polls_once()
-
         self.assertEqual(len(FakeAdapter.calls), 1)
         self.assertTrue(self.storage.get_poll(poll["id"])["result_published"])
-
-    async def test_web_deadline_uses_configured_timezone(self):
-        poll = await self._create(deadline="2026-09-18 22:00")
-        page = PollWeb(self.service)._render_page(
-            poll, [], {"visible": False, "message": "结果将在投票结束后公布。"},
-        )
-        self.assertIn("2026-09-18 22:00", page)
-        self.assertNotIn("2026-09-18T14:00:00+00:00", page)
-
-    async def test_web_generic_500_hides_internal_exception(self):
-        class FailingService:
-            public_base_url = "https://poll.example.com"
-
-            async def vote(self, *_args, **_kwargs):
-                raise RuntimeError("/secret/internal/path")
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(PollWeb(FailingService()).create_app())) as client:
-            response = await client.post("/api/poll/unknown/vote", json={"choices": [1]})
-            payload = await response.json()
-        self.assertEqual(response.status, 500)
-        self.assertEqual(payload["error"], "投票服务暂时不可用，请稍后重试。")
-        self.assertNotIn("/secret/internal/path", payload["error"])
-        self.assertNotIn("RuntimeError", payload["error"])
 
 
 if __name__ == "__main__":

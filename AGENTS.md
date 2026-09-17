@@ -15,3 +15,4 @@
 13. Collection 自然语言使用持久化 workflow capture 和增量 checkpoint；`GROUP_MESSAGE` 不得逐消息调用 LLM，deterministic parser 永远优先。
 14. checkpoint LLM 输出必须绑定自身 sender evidence 并经过 deterministic validation；不得创建任务、发消息或触发外部操作。
 15. 普通群枢控制可由当前绑定群的 QQ 群主/管理员执行，但不得跨群；私聊和跨群控制仍需 operator 权限。
+16. Poll 群消息必须先做确定性解析；只有明确候选时才允许最多一次受限语义判断，不得让普通聊天触发 Poll LLM。

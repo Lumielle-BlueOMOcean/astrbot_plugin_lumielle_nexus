@@ -167,56 +167,6 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS idx_member_set_members_set
                     ON member_set_members(set_id, user_id);
 
-                CREATE TABLE IF NOT EXISTS polls (
-                    id TEXT PRIMARY KEY,
-                    platform_id TEXT NOT NULL,
-                    group_id TEXT NOT NULL,
-                    group_alias TEXT NOT NULL,
-                    creator_id TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    description TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL,
-                    multiple_choice INTEGER NOT NULL DEFAULT 0,
-                    max_choices INTEGER NOT NULL DEFAULT 1,
-                    allow_change INTEGER NOT NULL DEFAULT 1,
-                    result_visibility TEXT NOT NULL DEFAULT 'after_close',
-                    auto_publish_result INTEGER NOT NULL DEFAULT 1,
-                    deadline_at TEXT,
-                    public_token TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    closed_at TEXT,
-                    close_reason TEXT,
-                    announcement_sent INTEGER NOT NULL DEFAULT 0,
-                    result_published INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_polls_scope_status
-                    ON polls(platform_id, group_id, status, created_at);
-                CREATE INDEX IF NOT EXISTS idx_polls_due
-                    ON polls(status, deadline_at);
-
-                CREATE TABLE IF NOT EXISTS poll_options (
-                    poll_id TEXT NOT NULL,
-                    option_id INTEGER NOT NULL,
-                    position INTEGER NOT NULL,
-                    label TEXT NOT NULL,
-                    PRIMARY KEY (poll_id, option_id),
-                    UNIQUE (poll_id, position),
-                    FOREIGN KEY (poll_id) REFERENCES polls(id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS poll_ballots (
-                    poll_id TEXT NOT NULL,
-                    voter_hash TEXT NOT NULL,
-                    choices_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (poll_id, voter_hash),
-                    FOREIGN KEY (poll_id) REFERENCES polls(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_poll_ballots_poll
-                    ON poll_ballots(poll_id);
                 """,
             )
             columns = {
@@ -235,6 +185,195 @@ class Storage:
                 """,
             )
             self._conn.commit()
+            self._ensure_poll_schema()
+            self._conn.commit()
+
+    def _ensure_poll_schema(self) -> None:
+        """Create the native-message poll schema or migrate the 0.9 Web Poll schema."""
+        poll_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(polls)").fetchall()
+        }
+        if not poll_columns:
+            self._create_native_poll_tables()
+            return
+
+        option_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(poll_options)").fetchall()
+        }
+        ballot_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(poll_ballots)").fetchall()
+        }
+        legacy = bool(
+            {"public_token", "result_visibility"} & poll_columns
+            or "voter_hash" in ballot_columns
+            or "reply_key" not in option_columns
+            or "voter_id" not in ballot_columns
+        )
+        if legacy:
+            self._migrate_legacy_poll_tables()
+            return
+
+        self._create_native_poll_indexes()
+
+    def _create_native_poll_tables(self) -> None:
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS polls (
+                id TEXT PRIMARY KEY,
+                platform_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                group_alias TEXT NOT NULL,
+                creator_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                multiple_choice INTEGER NOT NULL DEFAULT 0,
+                max_choices INTEGER NOT NULL DEFAULT 1,
+                allow_change INTEGER NOT NULL DEFAULT 1,
+                semantic_fallback INTEGER NOT NULL DEFAULT 1,
+                ai_provider_id TEXT NOT NULL DEFAULT '',
+                auto_publish_result INTEGER NOT NULL DEFAULT 1,
+                deadline_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                closed_at TEXT,
+                close_reason TEXT,
+                announcement_sent INTEGER NOT NULL DEFAULT 0,
+                result_published INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            );
+            CREATE TABLE IF NOT EXISTS poll_options (
+                poll_id TEXT NOT NULL,
+                option_id INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                reply_key TEXT NOT NULL,
+                label TEXT NOT NULL,
+                PRIMARY KEY (poll_id, option_id),
+                UNIQUE (poll_id, position),
+                UNIQUE (poll_id, reply_key),
+                FOREIGN KEY (poll_id) REFERENCES polls(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS poll_ballots (
+                poll_id TEXT NOT NULL,
+                voter_id TEXT NOT NULL,
+                choices_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (poll_id, voter_id),
+                FOREIGN KEY (poll_id) REFERENCES polls(id) ON DELETE CASCADE
+            );
+            """,
+        )
+        self._create_native_poll_indexes()
+
+    def _create_native_poll_indexes(self) -> None:
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_polls_scope_status "
+            "ON polls(platform_id, group_id, status, created_at)",
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_polls_due ON polls(status, deadline_at)",
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_poll_ballots_poll ON poll_ballots(poll_id)",
+        )
+
+    def _migrate_legacy_poll_tables(self) -> None:
+        """Migrate 0.9 browser ballots to native voter IDs without losing counts."""
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                """CREATE TABLE polls_v2 (
+                    id TEXT PRIMARY KEY,
+                    platform_id TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    group_alias TEXT NOT NULL,
+                    creator_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    multiple_choice INTEGER NOT NULL DEFAULT 0,
+                    max_choices INTEGER NOT NULL DEFAULT 1,
+                    allow_change INTEGER NOT NULL DEFAULT 1,
+                    semantic_fallback INTEGER NOT NULL DEFAULT 0,
+                    ai_provider_id TEXT NOT NULL DEFAULT '',
+                    auto_publish_result INTEGER NOT NULL DEFAULT 1,
+                    deadline_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    close_reason TEXT,
+                    announcement_sent INTEGER NOT NULL DEFAULT 0,
+                    result_published INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT
+                );""",
+            )
+            self._conn.execute(
+                """CREATE TABLE poll_options_v2 (
+                    poll_id TEXT NOT NULL,
+                    option_id INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    reply_key TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    PRIMARY KEY (poll_id, option_id),
+                    UNIQUE (poll_id, position),
+                    UNIQUE (poll_id, reply_key),
+                    FOREIGN KEY (poll_id) REFERENCES polls_v2(id) ON DELETE CASCADE
+                );""",
+            )
+            self._conn.execute(
+                """CREATE TABLE poll_ballots_v2 (
+                    poll_id TEXT NOT NULL,
+                    voter_id TEXT NOT NULL,
+                    choices_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (poll_id, voter_id),
+                    FOREIGN KEY (poll_id) REFERENCES polls_v2(id) ON DELETE CASCADE
+                );""",
+            )
+            self._conn.execute(
+                """
+                INSERT INTO polls_v2
+                    (id, platform_id, group_id, group_alias, creator_id, title,
+                     description, status, multiple_choice, max_choices, allow_change,
+                     semantic_fallback, ai_provider_id, auto_publish_result, deadline_at,
+                     created_at, updated_at, closed_at, close_reason, announcement_sent,
+                     result_published, last_error)
+                SELECT id, platform_id, group_id, group_alias, creator_id, title,
+                       description, status, multiple_choice, max_choices, allow_change,
+                       0, '', auto_publish_result, deadline_at, created_at, updated_at,
+                       closed_at, close_reason, announcement_sent, result_published, last_error
+                FROM polls
+                """,
+            )
+            self._conn.execute(
+                """
+                INSERT INTO poll_options_v2(poll_id, option_id, position, reply_key, label)
+                SELECT poll_id, option_id, position, CAST(position AS TEXT), label
+                FROM poll_options
+                """,
+            )
+            self._conn.execute(
+                """
+                INSERT INTO poll_ballots_v2(poll_id, voter_id, choices_json, created_at, updated_at)
+                SELECT poll_id, 'legacy-web:' || voter_hash, choices_json, created_at, updated_at
+                FROM poll_ballots
+                """,
+            )
+            self._conn.execute("DROP TABLE poll_ballots")
+            self._conn.execute("DROP TABLE poll_options")
+            self._conn.execute("DROP TABLE polls")
+            self._conn.execute("ALTER TABLE polls_v2 RENAME TO polls")
+            self._conn.execute("ALTER TABLE poll_options_v2 RENAME TO poll_options")
+            self._conn.execute("ALTER TABLE poll_ballots_v2 RENAME TO poll_ballots")
+            self._create_native_poll_indexes()
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            for table in ("poll_ballots_v2", "poll_options_v2", "polls_v2"):
+                self._conn.execute(f"DROP TABLE IF EXISTS {table}")
+            raise
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -345,8 +484,8 @@ class Storage:
                     INSERT INTO polls
                         (id, platform_id, group_id, group_alias, creator_id,
                          title, description, status, multiple_choice, max_choices,
-                         allow_change, result_visibility, auto_publish_result,
-                         deadline_at, public_token, created_at, updated_at)
+                         allow_change, semantic_fallback, ai_provider_id,
+                         auto_publish_result, deadline_at, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
@@ -354,20 +493,22 @@ class Storage:
                         poll["group_alias"], poll["creator_id"], poll["title"],
                         poll["description"], poll["status"], int(poll["multiple_choice"]),
                         int(poll["max_choices"]), int(poll["allow_change"]),
-                        poll["result_visibility"], int(poll["auto_publish_result"]),
-                        poll["deadline_at"], poll["public_token"],
+                        int(poll.get("semantic_fallback", True)),
+                        str(poll.get("ai_provider_id", "")),
+                        int(poll["auto_publish_result"]), poll["deadline_at"],
                         poll["created_at"], poll["updated_at"],
                     ),
                 )
                 self._conn.executemany(
                     """
-                    INSERT INTO poll_options(poll_id, option_id, position, label)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO poll_options(poll_id, option_id, position, reply_key, label)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
                     [
                         (
                             poll["id"], int(option["option_id"]),
-                            int(option["position"]), str(option["label"]),
+                            int(option["position"]), str(option["reply_key"]),
+                            str(option["label"]),
                         )
                         for option in options
                     ],
@@ -382,14 +523,6 @@ class Storage:
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM polls WHERE id = ?", (str(poll_id),),
-            ).fetchone()
-        return self._row(row)
-
-    def get_poll_by_token(self, public_token: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM polls WHERE public_token = ?",
-                (str(public_token),),
             ).fetchone()
         return self._row(row)
 
@@ -455,15 +588,15 @@ class Storage:
         return self._rows(rows)
 
     def get_poll_ballot(
-        self, poll_id: str, voter_hash: str,
+        self, poll_id: str, voter_id: str,
     ) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
                 """
                 SELECT * FROM poll_ballots
-                WHERE poll_id = ? AND voter_hash = ?
+                WHERE poll_id = ? AND voter_id = ?
                 """,
-                (str(poll_id), str(voter_hash)),
+                (str(poll_id), str(voter_id)),
             ).fetchone()
         return self._row(row)
 
@@ -478,7 +611,7 @@ class Storage:
     def upsert_poll_ballot(
         self,
         poll_id: str,
-        voter_hash: str,
+        voter_id: str,
         choices: list[int],
         created_at: str,
         updated_at: str,
@@ -489,27 +622,27 @@ class Storage:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 existing = self._conn.execute(
-                    "SELECT * FROM poll_ballots WHERE poll_id = ? AND voter_hash = ?",
-                    (str(poll_id), str(voter_hash)),
+                    "SELECT * FROM poll_ballots WHERE poll_id = ? AND voter_id = ?",
+                    (str(poll_id), str(voter_id)),
                 ).fetchone()
                 if existing and not allow_change:
                     raise ValueError("该投票已提交，当前投票不可修改")
                 self._conn.execute(
                     """
                     INSERT INTO poll_ballots
-                        (poll_id, voter_hash, choices_json, created_at, updated_at)
+                        (poll_id, voter_id, choices_json, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(poll_id, voter_hash) DO UPDATE SET
+                    ON CONFLICT(poll_id, voter_id) DO UPDATE SET
                         choices_json = excluded.choices_json,
                         updated_at = excluded.updated_at
                     """,
-                    (str(poll_id), str(voter_hash), choices_json, str(created_at), str(updated_at)),
+                    (str(poll_id), str(voter_id), choices_json, str(created_at), str(updated_at)),
                 )
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
-        return self.get_poll_ballot(poll_id, voter_hash)
+        return self.get_poll_ballot(poll_id, voter_id)
 
     def close_poll(
         self, poll_id: str, close_reason: str, closed_at: str,
