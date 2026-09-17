@@ -1,0 +1,8 @@
+# Keep development material in the repository but omit it from
+# distribution archives downloaded by AstrBot/plugin marketplaces.
+
+/docs export-ignore
+/tests export-ignore
+/AGENTS.md export-ignore
+/.gitignore export-ignore
+/.gitattributes export-ignore
