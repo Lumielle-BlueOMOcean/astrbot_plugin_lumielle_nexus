@@ -183,6 +183,13 @@ class PollService:
         poll["result_published"] = bool(poll.get("result_published"))
         poll["options"] = self.storage.get_poll_options(poll["id"])
         poll["public_url"] = f"{(base_url or self.public_base_url).rstrip('/')}/poll/{poll['public_token']}"
+        if poll.get("deadline_at"):
+            deadline = datetime.fromisoformat(str(poll["deadline_at"]))
+            poll["deadline_display"] = deadline.astimezone(self.timezone).strftime(
+                "%Y-%m-%d %H:%M",
+            )
+        else:
+            poll["deadline_display"] = "未设置"
         return poll
 
     async def get_poll(self, poll_id: str) -> dict[str, Any] | None:
@@ -377,6 +384,13 @@ class PollService:
                 if row and row["status"] == "CLOSED":
                     closed.append(self._view(row))
             return closed
+
+    async def pending_result_publications(self) -> list[dict[str, Any]]:
+        async with self.lock:
+            return [
+                self._view(row)
+                for row in self.storage.list_pending_poll_result_publications()
+            ]
 
     async def mark_announcement_sent(self, poll_id: str) -> dict[str, Any]:
         async with self.lock:

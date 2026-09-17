@@ -340,6 +340,16 @@ class LumielleNexus(Star):
             await self.poll_service.record_error(poll_id, str(exc))
             return f"结果公布失败：{exc}。投票结果仍已保留，可稍后手动重试。"
 
+    async def _maintain_polls_once(self) -> None:
+        await self.poll_service.close_due_polls()
+        for poll in await self.poll_service.pending_result_publications():
+            if not poll["auto_publish_result"]:
+                continue
+            try:
+                await self._publish_poll_result(poll)
+            except Exception:
+                logger.exception("群枢 Poll 自动公布结果失败 %s", poll.get("id"))
+
     async def _create_poll(
         self,
         event: AstrMessageEvent,
@@ -1868,12 +1878,7 @@ class LumielleNexus(Star):
         while True:
             try:
                 await self.manager.prune_archive_if_due()
-                for poll in await self.poll_service.close_due_polls():
-                    if poll["auto_publish_result"]:
-                        try:
-                            await self._publish_poll_result(poll)
-                        except Exception:
-                            logger.exception("群枢 Poll 自动公布结果失败 %s", poll.get("id"))
+                await self._maintain_polls_once()
                 await self.manager.materialize_due_schedules()
                 for task in await self.manager.due_tasks():
                     try:

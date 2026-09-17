@@ -72,11 +72,14 @@ class PollWeb:
     def _error_response(exc: Exception) -> web.Response:
         if isinstance(exc, PollClosedError):
             status = 409
+            message = str(exc)
         elif isinstance(exc, PollError):
             status = 400
+            message = str(exc)
         else:
             status = 500
-        return web.json_response({"ok": False, "error": str(exc)}, status=status)
+            message = "投票服务暂时不可用，请稍后重试。"
+        return web.json_response({"ok": False, "error": message}, status=status)
 
     @staticmethod
     def _render_result(result: dict[str, Any]) -> str:
@@ -98,7 +101,7 @@ class PollWeb:
         title = html.escape(str(poll["title"]), quote=True)
         description = html.escape(str(poll.get("description") or ""), quote=True)
         token = html.escape(str(poll["public_token"]), quote=True)
-        deadline = html.escape(str(poll.get("deadline_at") or "未设置"), quote=True)
+        deadline = html.escape(str(poll.get("deadline_display") or "未设置"), quote=True)
         disabled = poll["status"] != "OPEN" or (
             bool(ballot) and not poll["allow_change"]
         )

@@ -429,6 +429,20 @@ class Storage:
             ).fetchall()
         return self._rows(rows)
 
+    def list_pending_poll_result_publications(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM polls
+                WHERE status = 'CLOSED'
+                  AND auto_publish_result = 1
+                  AND result_published = 0
+                  AND (last_error IS NULL OR last_error = '')
+                ORDER BY closed_at, created_at
+                """
+            ).fetchall()
+        return self._rows(rows)
+
     def get_poll_options(self, poll_id: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(

@@ -304,6 +304,87 @@ class PollServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(FakeAdapter.calls), 1)
         self.assertTrue(self.storage.get_poll(poll["id"])["result_published"])
 
+    async def test_web_deadline_close_is_recovered_and_published_once(self):
+        main_module = _load_main_module()
+        now = datetime(2026, 9, 17, 10, 0, tzinfo=timezone.utc)
+        poll = await self._create(deadline="2026-09-17 19:00", now=now)
+        with self.assertRaises(PollClosedError):
+            await self.service.vote(
+                poll["public_token"], [1], "browser-a", now=now + timedelta(hours=9),
+            )
+        self.assertEqual(self.storage.get_poll(poll["id"])["status"], "CLOSED")
+
+        class FakeAdapter:
+            calls = []
+
+            def __init__(self, _context, _platform_id):
+                pass
+
+            async def send_group_text(self, group_id, text):
+                self.calls.append((group_id, text))
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.context = types.SimpleNamespace()
+        with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
+            await plugin._maintain_polls_once()
+            await plugin._maintain_polls_once()
+
+        self.assertEqual(len(FakeAdapter.calls), 1)
+        self.assertTrue(self.storage.get_poll(poll["id"])["result_published"])
+
+    async def test_failed_poll_publication_is_not_retried_by_maintenance(self):
+        main_module = _load_main_module()
+        poll = await self._create()
+        await self.service.close_poll(poll["id"], "manual")
+
+        class FailingAdapter:
+            calls = []
+
+            def __init__(self, _context, _platform_id):
+                pass
+
+            async def send_group_text(self, _group_id, _text):
+                self.calls.append(True)
+                raise RuntimeError("transport failed")
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.context = types.SimpleNamespace()
+        with mock.patch.object(main_module, "QQAdapter", FailingAdapter):
+            await plugin._maintain_polls_once()
+            await plugin._maintain_polls_once()
+
+        stored = self.storage.get_poll(poll["id"])
+        self.assertEqual(len(FailingAdapter.calls), 1)
+        self.assertFalse(stored["result_published"])
+        self.assertEqual(stored["last_error"], "transport failed")
+
+    async def test_web_deadline_uses_configured_timezone(self):
+        poll = await self._create(deadline="2026-09-18 22:00")
+        page = PollWeb(self.service)._render_page(
+            poll, [], {"visible": False, "message": "结果将在投票结束后公布。"},
+        )
+        self.assertIn("2026-09-18 22:00", page)
+        self.assertNotIn("2026-09-18T14:00:00+00:00", page)
+
+    async def test_web_generic_500_hides_internal_exception(self):
+        class FailingService:
+            public_base_url = "https://poll.example.com"
+
+            async def vote(self, *_args, **_kwargs):
+                raise RuntimeError("/secret/internal/path")
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(PollWeb(FailingService()).create_app())) as client:
+            response = await client.post("/api/poll/unknown/vote", json={"choices": [1]})
+            payload = await response.json()
+        self.assertEqual(response.status, 500)
+        self.assertEqual(payload["error"], "投票服务暂时不可用，请稍后重试。")
+        self.assertNotIn("/secret/internal/path", payload["error"])
+        self.assertNotIn("RuntimeError", payload["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
