@@ -1288,7 +1288,7 @@ class PluginContractTests(unittest.TestCase):
         metadata = (self.ROOT / "metadata.yaml").read_text(encoding="utf-8")
         config = json.loads((self.ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         self.assertIn("name: astrbot_plugin_lumielle_nexus", metadata)
-        self.assertIn('version: "0.8.2"', metadata)
+        self.assertIn('version: "0.9.0"', metadata)
         self.assertIn('astrbot_version: ">=4.25.5,<5"', metadata)
         self.assertIn("- aiocqhttp", metadata)
         self.assertEqual(config["operator_ids"]["default"], [])
@@ -1300,6 +1300,10 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(config["archive_retention_days"]["default"], 90)
         self.assertFalse(config["moderation_enabled"]["default"])
         self.assertEqual(config["moderator_ids"]["default"], [])
+        self.assertFalse(config["poll_web_enabled"]["default"])
+        self.assertEqual(config["poll_listen_host"]["default"], "127.0.0.1")
+        self.assertEqual(config["poll_listen_port"]["default"], 8765)
+        self.assertEqual(config["poll_public_base_url"]["default"], "")
 
     def test_main_contract_has_current_registration_points(self):
         main = (self.ROOT / "main.py").read_text(encoding="utf-8")
@@ -1315,6 +1319,12 @@ class PluginContractTests(unittest.TestCase):
             "nexus_collection_status",
             "nexus_stop_collection",
             "nexus_get_task",
+            "nexus_create_poll",
+            "nexus_list_polls",
+            "nexus_get_poll",
+            "nexus_close_poll",
+            "nexus_cancel_poll",
+            "nexus_publish_poll_result",
             "nexus_create_ddl",
             "nexus_create_recurring_reminder",
             "nexus_create_course",
@@ -1346,7 +1356,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("1=Monday", main)
         self.assertIn("/nexus task", main)
         readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("0.8.2", readme)
+        self.assertIn("0.9.0", readme)
         self.assertIn("默认关闭", readme)
         self.assertIn("prepare", readme)
         self.assertIn("confirm", readme)

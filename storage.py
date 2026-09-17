@@ -166,6 +166,57 @@ class Storage:
                     ON member_sets(platform_id, group_id, name);
                 CREATE INDEX IF NOT EXISTS idx_member_set_members_set
                     ON member_set_members(set_id, user_id);
+
+                CREATE TABLE IF NOT EXISTS polls (
+                    id TEXT PRIMARY KEY,
+                    platform_id TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    group_alias TEXT NOT NULL,
+                    creator_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    multiple_choice INTEGER NOT NULL DEFAULT 0,
+                    max_choices INTEGER NOT NULL DEFAULT 1,
+                    allow_change INTEGER NOT NULL DEFAULT 1,
+                    result_visibility TEXT NOT NULL DEFAULT 'after_close',
+                    auto_publish_result INTEGER NOT NULL DEFAULT 1,
+                    deadline_at TEXT,
+                    public_token TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    close_reason TEXT,
+                    announcement_sent INTEGER NOT NULL DEFAULT 0,
+                    result_published INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_polls_scope_status
+                    ON polls(platform_id, group_id, status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_polls_due
+                    ON polls(status, deadline_at);
+
+                CREATE TABLE IF NOT EXISTS poll_options (
+                    poll_id TEXT NOT NULL,
+                    option_id INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    label TEXT NOT NULL,
+                    PRIMARY KEY (poll_id, option_id),
+                    UNIQUE (poll_id, position),
+                    FOREIGN KEY (poll_id) REFERENCES polls(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS poll_ballots (
+                    poll_id TEXT NOT NULL,
+                    voter_hash TEXT NOT NULL,
+                    choices_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (poll_id, voter_hash),
+                    FOREIGN KEY (poll_id) REFERENCES polls(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_poll_ballots_poll
+                    ON poll_ballots(poll_id);
                 """,
             )
             columns = {
@@ -210,6 +261,20 @@ class Storage:
             except (IndexError, ValueError):
                 continue
         return f"{prefix}-{date_token}-{highest + 1:03d}"
+
+    def next_poll_id(self, date_token: str) -> str:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM polls WHERE id LIKE ?",
+                (f"P-{date_token}-%",),
+            ).fetchall()
+        highest = 0
+        for row in rows:
+            try:
+                highest = max(highest, int(str(row["id"]).rsplit("-", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+        return f"P-{date_token}-{highest + 1:03d}"
 
     def upsert_binding(
         self,
@@ -268,6 +333,230 @@ class Storage:
                 (platform_id, alias_or_group, alias_or_group, alias_or_group),
             ).fetchone()
         return self._row(row)
+
+    def create_poll(
+        self, poll: dict[str, Any], options: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.execute(
+                    """
+                    INSERT INTO polls
+                        (id, platform_id, group_id, group_alias, creator_id,
+                         title, description, status, multiple_choice, max_choices,
+                         allow_change, result_visibility, auto_publish_result,
+                         deadline_at, public_token, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        poll["id"], poll["platform_id"], poll["group_id"],
+                        poll["group_alias"], poll["creator_id"], poll["title"],
+                        poll["description"], poll["status"], int(poll["multiple_choice"]),
+                        int(poll["max_choices"]), int(poll["allow_change"]),
+                        poll["result_visibility"], int(poll["auto_publish_result"]),
+                        poll["deadline_at"], poll["public_token"],
+                        poll["created_at"], poll["updated_at"],
+                    ),
+                )
+                self._conn.executemany(
+                    """
+                    INSERT INTO poll_options(poll_id, option_id, position, label)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            poll["id"], int(option["option_id"]),
+                            int(option["position"]), str(option["label"]),
+                        )
+                        for option in options
+                    ],
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return self.get_poll(poll["id"])
+
+    def get_poll(self, poll_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM polls WHERE id = ?", (str(poll_id),),
+            ).fetchone()
+        return self._row(row)
+
+    def get_poll_by_token(self, public_token: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM polls WHERE public_token = ?",
+                (str(public_token),),
+            ).fetchone()
+        return self._row(row)
+
+    def list_polls(
+        self,
+        platform_id: str,
+        group_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        clauses = ["platform_id = ?"]
+        params: list[Any] = [str(platform_id)]
+        if group_id:
+            clauses.append("group_id = ?")
+            params.append(str(group_id))
+        if status:
+            clauses.append("status = ?")
+            params.append(str(status))
+        params.append(int(limit))
+        query = (
+            "SELECT * FROM polls WHERE " + " AND ".join(clauses)
+            + " ORDER BY created_at DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return self._rows(rows)
+
+    def list_due_polls(self, now_iso: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM polls
+                WHERE status = 'OPEN' AND deadline_at IS NOT NULL AND deadline_at <= ?
+                ORDER BY deadline_at, created_at
+                """,
+                (str(now_iso),),
+            ).fetchall()
+        return self._rows(rows)
+
+    def get_poll_options(self, poll_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM poll_options
+                WHERE poll_id = ? ORDER BY position
+                """,
+                (str(poll_id),),
+            ).fetchall()
+        return self._rows(rows)
+
+    def get_poll_ballot(
+        self, poll_id: str, voter_hash: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM poll_ballots
+                WHERE poll_id = ? AND voter_hash = ?
+                """,
+                (str(poll_id), str(voter_hash)),
+            ).fetchone()
+        return self._row(row)
+
+    def list_poll_ballots(self, poll_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM poll_ballots WHERE poll_id = ?",
+                (str(poll_id),),
+            ).fetchall()
+        return self._rows(rows)
+
+    def upsert_poll_ballot(
+        self,
+        poll_id: str,
+        voter_hash: str,
+        choices: list[int],
+        created_at: str,
+        updated_at: str,
+        allow_change: bool,
+    ) -> dict[str, Any]:
+        choices_json = json.dumps(choices, ensure_ascii=False)
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                existing = self._conn.execute(
+                    "SELECT * FROM poll_ballots WHERE poll_id = ? AND voter_hash = ?",
+                    (str(poll_id), str(voter_hash)),
+                ).fetchone()
+                if existing and not allow_change:
+                    raise ValueError("该投票已提交，当前投票不可修改")
+                self._conn.execute(
+                    """
+                    INSERT INTO poll_ballots
+                        (poll_id, voter_hash, choices_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(poll_id, voter_hash) DO UPDATE SET
+                        choices_json = excluded.choices_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (str(poll_id), str(voter_hash), choices_json, str(created_at), str(updated_at)),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return self.get_poll_ballot(poll_id, voter_hash)
+
+    def close_poll(
+        self, poll_id: str, close_reason: str, closed_at: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE polls
+                SET status = 'CLOSED', closed_at = ?, close_reason = ?,
+                    updated_at = ?
+                WHERE id = ? AND status = 'OPEN'
+                """,
+                (str(closed_at), str(close_reason), str(closed_at), str(poll_id)),
+            )
+            self._conn.commit()
+        return self.get_poll(poll_id)
+
+    def cancel_poll(
+        self, poll_id: str, close_reason: str, closed_at: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE polls
+                SET status = 'CANCELLED', closed_at = ?, close_reason = ?,
+                    updated_at = ?
+                WHERE id = ? AND status = 'OPEN'
+                """,
+                (str(closed_at), str(close_reason), str(closed_at), str(poll_id)),
+            )
+            self._conn.commit()
+        return self.get_poll(poll_id)
+
+    def update_poll_flags(
+        self,
+        poll_id: str,
+        updated_at: str,
+        *,
+        announcement_sent: bool | None = None,
+        result_published: bool | None = None,
+        last_error: str | None = None,
+    ) -> dict[str, Any] | None:
+        assignments = ["updated_at = ?"]
+        params: list[Any] = [str(updated_at)]
+        if announcement_sent is not None:
+            assignments.append("announcement_sent = ?")
+            params.append(int(announcement_sent))
+        if result_published is not None:
+            assignments.append("result_published = ?")
+            params.append(int(result_published))
+        if last_error is not None:
+            assignments.append("last_error = ?")
+            params.append(str(last_error)[:1000])
+        params.append(str(poll_id))
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE polls SET {', '.join(assignments)} WHERE id = ?",
+                params,
+            )
+            self._conn.commit()
+        return self.get_poll(poll_id)
 
     def list_bindings(self, platform_id: str | None = None) -> list[dict[str, Any]]:
         with self._lock:

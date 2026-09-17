@@ -12,6 +12,8 @@ REQUIRED_RUNTIME_FILES = {
     "storage.py",
     "qq_adapter.py",
     "exporter.py",
+    "poll_service.py",
+    "poll_web.py",
     "metadata.yaml",
     "_conf_schema.json",
     "requirements.txt",

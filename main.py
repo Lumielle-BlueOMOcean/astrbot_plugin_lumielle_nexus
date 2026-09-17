@@ -48,6 +48,8 @@ if __package__:
     from .exporter import export_collection
     from .qq_adapter import QQAdapter, QQAdapterError
     from .storage import Storage
+    from .poll_service import PollService
+    from .poll_web import PollWeb
 else:
     from core import (
         MODERATION_CONFIRM_TTL_SECONDS,
@@ -83,6 +85,8 @@ else:
     from exporter import export_collection
     from qq_adapter import QQAdapter, QQAdapterError
     from storage import Storage
+    from poll_service import PollService
+    from poll_web import PollWeb
 
 PLUGIN_NAME = "astrbot_plugin_lumielle_nexus"
 
@@ -115,9 +119,42 @@ class LumielleNexus(Star):
         self.moderator_ids = {
             str(value).strip() for value in moderator_ids if str(value).strip()
         }
+        self.poll_web_enabled = bool(self.config.get("poll_web_enabled", False))
+        self.poll_listen_host = str(
+            self.config.get("poll_listen_host", "127.0.0.1")
+        ).strip() or "127.0.0.1"
+        try:
+            self.poll_listen_port = int(self.config.get("poll_listen_port", 8765))
+        except (TypeError, ValueError):
+            self.poll_listen_port = 8765
+        if not 1 <= self.poll_listen_port <= 65535:
+            self.poll_listen_port = 8765
+        self.poll_public_base_url = str(
+            self.config.get("poll_public_base_url", "")
+        ).strip().rstrip("/")
+        self.poll_service = PollService(
+            self.storage,
+            timezone_name=self.manager.timezone_name,
+            web_enabled=self.poll_web_enabled,
+            public_base_url=self.poll_public_base_url,
+        )
+        self.poll_web = PollWeb(self.poll_service)
+        self._poll_web_available = False
         self._scheduler_task: asyncio.Task[None] | None = None
 
     async def initialize(self) -> None:
+        if self.poll_web_enabled:
+            try:
+                await self.poll_web.start(self.poll_listen_host, self.poll_listen_port)
+                self._poll_web_available = True
+                logger.info(
+                    "群枢 Poll Web 已启动：%s:%s",
+                    self.poll_listen_host,
+                    self.poll_listen_port,
+                )
+            except Exception:
+                self._poll_web_available = False
+                logger.exception("群枢 Poll Web 启动失败，其他插件功能继续运行")
         if self._scheduler_task is None or self._scheduler_task.done():
             self._scheduler_task = asyncio.create_task(
                 self._scheduler_loop(),
@@ -132,6 +169,11 @@ class LumielleNexus(Star):
             except asyncio.CancelledError:
                 pass
             self._scheduler_task = None
+        try:
+            await self.poll_web.stop()
+        except Exception:
+            logger.exception("群枢 Poll Web 关闭失败")
+        self._poll_web_available = False
         self.storage.close()
 
     def is_authorized_operator(self, event: AstrMessageEvent) -> bool:
@@ -217,6 +259,214 @@ class LumielleNexus(Star):
 
     def _adapter(self, event: AstrMessageEvent) -> QQAdapter:
         return QQAdapter(self.context, self._platform_id(event))
+
+    async def _poll_authorize_group(
+        self, event: AstrMessageEvent, group: str = "",
+    ) -> tuple[bool, str, str]:
+        return await self._authorized_collection_control(event, group)
+
+    async def _poll_authorize_id(
+        self, event: AstrMessageEvent, poll_id: str,
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        poll = await self.poll_service.get_poll(poll_id)
+        if poll is None:
+            return False, f"投票不存在：{poll_id}", None
+        if self._platform_id(event) != str(poll["platform_id"]):
+            return False, "不能跨平台操作投票。", None
+        allowed, message, _effective_group = await self._authorized_collection_control(
+            event, str(poll["group_id"]),
+        )
+        return allowed, message, poll
+
+    def _poll_announcement(self, poll: dict[str, Any]) -> str:
+        deadline = (
+            format_local_time(
+                poll.get("deadline_at"), self.manager.timezone_name, "minutes",
+            )
+            if poll.get("deadline_at") else "未设置"
+        )
+        if poll["multiple_choice"]:
+            poll_type = f"多选，最多选择 {poll['max_choices']} 项"
+        else:
+            poll_type = "单选"
+        change = "提交后可修改" if poll["allow_change"] else "提交后不可修改"
+        lines = ["【群投票】", "", poll["title"], ""]
+        if poll.get("description"):
+            lines.extend([poll["description"], ""])
+        lines.extend(
+            f"{option['position']}. {option['label']}" for option in poll["options"]
+        )
+        lines.extend([
+            "", f"类型：{poll_type}", f"截止：{deadline}", change,
+            "", f"点击参与：{poll['public_url']}",
+        ])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _poll_status_text(status: str) -> str:
+        return {"OPEN": "进行中", "CLOSED": "已结束", "CANCELLED": "已取消"}.get(
+            str(status), str(status),
+        )
+
+    def _poll_result_lines(self, poll: dict[str, Any], result: dict[str, Any]) -> list[str]:
+        lines = [f"{option['option_id']}. {option['label']} — "
+                 f"{option['votes']}票（{option['percentage']:.1f}%）"
+                 for option in result["options"]]
+        return lines
+
+    async def _publish_poll_result(
+        self, poll: dict[str, Any] | str, force: bool = False,
+    ) -> str:
+        poll_id = poll if isinstance(poll, str) else str(poll["id"])
+        current = await self.poll_service.get_poll(poll_id)
+        if current is None:
+            return f"投票不存在：{poll_id}"
+        if current["status"] != "CLOSED":
+            return "只有已结束的投票可以公布结果。"
+        if current["result_published"] and not force:
+            return f"投票 {poll_id} 的结果已经公布。"
+        try:
+            text = await self.poll_service.publishable_result_text(poll_id)
+            await QQAdapter(self.context, current["platform_id"]).send_group_text(
+                current["group_id"], text,
+            )
+            await self.poll_service.mark_result_published(poll_id)
+            return f"已在「{current['group_alias']}」公布投票 {poll_id} 的结果。"
+        except QQAdapterError as exc:
+            await self.poll_service.record_error(poll_id, str(exc))
+            return f"结果公布失败：{exc}。投票结果仍已保留，可稍后手动重试。"
+        except Exception as exc:
+            logger.exception("群枢 Poll 结果公布失败 %s", poll_id)
+            await self.poll_service.record_error(poll_id, str(exc))
+            return f"结果公布失败：{exc}。投票结果仍已保留，可稍后手动重试。"
+
+    async def _create_poll(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        title: str,
+        options: list[str],
+        description: str = "",
+        deadline: str = "",
+        multiple_choice: bool = False,
+        max_choices: int = 0,
+        allow_change: bool = True,
+        result_visibility: str = "after_close",
+        auto_publish_result: bool = True,
+    ) -> str:
+        allowed, message, effective_group = await self._poll_authorize_group(event, group)
+        if not allowed:
+            return message
+        if not self._poll_web_available:
+            return "投票网页服务当前不可用，请先启用并正确配置 Poll Web。"
+        try:
+            poll = await self.poll_service.create_poll(
+                effective_group or group,
+                title,
+                options,
+                description,
+                deadline,
+                multiple_choice,
+                max_choices,
+                allow_change,
+                result_visibility,
+                auto_publish_result,
+                self._platform_id(event),
+                str(event.get_sender_id()),
+            )
+            announcement = self._poll_announcement(poll)
+            try:
+                await self._adapter(event).send_group_text(poll["group_id"], announcement)
+                await self.poll_service.mark_announcement_sent(poll["id"])
+            except QQAdapterError as exc:
+                await self.poll_service.record_error(poll["id"], str(exc))
+                return (
+                    f"投票 {poll['id']} 已创建，但群公告发送失败：{exc}\n"
+                    f"参与链接：{poll['public_url']}"
+                )
+            return f"已创建投票 {poll['id']}，参与链接：{poll['public_url']}"
+        except (KeyError, TypeError, ValueError) as exc:
+            return f"创建投票失败：{exc}"
+
+    async def _list_polls(
+        self, event: AstrMessageEvent, group: str = "", status: str = "", limit: int = 50,
+    ) -> str:
+        allowed, message, effective_group = await self._poll_authorize_group(event, group)
+        if not allowed:
+            return message
+        try:
+            polls = await self.poll_service.list_polls(
+                self._platform_id(event), effective_group or group, status, limit,
+            )
+            if not polls:
+                return "暂无投票。"
+            lines = ["投票列表："]
+            for poll in polls:
+                deadline = (
+                    format_local_time(
+                        poll.get("deadline_at"), self.manager.timezone_name, "minutes",
+                    ) if poll.get("deadline_at") else "无截止时间"
+                )
+                lines.append(
+                    f"{poll['id']} [{self._poll_status_text(poll['status'])}] "
+                    f"{poll['group_alias']}：{poll['title']}，截止 {deadline}，"
+                    f"参与 {len(self.storage.list_poll_ballots(poll['id']))} 人"
+                )
+            return "\n".join(lines)
+        except (KeyError, TypeError, ValueError) as exc:
+            return f"查询投票失败：{exc}"
+
+    async def _get_poll(self, event: AstrMessageEvent, poll_id: str) -> str:
+        allowed, message, poll = await self._poll_authorize_id(event, poll_id)
+        if not allowed or poll is None:
+            return message
+        try:
+            result = await self.poll_service.get_result(poll["id"])
+            deadline = (
+                format_local_time(
+                    poll.get("deadline_at"), self.manager.timezone_name, "minutes",
+                ) if poll.get("deadline_at") else "未设置"
+            )
+            lines = [
+                f"投票：{poll['id']}", f"群：{poll['group_alias']}",
+                f"标题：{poll['title']}", f"状态：{self._poll_status_text(poll['status'])}",
+                f"截止：{deadline}", f"参与人数：{result['participant_count']}",
+                f"链接：{poll['public_url']}", "结果：",
+            ]
+            lines.extend(self._poll_result_lines(poll, result))
+            return "\n".join(lines)
+        except (KeyError, TypeError, ValueError) as exc:
+            return f"查询投票失败：{exc}"
+
+    async def _close_poll(self, event: AstrMessageEvent, poll_id: str) -> str:
+        allowed, message, poll = await self._poll_authorize_id(event, poll_id)
+        if not allowed or poll is None:
+            return message
+        try:
+            closed = await self.poll_service.close_poll(poll["id"], "manual")
+            result = f"已结束投票 {closed['id']}。"
+            if closed["auto_publish_result"]:
+                result += "\n" + await self._publish_poll_result(closed)
+            return result
+        except (KeyError, TypeError, ValueError) as exc:
+            return f"结束投票失败：{exc}"
+
+    async def _cancel_poll(self, event: AstrMessageEvent, poll_id: str) -> str:
+        allowed, message, poll = await self._poll_authorize_id(event, poll_id)
+        if not allowed or poll is None:
+            return message
+        try:
+            cancelled = await self.poll_service.cancel_poll(poll["id"])
+            try:
+                await self._adapter(event).send_group_text(
+                    cancelled["group_id"], f"【投票取消】\n{cancelled['title']}",
+                )
+            except QQAdapterError as exc:
+                await self.poll_service.record_error(cancelled["id"], str(exc))
+                return f"投票 {cancelled['id']} 已取消，但群内取消通知发送失败：{exc}"
+            return f"已取消投票 {cancelled['id']}。"
+        except (KeyError, TypeError, ValueError) as exc:
+            return f"取消投票失败：{exc}"
 
     @staticmethod
     def _payload(task: dict[str, Any]) -> dict[str, Any]:
@@ -1618,6 +1868,12 @@ class LumielleNexus(Star):
         while True:
             try:
                 await self.manager.prune_archive_if_due()
+                for poll in await self.poll_service.close_due_polls():
+                    if poll["auto_publish_result"]:
+                        try:
+                            await self._publish_poll_result(poll)
+                        except Exception:
+                            logger.exception("群枢 Poll 自动公布结果失败 %s", poll.get("id"))
                 await self.manager.materialize_due_schedules()
                 for task in await self.manager.due_tasks():
                     try:
@@ -1853,6 +2109,8 @@ class LumielleNexus(Star):
             "/nexus member-sets [群别名]\n"
             "/nexus member-set <群别名> <集合名>\n"
             "/nexus moderation-confirm <M-任务ID>\n"
+            "/nexus poll list|show <P-ID>|close <P-ID>|cancel <P-ID>|result <P-ID>\n"
+            "/nexus poll create . | 标题 | 选项A | 选项B | ...\n"
             "/nexus collect-start 群别名|标题|字段1,字段2[,公告][,all]\n"
             "/nexus collect-status <任务ID>\n"
             "/nexus collect-stop <任务ID>\n"
@@ -1983,6 +2241,51 @@ class LumielleNexus(Star):
             if args
             else "用法：/nexus collect-stop <任务ID>",
         )
+
+    @nexus.command("poll", priority=10)
+    async def cmd_poll(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
+        """Minimal deterministic fallback commands for web polls."""
+        args = self._command_args(event)
+        if not args:
+            yield event.plain_result(
+                "用法：/nexus poll list|show <P-ID>|close <P-ID>|cancel <P-ID>|result <P-ID>\n"
+                "/nexus poll create . | 标题 | 选项A | 选项B | ...",
+            )
+            return
+        action = args[0].casefold()
+        if action == "list":
+            group = args[1] if len(args) > 1 else ""
+            status = args[2] if len(args) > 2 else ""
+            response = await self._list_polls(event, group, status)
+        elif action == "show" and len(args) >= 2:
+            response = await self._get_poll(event, args[1])
+        elif action == "close" and len(args) >= 2:
+            response = await self._close_poll(event, args[1])
+        elif action == "cancel" and len(args) >= 2:
+            response = await self._cancel_poll(event, args[1])
+        elif action == "result" and len(args) >= 2:
+            allowed, message, poll = await self._poll_authorize_id(event, args[1])
+            if not allowed or poll is None:
+                response = message
+            else:
+                response = await self._publish_poll_result(poll)
+        elif action == "create":
+            parts = [part.strip() for part in " ".join(args[1:]).split("|")]
+            if len(parts) < 4:
+                response = "用法：/nexus poll create . | 标题 | 选项A | 选项B | ..."
+            elif parts[0] == "." and event.is_private_chat():
+                response = "create 使用“.”时必须在目标 QQ 群内执行。"
+            else:
+                group = str(event.get_group_id()) if parts[0] == "." else parts[0]
+                response = await self._create_poll(
+                    event, group, parts[1], parts[2:],
+                )
+        else:
+            response = (
+                "用法：/nexus poll list|show <P-ID>|close <P-ID>|cancel <P-ID>|result <P-ID>\n"
+                "/nexus poll create . | 标题 | 选项A | 选项B | ..."
+            )
+        yield event.plain_result(response)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
@@ -2333,6 +2636,94 @@ class LumielleNexus(Star):
             task_id(string): 要结束的收集任务 ID。
         """
         return await self._stop_collection(event, task_id)
+
+    @filter.llm_tool(name="nexus_create_poll")
+    async def nexus_create_poll(
+        self,
+        event: AstrMessageEvent,
+        group: str,
+        title: str,
+        options: list[str],
+        description: str = "",
+        deadline: str = "",
+        multiple_choice: bool = False,
+        max_choices: int = 0,
+        allow_change: bool = True,
+        result_visibility: str = "after_close",
+        auto_publish_result: bool = True,
+    ) -> str:
+        """创建并发布一个轻量 Web 群投票。只有用户明确要求创建、发起或发布投票时调用；创建后会向目标群发送参与链接。投票网页未启用或没有公网地址时不会创建。只能由私聊 operator 或当前群 QQ 群主/管理员调用。
+
+        Args:
+            group(string): 已绑定群别名或群号；群内只能是当前群。
+            title(string): 投票标题，1 到 200 个字符。
+            options(list[string]): 2 到 20 个选项。
+            description(string): 可选说明，最多 1000 个字符。
+            deadline(string): 可选截止时间，按插件时区解释且必须在未来。
+            multiple_choice(boolean): 是否多选，默认 false。
+            max_choices(number): 多选最多选择数，0 表示等于选项数。
+            allow_change(boolean): 提交后是否允许同一浏览器修改，默认 true。
+            result_visibility(string): live 或 after_close，默认 after_close。
+            auto_publish_result(boolean): 截止后是否自动向群公布结果，默认 true。
+        """
+        return await self._create_poll(
+            event, group, title, options, description, deadline,
+            multiple_choice, max_choices, allow_change, result_visibility,
+            auto_publish_result,
+        )
+
+    @filter.llm_tool(name="nexus_list_polls")
+    async def nexus_list_polls(
+        self, event: AstrMessageEvent, group: str = "", status: str = "", limit: int = 50,
+    ) -> str:
+        """列出已绑定群的 Web Poll。只能由私聊 operator 或当前群 QQ 群主/管理员调用；群内只能查看当前群。
+
+        Args:
+            group(string): 可选已绑定群别名或群号。
+            status(string): 可选 OPEN、CLOSED 或 CANCELLED。
+            limit(number): 返回 1 到 100 条，默认 50。
+        """
+        return await self._list_polls(event, group, status, limit)
+
+    @filter.llm_tool(name="nexus_get_poll")
+    async def nexus_get_poll(self, event: AstrMessageEvent, poll_id: str) -> str:
+        """查看一个已绑定群 Web Poll 的当前状态、参与人数和结果；管理员查询不受网页结果可见性限制。只能由私聊 operator 或当前群 QQ 群主/管理员调用。
+
+        Args:
+            poll_id(string): 投票 ID，例如 P-20260917-001。
+        """
+        return await self._get_poll(event, poll_id)
+
+    @filter.llm_tool(name="nexus_close_poll")
+    async def nexus_close_poll(self, event: AstrMessageEvent, poll_id: str) -> str:
+        """手动结束一个 OPEN Web Poll；若启用自动公布结果，会在结束后向原群发送一次结果。只能由私聊 operator 或当前群 QQ 群主/管理员调用。
+
+        Args:
+            poll_id(string): 要结束的投票 ID。
+        """
+        return await self._close_poll(event, poll_id)
+
+    @filter.llm_tool(name="nexus_cancel_poll")
+    async def nexus_cancel_poll(self, event: AstrMessageEvent, poll_id: str) -> str:
+        """取消一个 OPEN Web Poll。取消后不能再投票，也不会自动公布结果。只能由私聊 operator 或当前群 QQ 群主/管理员调用。
+
+        Args:
+            poll_id(string): 要取消的投票 ID。
+        """
+        return await self._cancel_poll(event, poll_id)
+
+    @filter.llm_tool(name="nexus_publish_poll_result")
+    async def nexus_publish_poll_result(
+        self, event: AstrMessageEvent, poll_id: str, force: bool = False,
+    ) -> str:
+        """手动向已结束投票的原群公布结果。已公布时默认不重复发送；只有用户明确要求重新公布时才传 force=true。只能由私聊 operator 或当前群 QQ 群主/管理员调用。
+
+        Args:
+            poll_id(string): 要公布结果的投票 ID。
+            force(boolean): 是否明确要求重复公布，默认 false。
+        """
+        allowed, message, poll = await self._poll_authorize_id(event, poll_id)
+        return message if not allowed or poll is None else await self._publish_poll_result(poll, force)
 
     @filter.llm_tool(name="nexus_set_archive")
     async def nexus_set_archive(self, event: AstrMessageEvent, group: str, enabled: bool) -> str:

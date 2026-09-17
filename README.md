@@ -2,7 +2,7 @@
 
 > 一个面向 AstrBot + QQ 的跨会话群事务编排插件。
 
-[![Version](https://img.shields.io/badge/version-0.8.2-7c5cff.svg)](metadata.yaml)
+[![Version](https://img.shields.io/badge/version-0.9.0-7c5cff.svg)](metadata.yaml)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.25.5%2C%3C5-4b8bbe.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![Platform](https://img.shields.io/badge/platform-aiocqhttp%20%2F%20OneBot%20v11-12a594.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
@@ -11,7 +11,7 @@
 
 | 项目 | 当前版本 |
 | --- | --- |
-| Version | `0.8.2` |
+| Version | `0.9.0` |
 | AstrBot | `>=4.25.5,<5` |
 | Platform | `aiocqhttp` / OneBot v11（QQ，主要面向 NapCat） |
 | License | MIT |
@@ -28,15 +28,16 @@
 | Relay | ✅ 已实现 |
 | Moderation | ✅ 已实现，默认关闭 |
 | QQ 群管理员控制 | ✅ 当前绑定群内支持有限控制 |
-| 自动测试 | ✅ 129 项 |
+| Web Poll / 群投票 | ✅ 轻量匿名浏览器投票 |
+| 自动测试 | ✅ 持续由 CI 验证 |
 | Real-world QQ / NapCat / Provider validation | 🧪 仍需按实际部署验证 |
 
 ## 🔗 Compatibility
 
 - AstrBot：`>=4.25.5,<5`
 - 平台：`aiocqhttp` / OneBot v11（QQ，主要面向 NapCat）
-- 最低兼容版本已在独立临时环境使用 AstrBot 4.25.5 官方源码完成 loader smoke，插件可导入、初始化并注册 31 个工具。
-- AstrBot 4.28.0 loader smoke 同样通过。
+- 最低兼容版本已在独立临时环境使用 AstrBot 4.25.5 官方源码完成 loader smoke，插件可导入、初始化并注册 37 个工具。
+- AstrBot 4.28.0 loader smoke 同样通过；其中包含 6 个 Web Poll 工具。
 - 上述是代码级兼容性验证，不代表已经完成真实 QQ、NapCat 或 LLM Provider E2E 验证。
 
 ✅ 表示代码实现和自动化验证已完成；🧪 不代表已经在真实 QQ、NapCat 或付费 LLM Provider 环境中做过生产验证。
@@ -66,6 +67,26 @@
 - 按需群聊总结和自动 `weekly summary`（周总结）。
 - 群消息不会逐条调用 LLM：平时先持久化 capture，checkpoint 只处理 cursor 之后的新消息。
 - 总结模型只负责整理，不会自动创建 DDL 或其他任务。
+
+### 🗳️ Web Poll / 群投票
+
+微光·群枢提供自带网页的轻量群投票：支持单选、多选、截止时间、改票策略、实时/截止后结果、手动结束/取消，以及截止后自动向原群公布结果。它不是 QQ 原生投票，也不依赖 QQ OAuth。
+
+启用前在插件配置中设置：
+
+| 配置 | 说明 |
+| --- | --- |
+| `poll_web_enabled` | 默认 `false`；是否启动本地投票网页服务 |
+| `poll_listen_host` / `poll_listen_port` | 默认 `127.0.0.1:8765` |
+| `poll_public_base_url` | 发到群里的公网根地址，例如 `https://poll.example.com` |
+
+公网地址、HTTPS、DNS、反向代理或 Tunnel 需要自行准备；Nexus 不自动暴露端口。没有启用网页服务或没有配置公网地址时，不会创建 Poll。启用后可以说：
+
+```text
+在班群发一个投票：周末吃什么？火锅、烧烤、日料，明晚八点截止。
+```
+
+投票使用匿名浏览器 Cookie（`HttpOnly`、`SameSite=Strict`）；数据库只保存 Cookie 的 SHA-256。清除 Cookie、换浏览器或换设备可能再次参与，因此它适合普通意见调查，不等同于 QQ 实名投票。
 
 ### 🔐 协作与安全操作
 
@@ -109,6 +130,17 @@ flowchart LR
 /nexus tasks
 /nexus task R-...
 /nexus cancel R-...
+```
+
+Poll 的确定性 fallback：
+
+```text
+/nexus poll list
+/nexus poll show <P-ID>
+/nexus poll close <P-ID>
+/nexus poll cancel <P-ID>
+/nexus poll result <P-ID>
+/nexus poll create . | 标题 | 选项A | 选项B | 选项C
 ```
 
 ## 📋 真实 Collection 示例
@@ -234,7 +266,7 @@ WebUI → 插件 → 微光·群枢 → 重载插件
 python -m pip install -r requirements.txt
 ```
 
-本插件只额外依赖 `openpyxl`；AstrBot、aiocqhttp/OneBot 和 LLM Provider 由宿主环境提供。
+本插件额外依赖 `openpyxl` 和 Web Poll 使用的 `aiohttp`；AstrBot、aiocqhttp/OneBot 和 LLM Provider 由宿主环境提供。
 
 ## ⚙️ 初始配置
 
@@ -251,6 +283,10 @@ python -m pip install -r requirements.txt
 | `archive_retention_days` | `90` | 归档自动保留天数；`0` 表示不自动清理，其他值限制 `7–3650` |
 | `moderation_enabled` | `false` | 是否开启单成员群管理；默认完全关闭 |
 | `moderator_ids` | `[]` | 独立群管理 QQ 用户 ID，不继承 `operator_ids` |
+| `poll_web_enabled` | `false` | 是否启用轻量投票网页服务 |
+| `poll_listen_host` | `127.0.0.1` | 投票网页本地监听地址 |
+| `poll_listen_port` | `8765` | 投票网页本地监听端口 |
+| `poll_public_base_url` | `""` | 发到 QQ 群的公网根地址；需自行配置 HTTPS/反代 |
 
 ## 🗃️ 数据、隐私与 Archive
 
@@ -340,6 +376,7 @@ python -m pip install -r requirements.txt
 - embedding、向量数据库、RAG、知识图谱；
 - WebUI 页面、Redis、ORM、新 Web 服务；
 - 批量 moderation、全员禁言、设置管理员、退群；
+- QQ OAuth、实名投票、投票管理后台、问卷和复杂投票算法；
 - 根据群总结自动创建任务；
 - 更复杂的课程表和周期规则。
 
@@ -355,7 +392,7 @@ python3 -m unittest discover -s tests -v
 git diff --check
 ```
 
-结果为 129 项测试通过，AstrBot 4.25.5 与 4.28.0 官方源码 loader smoke 均通过，31 个工具成功注册。当前没有进行真实 LLM 消耗测试，也没有在真实群执行 mute/kick 或发送测试 spam。
+Poll Web 使用本地 aiohttp 服务和 SQLite 持久化；自动化测试覆盖 Poll 服务、网页 Cookie/XSS/投票链路和旧功能回归。AstrBot 4.25.5 与 4.28.0 loader smoke 均应通过，工具数量为原有 31 个加 6 个 Poll 工具。当前没有进行真实 LLM 消耗测试、真实 QQ 投票 E2E，也没有在真实群执行 mute/kick 或发送测试 spam。
 
 ## ⚖️ License
 

@@ -52,5 +52,25 @@
     "items": {
       "type": "string"
     }
+  },
+  "poll_web_enabled": {
+    "type": "bool",
+    "description": "是否启用投票网页服务；默认关闭",
+    "default": false
+  },
+  "poll_listen_host": {
+    "type": "string",
+    "description": "投票网页服务本地监听地址",
+    "default": "127.0.0.1"
+  },
+  "poll_listen_port": {
+    "type": "int",
+    "description": "投票网页服务本地监听端口",
+    "default": 8765
+  },
+  "poll_public_base_url": {
+    "type": "string",
+    "description": "发到 QQ 群的投票公网根地址，需自行提供公网 HTTPS/URL",
+    "default": ""
   }
 }
