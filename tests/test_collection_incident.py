@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import core as core_module
-from core import Storage, TaskManager
+from core import Storage, TaskManager, collection_member_stats
 
 
 def _load_main_module():
@@ -199,6 +199,109 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["rejected"], [])
         self.assertEqual(saved["analysis_cursor_id"], captured["id"])
         self.assertFalse(saved["analysis_incomplete"])
+
+    async def test_ok_empty_items_is_unresolved_and_keeps_cursor(self):
+        task, captured, result, saved = await self._checkpoint_with_candidate({
+            "members": [{"user_id": "1001", "status": "ok", "items": []}],
+        })
+        self.assertEqual(saved["analysis_cursor_id"], 0)
+        self.assertTrue(saved["analysis_incomplete"])
+        self.assertEqual(
+            saved["last_checkpoint"]["rejection_counts"]["empty_ok_result"], 1,
+        )
+
+    async def test_empty_ok_validator_marks_sender_unresolved(self):
+        validation = core_module.validate_collection_checkpoint_candidate(
+            {"members": [{"user_id": "1001", "status": "ok", "items": []}]},
+            ["返校时间"],
+            {"1001": ["我大概7号回来"]},
+        )
+        self.assertNotIn("1001", validation["resolved_user_ids"])
+        self.assertIn("1001", validation["unresolved_user_ids"])
+        self.assertIn(
+            {"user_id": "1001", "reason": "empty_ok_result"},
+            validation["rejected"],
+        )
+
+    async def test_valid_ok_result_is_terminal_and_advances_cursor(self):
+        task, captured, result, saved = await self._checkpoint_with_candidate({
+            "members": [{
+                "user_id": "1001", "status": "ok", "items": [{
+                    "field": "返校时间", "value": "7号", "evidence": "7号",
+                    "confidence": 0.99,
+                }],
+            }],
+        }, message="我7号回来")
+        self.assertEqual(result["rejected"], [])
+        self.assertEqual(saved["analysis_cursor_id"], captured["id"])
+        self.assertFalse(saved["analysis_incomplete"])
+
+    async def test_confirmation_entry_survives_checkpoint_chase_and_finalize(self):
+        main_module = _load_main_module()
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        collection = await self.manager.start_collection(
+            "班群", "回执确认", ["收到确认"], "", False,
+            "qq-main", "operator", "origin",
+            chase_at=now + timedelta(minutes=10),
+            deadline=now + timedelta(minutes=20),
+            missing_default_field="收到确认",
+            missing_default_value="未收到",
+            now=now,
+        )
+        captured = await self.manager.capture_collection_message(
+            collection["id"], "1001", "张三", "收到", sent_at=now + timedelta(seconds=1),
+            now=now + timedelta(seconds=1),
+        )
+        self.assertEqual(captured["entry"]["parsed_data"], {"收到确认": "已收到"})
+
+        children = self.storage.list_children(collection["id"])
+        chase = next(
+            child for child in children
+            if json.loads(child["payload"]).get("checkpoint_type") == "chase"
+        )
+        finalize = next(
+            child for child in children
+            if json.loads(child["payload"]).get("kind") == "collection_finalize"
+        )
+
+        class FakeAdapter:
+            sent_batches = []
+
+            def __init__(self, _context, _platform_id):
+                pass
+
+            async def get_group_member_list(self, _group_id):
+                return [
+                    {"user_id": "1001", "nickname": "张三"},
+                    {"user_id": "9000", "nickname": "Bot"},
+                ]
+
+            async def get_login_info(self):
+                return {"user_id": "9000"}
+
+            async def send_group_at_member_batch(self, group_id, user_ids, text):
+                self.sent_batches.append((group_id, list(user_ids), text))
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.context = types.SimpleNamespace()
+        plugin.manager = self.manager
+        plugin.data_dir = Path(self.temp_dir.name)
+        with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
+            await plugin._execute_collection_checkpoint(
+                chase, json.loads(chase["payload"]),
+            )
+            await plugin._execute_collection_finalize(
+                finalize, json.loads(finalize["payload"]),
+            )
+
+        final_status = await self.manager.collection_status(collection["id"], "qq-main")
+        entry = final_status["entries"][0]
+        self.assertEqual(json.loads(entry["parsed_data"]), {"收到确认": "已收到"})
+        members = await FakeAdapter(None, None).get_group_member_list("123456789")
+        stats = collection_member_stats(members, final_status["entries"], self_id="9000")
+        self.assertNotIn("1001", stats["missing_ids"])
+        self.assertEqual(FakeAdapter.sent_batches, [])
+        self.assertNotEqual(json.loads(entry["parsed_data"]).get("收到确认"), "未收到")
 
     async def test_ambiguous_result_keeps_cursor_and_marks_incomplete(self):
         task, captured, result, saved = await self._checkpoint_with_candidate({

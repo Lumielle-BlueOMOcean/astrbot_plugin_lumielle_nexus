@@ -776,7 +776,9 @@ def validate_collection_checkpoint_candidate(
             })
         for item in validation["rejected"]:
             reject(item, user_id)
-        if validation["accepted"] and not validation["rejected"]:
+        if not validation["accepted"] and not validation["rejected"]:
+            reject({"reason": "empty_ok_result"}, user_id)
+        elif validation["accepted"] and not validation["rejected"]:
             resolved_users.add(user_id)
         else:
             unresolved_users.add(user_id)
@@ -2439,7 +2441,9 @@ class TaskManager:
                 applied_ids.append(user_id)
             result = self._task_result(task)
             rejected = validation["rejected"]
-            analysis_incomplete = bool(rejected)
+            analysis_incomplete = bool(
+                rejected or validation["unresolved_user_ids"]
+            )
             current_cursor = int(result.get("analysis_cursor_id") or 0)
             result.update({
                 "analysis_cursor_id": current_cursor if analysis_incomplete else int(
