@@ -519,7 +519,7 @@ class Storage:
                 """
                 UPDATE polls
                 SET status = 'CLOSED', closed_at = ?, close_reason = ?,
-                    updated_at = ?
+                    updated_at = ?, last_error = NULL
                 WHERE id = ? AND status = 'OPEN'
                 """,
                 (str(closed_at), str(close_reason), str(closed_at), str(poll_id)),

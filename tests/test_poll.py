@@ -360,6 +360,34 @@ class PollServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(stored["result_published"])
         self.assertEqual(stored["last_error"], "transport failed")
 
+    async def test_announcement_error_is_cleared_when_poll_closes(self):
+        main_module = _load_main_module()
+        poll = await self._create()
+        await self.service.record_error(poll["id"], "announcement failed")
+        self.assertEqual(self.storage.get_poll(poll["id"])["last_error"], "announcement failed")
+
+        await self.service.close_poll(poll["id"], "manual")
+        self.assertIsNone(self.storage.get_poll(poll["id"])["last_error"])
+
+        class FakeAdapter:
+            calls = []
+
+            def __init__(self, _context, _platform_id):
+                pass
+
+            async def send_group_text(self, group_id, text):
+                self.calls.append((group_id, text))
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.context = types.SimpleNamespace()
+        with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
+            await plugin._maintain_polls_once()
+            await plugin._maintain_polls_once()
+
+        self.assertEqual(len(FakeAdapter.calls), 1)
+        self.assertTrue(self.storage.get_poll(poll["id"])["result_published"])
+
     async def test_web_deadline_uses_configured_timezone(self):
         poll = await self._create(deadline="2026-09-18 22:00")
         page = PollWeb(self.service)._render_page(
