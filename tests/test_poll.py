@@ -324,6 +324,218 @@ class PollServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0]["chat_provider_id"], "provider-1")
         self.assertEqual(self.storage.list_poll_ballots(poll["id"])[0]["voter_id"], "1002")
 
+    async def test_single_open_poll_ordinal_uses_semantic_fallback(self):
+        main_module = _load_main_module()
+        poll = await self._create(
+            options=["14点", "15点", "16点"],
+            semantic_fallback=True,
+            ai_provider_id="provider-1",
+        )
+        calls = []
+
+        class Context:
+            async def llm_generate(self, **kwargs):
+                calls.append(kwargs)
+                return types.SimpleNamespace(
+                    completion_text='{"status":"vote","choices":[2],"confidence":0.95,"evidence":"第二个"}',
+                )
+
+        class Event:
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_group_id(self):
+                return "123456789"
+
+            def get_message_str(self):
+                return "第二个吧"
+
+            def get_sender_id(self):
+                return "1005"
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.storage = self.storage
+        plugin.context = Context()
+        result = await plugin._handle_poll_message(Event())
+        self.assertEqual(result, {"handled": True, "kind": "success"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.storage.list_poll_ballots(poll["id"])[0]["choices_json"], "[2]")
+
+    async def test_explicit_poll_id_uses_semantic_fallback(self):
+        main_module = _load_main_module()
+        poll = await self._create(
+            options=["周六", "周日"],
+            semantic_fallback=True,
+            ai_provider_id="provider-1",
+        )
+        calls = []
+
+        class Context:
+            async def llm_generate(self, **kwargs):
+                calls.append(kwargs)
+                return types.SimpleNamespace(
+                    completion_text='{"status":"vote","choices":[2],"confidence":0.95,"evidence":"第二个"}',
+                )
+
+        class Event:
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_group_id(self):
+                return "123456789"
+
+            def get_message_str(self):
+                return f"投票 {poll['id']} 第二个吧"
+
+            def get_sender_id(self):
+                return "1006"
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.storage = self.storage
+        plugin.context = Context()
+        result = await plugin._handle_poll_message(Event())
+        self.assertEqual(result, {"handled": True, "kind": "success"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.storage.list_poll_ballots(poll["id"])[0]["choices_json"], "[2]")
+
+    async def test_ordinary_numeric_message_does_not_trigger_poll_llm(self):
+        main_module = _load_main_module()
+        await self._create(ai_provider_id="provider-1")
+        calls = []
+
+        class Context:
+            async def llm_generate(self, **_kwargs):
+                calls.append(True)
+
+        class Event:
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_group_id(self):
+                return "123456789"
+
+            def get_message_str(self):
+                return "今天用1号实验室"
+
+            def get_sender_id(self):
+                return "1007"
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.storage = self.storage
+        plugin.context = Context()
+        result = await plugin._handle_poll_message(Event())
+        self.assertEqual(result, {"handled": False, "kind": "no_match"})
+        self.assertEqual(calls, [])
+        self.assertEqual(self.storage.list_poll_ballots("P-20260917-001"), [])
+
+    async def test_ordinary_substring_message_passes_through(self):
+        main_module = _load_main_module()
+        await self._create(ai_provider_id="provider-1")
+        calls = []
+
+        class Context:
+            async def llm_generate(self, **_kwargs):
+                calls.append(True)
+
+        class Event:
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_group_id(self):
+                return "123456789"
+
+            def get_message_str(self):
+                return "投影仪坏了"
+
+            def get_sender_id(self):
+                return "1008"
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.storage = self.storage
+        plugin.context = Context()
+        result = await plugin._handle_poll_message(Event())
+        self.assertEqual(result, {"handled": False, "kind": "no_match"})
+        self.assertEqual(calls, [])
+        self.assertEqual(self.storage.list_poll_ballots("P-20260917-001"), [])
+
+    async def test_non_explicit_semantic_failure_passes_through(self):
+        main_module = _load_main_module()
+        await self._create(
+            options=["周六", "周日"],
+            semantic_fallback=True,
+            ai_provider_id="provider-1",
+        )
+        calls = []
+
+        class Context:
+            async def llm_generate(self, **_kwargs):
+                calls.append(True)
+                raise RuntimeError("provider unavailable")
+
+        class Event:
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_group_id(self):
+                return "123456789"
+
+            def get_message_str(self):
+                return "我还是选周日吧"
+
+            def get_sender_id(self):
+                return "1009"
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.storage = self.storage
+        plugin.context = Context()
+        result = await plugin._handle_poll_message(Event())
+        self.assertEqual(result, {"handled": False, "kind": "not_vote"})
+        self.assertEqual(calls, [True])
+        self.assertEqual(self.storage.list_poll_ballots("P-20260917-001"), [])
+
+    async def test_explicit_semantic_failure_returns_short_error(self):
+        main_module = _load_main_module()
+        poll = await self._create(
+            options=["周六", "周日"],
+            semantic_fallback=True,
+            ai_provider_id="provider-1",
+        )
+        calls = []
+
+        class Context:
+            async def llm_generate(self, **_kwargs):
+                calls.append(True)
+                raise RuntimeError("provider unavailable")
+
+        class Event:
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_group_id(self):
+                return "123456789"
+
+            def get_message_str(self):
+                return f"投票 {poll['id']} 我还是选周日吧"
+
+            def get_sender_id(self):
+                return "1010"
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.storage = self.storage
+        plugin.context = Context()
+        result = await plugin._handle_poll_message(Event())
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["kind"], "error")
+        self.assertIn("没有识别出明确选择", result["message"])
+        self.assertEqual(calls, [True])
+        self.assertEqual(self.storage.list_poll_ballots(poll["id"]), [])
+
     async def test_ordinary_group_message_does_not_call_poll_provider(self):
         main_module = _load_main_module()
         await self._create(options=["周六", "周日"], ai_provider_id="provider-1")

@@ -28,8 +28,12 @@ class PollClosedError(PollError):
 
 _REPLY_SPLITTER = re.compile(r"[\s,，、/|;；+]+")
 _FORBIDDEN_REPLY_CHARS = set(",，、/|;；+")
-_SEMANTIC_INTENTS = ("选", "选择", "我选", "我投", "投", "支持", "更想", "倾向", "就选")
+_SEMANTIC_INTENTS = ("我选", "我投", "还是选", "就选", "更想", "倾向", "我觉得")
 _ORDINALS = ("第一个", "第二个", "第三个", "第1个", "第2个", "第3个", "第1项", "第2项", "第3项")
+_POLL_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])P-\d{8}-\d{3}(?![A-Za-z0-9])", re.IGNORECASE)
+_NUMERIC_SELF_CHOICE_PATTERN = re.compile(
+    r"(?:我选|我投|还是选|就选|更想|倾向)\s*(?:了|是)?\s*\d+(?:号|项|个)?",
+)
 
 
 def normalize_poll_reply(value: str) -> str:
@@ -123,25 +127,41 @@ def parse_poll_message(message: str, poll: dict[str, Any]) -> list[int] | None:
     return choices
 
 
+def is_explicit_poll_signal(message: str) -> bool:
+    """Return whether a message explicitly refers to the poll workflow."""
+    folded = normalize_poll_reply(message)
+    return bool(
+        "投票" in folded
+        or re.search(r"(?<![a-z])vote(?![a-z])", folded)
+        or _POLL_ID_PATTERN.search(folded)
+    )
+
+
 def is_poll_semantic_candidate(message: str, polls: list[dict[str, Any]]) -> bool:
     """Return whether a bounded group message plausibly refers to a poll."""
     text = str(message or "").strip()
     if not 1 <= len(text) <= 160:
         return False
     folded = normalize_poll_reply(text)
-    if any(term in folded for term in ("投票", "vote", *_SEMANTIC_INTENTS, *_ORDINALS)):
+    if is_explicit_poll_signal(folded) or any(term in folded for term in _ORDINALS):
         return True
+    has_option_clue = False
     for poll in polls:
-        if normalize_poll_reply(str(poll.get("id", ""))) in folded:
+        poll_id = normalize_poll_reply(str(poll.get("id", "")))
+        if poll_id and poll_id in folded:
             return True
         for option in poll.get("options") or []:
             reply_key = normalize_poll_reply(str(option.get("reply_key", "")))
             label = normalize_poll_reply(str(option.get("label", "")))
-            if reply_key and reply_key in folded:
-                return True
-            if label and label in folded:
-                return True
-    return False
+            if reply_key and not reply_key.isdecimal() and reply_key in folded:
+                has_option_clue = True
+            if label and not label.isdecimal() and label in folded:
+                has_option_clue = True
+    has_self_choice = any(term in folded for term in _SEMANTIC_INTENTS)
+    return bool(
+        _NUMERIC_SELF_CHOICE_PATTERN.search(folded)
+        or (has_self_choice and has_option_clue)
+    )
 
 
 def validate_semantic_vote_candidate(

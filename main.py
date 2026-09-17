@@ -51,6 +51,7 @@ if __package__:
     from .poll_service import (
         PollError,
         PollService,
+        is_explicit_poll_signal,
         is_poll_semantic_candidate,
         normalize_poll_reply,
         parse_poll_message,
@@ -94,6 +95,7 @@ else:
     from poll_service import (
         PollError,
         PollService,
+        is_explicit_poll_signal,
         is_poll_semantic_candidate,
         normalize_poll_reply,
         parse_poll_message,
@@ -482,12 +484,12 @@ class LumielleNexus(Star):
         aliases: set[str] = set()
         for option in poll.get("options") or []:
             for value in (
-                str(option.get("position", "")),
                 str(option.get("reply_key", "")),
                 str(option.get("label", "")),
             ):
-                if value.strip():
-                    aliases.add(normalize_poll_reply(value))
+                normalized = normalize_poll_reply(value)
+                if normalized and not normalized.isdecimal():
+                    aliases.add(normalized)
         return aliases
 
     @staticmethod
@@ -563,7 +565,9 @@ class LumielleNexus(Star):
                 if raw.startswith("json"):
                     raw = raw[4:].strip()
             candidate = json.loads(raw)
-            if not isinstance(candidate, dict) or candidate.get("status") in {"not_vote", "ambiguous"}:
+            if not isinstance(candidate, dict):
+                return "ambiguous", None
+            if candidate.get("status") in {"not_vote", "ambiguous"}:
                 return "not_vote" if candidate.get("status") == "not_vote" else "ambiguous", None
             choices = validate_semantic_vote_candidate(
                 candidate,
@@ -594,22 +598,41 @@ class LumielleNexus(Star):
             poll = next((item for item in polls if item["id"].casefold() == explicit_id.casefold()), None)
             if poll is None:
                 return {"handled": True, "kind": "error", "message": "指定的投票不存在、已结束，或不属于当前群。"}
+            parse_error: PollError | None = None
             try:
                 choices = parse_poll_message(vote_text, poll)
-                if choices is None:
-                    raise PollError("无法识别投票选项，请使用编号、完整标签或 reply key。")
-                await self.poll_service.cast_vote(poll["id"], choices, str(event.get_sender_id()))
-                return {"handled": True, "kind": "success"}
             except PollError as exc:
-                return {"handled": True, "kind": "error", "message": str(exc)}
+                choices = None
+                parse_error = exc
+            if choices is not None:
+                try:
+                    await self.poll_service.cast_vote(poll["id"], choices, str(event.get_sender_id()))
+                    return {"handled": True, "kind": "success"}
+                except PollError as exc:
+                    return {"handled": True, "kind": "error", "message": str(exc)}
+            if is_poll_semantic_candidate(vote_text, [poll]):
+                status, choices = await self._semantic_poll_vote(
+                    poll, vote_text, str(event.get_sender_id()),
+                )
+                if status == "vote" and choices is not None:
+                    try:
+                        await self.poll_service.cast_vote(
+                            poll["id"], choices, str(event.get_sender_id()),
+                        )
+                        return {"handled": True, "kind": "success"}
+                    except PollError as exc:
+                        return {"handled": True, "kind": "error", "message": str(exc)}
+            return {
+                "handled": True,
+                "kind": "error",
+                "message": str(parse_error) if parse_error else "没有识别出明确选择，请按投票公告中的回复格式发送。",
+            }
 
         deterministic: list[tuple[dict[str, Any], list[int]]] = []
-        parse_errors: list[str] = []
         for poll in polls:
             try:
                 choices = parse_poll_message(message, poll)
-            except PollError as exc:
-                parse_errors.append(str(exc))
+            except PollError:
                 continue
             if choices is not None:
                 deterministic.append((poll, choices))
@@ -627,27 +650,29 @@ class LumielleNexus(Star):
                 "kind": "ambiguity",
                 "message": f"这条回复可能对应多个投票（{labels}），请回复“投票 <投票ID> <选项>”。",
             }
-        if parse_errors and is_poll_semantic_candidate(message, polls):
-            return {"handled": True, "kind": "error", "message": parse_errors[0]}
         if not is_poll_semantic_candidate(message, polls):
             return {"handled": False, "kind": "no_match"}
 
-        lexical = []
-        folded = message.casefold()
-        for poll in polls:
-            aliases = self._poll_aliases(poll)
-            if any(alias and alias in folded for alias in aliases):
-                lexical.append(poll)
-        if len(lexical) > 1:
-            ids = "、".join(item["id"] for item in lexical)
-            return {
-                "handled": True,
-                "kind": "ambiguity",
-                "message": f"这条回复可能对应多个投票（{ids}），请回复“投票 <投票ID> <选项>”。",
-            }
-        if len(lexical) != 1:
-            return {"handled": True, "kind": "ambiguity", "message": "请使用“投票 <投票ID> <选项>”明确指定投票。"}
-        poll = lexical[0]
+        if len(polls) == 1:
+            poll = polls[0]
+        else:
+            lexical = []
+            folded = normalize_poll_reply(message)
+            for poll in polls:
+                aliases = self._poll_aliases(poll)
+                if any(alias and alias in folded for alias in aliases):
+                    lexical.append(poll)
+            if len(lexical) == 1:
+                poll = lexical[0]
+            else:
+                if is_explicit_poll_signal(message):
+                    ids = "、".join(item["id"] for item in lexical) or "多个进行中的投票"
+                    return {
+                        "handled": True,
+                        "kind": "ambiguity",
+                        "message": f"无法确定目标投票（{ids}），请回复“投票 <投票ID> <选项>”。",
+                    }
+                return {"handled": False, "kind": "no_match"}
         status, choices = await self._semantic_poll_vote(
             poll, message, str(event.get_sender_id()),
         )
@@ -657,11 +682,7 @@ class LumielleNexus(Star):
                 return {"handled": True, "kind": "success"}
             except PollError as exc:
                 return {"handled": True, "kind": "error", "message": str(exc)}
-        if status == "not_vote":
-            return {"handled": False, "kind": "not_vote"}
-        if status == "ambiguous":
-            return {"handled": True, "kind": "ambiguity", "message": "无法确定你的投票选择，请使用编号、完整标签或 reply key。"}
-        return {"handled": True, "kind": "error", "message": "暂时无法判断这条投票回复，请使用编号、完整标签或 reply key。"}
+        return {"handled": False, "kind": "not_vote"}
 
     @staticmethod
     def _payload(task: dict[str, Any]) -> dict[str, Any]:
