@@ -37,6 +37,7 @@ if __package__:
         member_display_name,
         member_role,
         next_interval_occurrence,
+        resolve_collection_chase_message,
         is_group_admin_member,
         parse_collection_checkpoint_response,
         validate_collection_checkpoint_candidate,
@@ -71,6 +72,7 @@ else:
         member_display_name,
         member_role,
         next_interval_occurrence,
+        resolve_collection_chase_message,
         is_group_admin_member,
         parse_collection_checkpoint_response,
         validate_collection_checkpoint_candidate,
@@ -1184,7 +1186,7 @@ class LumielleNexus(Star):
         event: AstrMessageEvent,
         task_id: str = "",
         group: str = "",
-        refresh: bool = True,
+        refresh: bool = False,
     ) -> str:
         allowed, message, effective_group = await self._authorized_collection_control(event, group)
         if not allowed:
@@ -1484,8 +1486,21 @@ class LumielleNexus(Star):
         snapshot = await self.manager.prepare_collection_checkpoint(task_id, cutoff, reason)
         if not snapshot["messages"] or not snapshot["payload"].get("ai_extraction"):
             await self.manager.advance_collection_checkpoint(task_id, snapshot)
-            return {"snapshot": snapshot, "llm_called": False, "applied": []}
-        candidate = await self._generate_collection_checkpoint_candidate(snapshot)
+            return {
+                "snapshot": snapshot,
+                "llm_called": False,
+                "applied": [],
+                "rejected": [],
+                "analysis_incomplete": False,
+                "analysis_error": None,
+            }
+        try:
+            candidate = await self._generate_collection_checkpoint_candidate(snapshot)
+        except Exception as exc:
+            await self.manager.advance_collection_checkpoint(
+                task_id, snapshot, analysis_error=str(exc),
+            )
+            raise
         applied = await self.manager.apply_collection_checkpoint(task_id, snapshot, candidate)
         return {"snapshot": snapshot, "llm_called": True, **applied}
 
@@ -1497,11 +1512,13 @@ class LumielleNexus(Star):
         )
         if status["task"]["status"] != "ACTIVE":
             return
-        await self._run_collection_checkpoint(
+        checkpoint_result = await self._run_collection_checkpoint(
             payload["collection_task_id"],
             payload.get("scheduled_run_at") or task["run_at"],
             payload.get("checkpoint_type", "chase"),
         )
+        if checkpoint_result.get("analysis_incomplete"):
+            return
         if payload.get("checkpoint_type") == "chase":
             collection = (await self.manager.collection_status(
                 payload["collection_task_id"], task["platform_id"],
@@ -1526,11 +1543,13 @@ class LumielleNexus(Star):
         analysis_incomplete = False
         analysis_error = ""
         try:
-            await self._run_collection_checkpoint(
+            checkpoint_result = await self._run_collection_checkpoint(
                 collection["id"],
                 collection_payload.get("deadline") or payload.get("scheduled_run_at") or task["run_at"],
                 "finalize",
             )
+            analysis_incomplete = bool(checkpoint_result.get("analysis_incomplete"))
+            analysis_error = str(checkpoint_result.get("analysis_error") or "")
         except Exception as exc:
             analysis_incomplete = True
             analysis_error = str(exc)
@@ -1562,7 +1581,10 @@ class LumielleNexus(Star):
         snapshot = await self.manager.stop_collection(collection["id"], task["platform_id"])
         export_path = None
         upload_error = ""
-        if collection_payload.get("auto_export"):
+        auto_export_skipped_reason = None
+        if collection_payload.get("auto_export") and analysis_incomplete:
+            auto_export_skipped_reason = "analysis_incomplete"
+        elif collection_payload.get("auto_export"):
             export_task = dict(snapshot["task"])
             export_task["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             try:
@@ -1586,6 +1608,7 @@ class LumielleNexus(Star):
             "auto_export": bool(collection_payload.get("auto_export")),
             "export_path": str(export_path) if export_path else None,
             "upload_error": upload_error or None,
+            "auto_export_skipped_reason": auto_export_skipped_reason,
             "analysis_incomplete": analysis_incomplete,
             "analysis_error": analysis_error or None,
         }
@@ -1774,12 +1797,15 @@ class LumielleNexus(Star):
         remaining_ids = [
             user_id for user_id in missing_ids if user_id not in mentioned_set
         ]
+        collection_chase_message = resolve_collection_chase_message(
+            collection_payload, payload,
+        )
         if remaining_ids:
             await deliver_mention_batches(
                 remaining_ids,
                 send_batch,
                 save_progress,
-                payload["message"],
+                collection_chase_message,
                 mentioned_ids,
             )
         interval = int(payload.get("repeat_interval_minutes") or 0)
@@ -1794,7 +1820,7 @@ class LumielleNexus(Star):
                 await self.manager.schedule_collection_chase(
                     collection["id"],
                     next_run,
-                    payload["message"],
+                    collection_chase_message,
                     interval,
                     task["platform_id"],
                     task["creator_id"],
@@ -2288,14 +2314,14 @@ class LumielleNexus(Star):
         event: AstrMessageEvent,
         task_id: str = "",
         group: str = "",
-        refresh: bool = True,
+        refresh: bool = False,
     ) -> str:
-        """查看信息收集任务的提交人数、群成员数、未提交人数和状态；默认会先对 cursor 后的新 workflow messages 做一次增量 refresh。可用 task_id、group 或当前会话中的 Collection 线索定位；只能由私聊 operator 或当前群 QQ 群主/管理员调用。
+        """查看信息收集任务的提交人数、群成员数、未提交人数和状态；默认只读，不执行 checkpoint。只有显式 refresh=true 才会对 cursor 后的新 workflow messages 做一次增量 refresh。可用 task_id、group 或当前会话中的 Collection 线索定位；只能由私聊 operator 或当前群 QQ 群主/管理员调用。
 
         Args:
             task_id(string): 可选的收集任务 ID，例如 C-20260909-001。
             group(string): 可选的已绑定群别名；群内调用时只能是当前群。
-            refresh(boolean): 是否先执行一次增量 checkpoint，默认 true；无新增消息时不会调用 LLM。
+            refresh(boolean): 是否先执行一次增量 checkpoint，默认 false；只有显式 true 才会调用 checkpoint。
         """
         return await self._collection_status(event, task_id, group, refresh)
 

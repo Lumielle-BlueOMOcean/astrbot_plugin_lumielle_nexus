@@ -2,7 +2,7 @@
 
 > 一个面向 AstrBot + QQ 的跨会话群事务编排插件。
 
-[![Version](https://img.shields.io/badge/version-0.8.1-7c5cff.svg)](metadata.yaml)
+[![Version](https://img.shields.io/badge/version-0.8.2-7c5cff.svg)](metadata.yaml)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.25.5%2C%3C5-4b8bbe.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![Platform](https://img.shields.io/badge/platform-aiocqhttp%20%2F%20OneBot%20v11-12a594.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
@@ -11,7 +11,7 @@
 
 | 项目 | 当前版本 |
 | --- | --- |
-| Version | `0.8.1` |
+| Version | `0.8.2` |
 | AstrBot | `>=4.25.5,<5` |
 | Platform | `aiocqhttp` / OneBot v11（QQ，主要面向 NapCat） |
 | License | MIT |
@@ -136,7 +136,7 @@ flowchart LR
 返校时间：10月7日下午3点
 ```
 
-两种消息都会先留下任务事实。标准字段格式会立即写入；自然语言不会在每条群消息到达时调用 LLM，而是在启用 `ai_extraction` 且到达 checkpoint、截止收尾或 operator 查询状态时批量理解。
+两种消息都会先留下任务事实。标准字段格式会立即写入；自然语言不会在每条群消息到达时调用 LLM，而是在启用 `ai_extraction` 且到达 checkpoint、截止收尾或 operator 显式请求 `refresh=true` 时批量理解。
 
 ### Checkpoint 时间和成本模型
 
@@ -146,7 +146,7 @@ flowchart LR
       0 LLM            only delta         📊 XLSX
 ```
 
-例如 19:00 已分析到 cursor `#120`，20:00 只处理 `#121+`。私聊询问“目前统计怎么样？”会执行一次增量 checkpoint；如果没有新消息，则为 `0` 次 LLM 调用。checkpoint 受消息数、字符数和分片数限制，避免无限增长的上下文。
+例如 19:00 已分析到 cursor `#120`，20:00 只处理 `#121+`。普通私聊询问“目前统计怎么样？”默认只读；只有明确要求 refresh 时才执行一次增量 checkpoint；如果没有新消息，则为 `0` 次 LLM 调用。checkpoint 受消息数、字符数和分片数限制，避免无限增长的上下文。
 
 ## 🪪 成员身份
 

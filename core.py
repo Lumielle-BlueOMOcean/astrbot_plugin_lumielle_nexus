@@ -39,6 +39,11 @@ COLLECTION_CHECKPOINT_MAX_TOTAL_CHARS = 50000
 COLLECTION_CHECKPOINT_CHUNK_CHARS = 20000
 COLLECTION_CHECKPOINT_MAX_CHUNKS = 3
 COLLECTION_CHECKPOINT_TIMEOUT_SECONDS = 60
+CHECKPOINT_REJECTED_LIMIT = 20
+CONFIRMATION_FIELDS = {
+    "收到确认", "确认收到", "是否收到", "收到", "回执确认", "确认回执",
+}
+CONFIRMATION_REPLIES = {"收到", "已收到", "确认", "已确认", "确认收到", "收到确认"}
 
 
 def utc_now_iso() -> str:
@@ -530,6 +535,12 @@ def parse_collection_submission(
         value = match.group(2).strip()
         if label in normalized and value:
             result[normalized[label]] = value
+    if not result and len(normalized) == 1:
+        field = next(iter(normalized.values()))
+        if field.casefold() in CONFIRMATION_FIELDS:
+            reply = re.sub(r"[。.!！!?？,，;；、]+$", "", str(raw_message).strip())
+            if reply in CONFIRMATION_REPLIES:
+                result[field] = "已收到"
     return result
 
 
@@ -710,29 +721,48 @@ def validate_collection_checkpoint_candidate(
     messages_by_user: dict[str, list[str]],
 ) -> dict[str, Any]:
     """Validate a batch response and keep evidence tied to its own sender."""
-    result: dict[str, Any] = {"members": [], "rejected": []}
+    result: dict[str, Any] = {
+        "members": [],
+        "rejected": [],
+        "resolved_user_ids": [],
+        "unresolved_user_ids": [],
+    }
+    resolved_users: set[str] = set()
+    unresolved_users: set[str] = set()
+
+    def reject(item: dict[str, Any], user_id: str = "") -> None:
+        if user_id:
+            item = {"user_id": user_id, **item}
+            unresolved_users.add(user_id)
+        result["rejected"].append(item)
+
     if not isinstance(candidate, dict) or not isinstance(candidate.get("members"), list):
-        result["rejected"].append({"reason": "members_not_array"})
-        return result
+        reject({"reason": "members_not_array"})
+        candidate_members: list[Any] = []
+    else:
+        candidate_members = candidate["members"]
     seen_users: set[str] = set()
-    for member in candidate["members"]:
+    for member in candidate_members:
         if not isinstance(member, dict):
-            result["rejected"].append({"reason": "member_not_object"})
+            reject({"reason": "member_not_object"})
             continue
         user_id = str(member.get("user_id") or "").strip()
         if not user_id or user_id not in messages_by_user:
-            result["rejected"].append({"user_id": user_id, "reason": "unknown_user"})
+            reject({"reason": "unknown_user"}, user_id)
             continue
         if user_id in seen_users:
-            result["rejected"].append({"user_id": user_id, "reason": "duplicate_user"})
+            reject({"reason": "duplicate_user"}, user_id)
             continue
         seen_users.add(user_id)
         status = member.get("status")
         if status not in {"ok", "ambiguous", "no_data"}:
-            result["rejected"].append({"user_id": user_id, "reason": "invalid_status"})
+            reject({"reason": "invalid_status"}, user_id)
+            continue
+        if status == "no_data":
+            resolved_users.add(user_id)
             continue
         if status != "ok":
-            result["rejected"].append({"user_id": user_id, "reason": status})
+            reject({"reason": status}, user_id)
             continue
         validation = validate_ai_extraction_candidate(
             {"status": "ok", "items": member.get("items")},
@@ -744,10 +774,56 @@ def validate_collection_checkpoint_candidate(
                 "user_id": user_id,
                 "items": validation["accepted"],
             })
-        result["rejected"].extend(
-            {"user_id": user_id, **item} for item in validation["rejected"]
-        )
+        for item in validation["rejected"]:
+            reject(item, user_id)
+        if validation["accepted"] and not validation["rejected"]:
+            resolved_users.add(user_id)
+        else:
+            unresolved_users.add(user_id)
+
+    for user_id in messages_by_user:
+        if user_id not in seen_users:
+            reject({"reason": "missing_member_result"}, user_id)
+
+    result["resolved_user_ids"] = [
+        user_id for user_id in messages_by_user if user_id in resolved_users
+    ]
+    result["unresolved_user_ids"] = [
+        user_id for user_id in messages_by_user if user_id in unresolved_users
+    ]
     return result
+
+
+def checkpoint_diagnostics(
+    snapshot: dict[str, Any],
+    applied_user_ids: list[str],
+    rejected: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rejection_counts: dict[str, int] = {}
+    for item in rejected:
+        reason = str(item.get("reason") or "unknown")
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+    return {
+        "reason": str(snapshot.get("reason") or "manual"),
+        "message_count": len(snapshot.get("messages") or []),
+        "applied_user_ids": list(applied_user_ids),
+        "rejection_counts": rejection_counts,
+        "rejected": [dict(item) for item in rejected[:CHECKPOINT_REJECTED_LIMIT]],
+    }
+
+
+def default_collection_chase_message(title: str) -> str:
+    clean_title = str(title or "信息收集").strip() or "信息收集"
+    return f"请还未完成「{clean_title}」的同学尽快回复。"
+
+
+def resolve_collection_chase_message(
+    collection_payload: dict[str, Any], chase_payload: dict[str, Any],
+) -> str:
+    message = str(chase_payload.get("message") or "").strip()
+    if message:
+        return message
+    return default_collection_chase_message(str(collection_payload.get("title") or "信息收集"))
 
 
 def parse_collection_checkpoint_response(text: str) -> dict[str, Any]:
@@ -1990,6 +2066,7 @@ class TaskManager:
                         "kind": "collection_checkpoint",
                         "collection_task_id": task["id"],
                         "checkpoint_type": "chase",
+                        "message": default_collection_chase_message(title),
                         "scheduled_run_at": chase_dt.isoformat(timespec="seconds"),
                     },
                 )
@@ -2289,13 +2366,25 @@ class TaskManager:
             if task is None or task["status"] not in {"ACTIVE", "PROCESSING"}:
                 raise ValueError("Collection 已不再处于可 checkpoint 状态")
             result = self._task_result(task)
+            incomplete = bool(str(analysis_error or "").strip())
+            current_cursor = int(result.get("analysis_cursor_id") or 0)
+            rejection = (
+                [{"reason": "analysis_error"}] if incomplete else []
+            )
             result.update({
-                "analysis_cursor_id": int(snapshot.get("next_cursor_id") or 0),
+                "analysis_cursor_id": current_cursor if incomplete else int(
+                    snapshot.get("next_cursor_id") or 0
+                ),
                 "last_checkpoint_at": utc_now_iso(),
                 "checkpoint_count": int(result.get("checkpoint_count") or 0) + 1,
+                "analysis_incomplete": incomplete,
+                "analysis_error": str(analysis_error)[:1000] if incomplete else None,
+                "last_checkpoint": checkpoint_diagnostics(snapshot, [], rejection),
             })
-            if analysis_error:
-                result.update({"analysis_incomplete": True, "analysis_error": str(analysis_error)[:1000]})
+            if incomplete and str(snapshot.get("reason")) == "chase":
+                result["chase_suppressed_reason"] = "analysis_incomplete"
+            elif not incomplete:
+                result.pop("chase_suppressed_reason", None)
             return self.storage.update_task(
                 task["id"], result=result, updated_at=utc_now_iso(),
             )
@@ -2349,17 +2438,30 @@ class TaskManager:
                 )
                 applied_ids.append(user_id)
             result = self._task_result(task)
+            rejected = validation["rejected"]
+            analysis_incomplete = bool(rejected)
+            current_cursor = int(result.get("analysis_cursor_id") or 0)
             result.update({
-                "analysis_cursor_id": int(snapshot.get("next_cursor_id") or 0),
+                "analysis_cursor_id": current_cursor if analysis_incomplete else int(
+                    snapshot.get("next_cursor_id") or 0
+                ),
                 "last_checkpoint_at": utc_now_iso(),
                 "checkpoint_count": int(result.get("checkpoint_count") or 0) + 1,
-                "analysis_incomplete": False,
+                "analysis_incomplete": analysis_incomplete,
+                "analysis_error": None,
+                "last_checkpoint": checkpoint_diagnostics(snapshot, applied_ids, rejected),
             })
+            if analysis_incomplete and str(snapshot.get("reason")) == "chase":
+                result["chase_suppressed_reason"] = "analysis_incomplete"
+            elif not analysis_incomplete:
+                result.pop("chase_suppressed_reason", None)
             self.storage.update_task(task["id"], result=result, updated_at=utc_now_iso())
             return {
                 "applied": applied_ids,
-                "rejected": validation["rejected"],
+                "rejected": rejected,
                 "cursor_id": result["analysis_cursor_id"],
+                "analysis_incomplete": analysis_incomplete,
+                "analysis_error": result["analysis_error"],
             }
 
     async def apply_missing_default(
@@ -2626,7 +2728,7 @@ class TaskManager:
             payload = json.loads(collection["payload"])
             title = str(payload.get("title") or collection["group_alias"])
             clean_message = str(message or "").strip() or (
-                f"以下同学尚未完成「{title}」，请及时提交。"
+                default_collection_chase_message(title)
             )
             run_at_iso = run_at_dt.isoformat(timespec="seconds")
             return self.storage.create_child_reminder(
