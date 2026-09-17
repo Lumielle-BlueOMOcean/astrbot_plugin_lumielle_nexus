@@ -591,6 +591,77 @@ class PollServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["kind"], "ambiguity")
         self.assertEqual(self.storage.list_poll_ballots("P-20260917-001"), [])
 
+    async def test_single_choice_cardinality_error_is_reported_without_llm(self):
+        main_module = _load_main_module()
+        poll = await self._create(ai_provider_id="provider-1")
+        calls = []
+
+        class Context:
+            async def llm_generate(self, **_kwargs):
+                calls.append(True)
+
+        class Event:
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_group_id(self):
+                return "123456789"
+
+            def get_message_str(self):
+                return "1 2"
+
+            def get_sender_id(self):
+                return "1011"
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.storage = self.storage
+        plugin.context = Context()
+        result = await plugin._handle_poll_message(Event())
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["kind"], "error")
+        self.assertIn("单选投票只能选择一个选项", result["message"])
+        self.assertEqual(calls, [])
+        self.assertEqual(self.storage.list_poll_ballots(poll["id"]), [])
+
+    async def test_max_choices_error_is_reported_without_llm(self):
+        main_module = _load_main_module()
+        poll = await self._create(
+            multiple_choice=True,
+            max_choices=2,
+            reply_keys=["abc", "def", "ghi"],
+            ai_provider_id="provider-1",
+        )
+        calls = []
+
+        class Context:
+            async def llm_generate(self, **_kwargs):
+                calls.append(True)
+
+        class Event:
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_group_id(self):
+                return "123456789"
+
+            def get_message_str(self):
+                return "abc def ghi"
+
+            def get_sender_id(self):
+                return "1012"
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.storage = self.storage
+        plugin.context = Context()
+        result = await plugin._handle_poll_message(Event())
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["kind"], "error")
+        self.assertIn("最多选择 2 个选项", result["message"])
+        self.assertEqual(calls, [])
+        self.assertEqual(self.storage.list_poll_ballots(poll["id"]), [])
+
     async def test_poll_control_uses_operator_and_group_admin_authorization(self):
         main_module = _load_main_module()
 

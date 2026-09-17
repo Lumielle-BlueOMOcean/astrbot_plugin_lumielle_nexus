@@ -629,10 +629,12 @@ class LumielleNexus(Star):
             }
 
         deterministic: list[tuple[dict[str, Any], list[int]]] = []
+        deterministic_errors: list[tuple[dict[str, Any], PollError]] = []
         for poll in polls:
             try:
                 choices = parse_poll_message(message, poll)
-            except PollError:
+            except PollError as exc:
+                deterministic_errors.append((poll, exc))
                 continue
             if choices is not None:
                 deterministic.append((poll, choices))
@@ -649,6 +651,18 @@ class LumielleNexus(Star):
                 "handled": True,
                 "kind": "ambiguity",
                 "message": f"这条回复可能对应多个投票（{labels}），请回复“投票 <投票ID> <选项>”。",
+            }
+        if not deterministic and len(deterministic_errors) == 1:
+            return {
+                "handled": True,
+                "kind": "error",
+                "message": str(deterministic_errors[0][1]),
+            }
+        if not deterministic and len(deterministic_errors) > 1:
+            return {
+                "handled": True,
+                "kind": "ambiguity",
+                "message": "这条回复可能对应多个投票，请使用“投票 <投票ID> <选项>”。",
             }
         if not is_poll_semantic_candidate(message, polls):
             return {"handled": False, "kind": "no_match"}
