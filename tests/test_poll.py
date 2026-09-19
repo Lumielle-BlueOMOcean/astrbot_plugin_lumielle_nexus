@@ -125,6 +125,44 @@ class PollServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("public_url", poll)
         self.assertEqual(self.storage.get_poll(poll["id"])["title"], poll["title"])
 
+    async def test_create_accepts_up_to_fifty_options(self):
+        options = [f"选项 {index}" for index in range(1, 51)]
+        poll = await self._create(options=options)
+        self.assertEqual(len(poll["options"]), 50)
+
+    async def test_create_poll_can_mention_all_in_announcement(self):
+        main_module = _load_main_module()
+        calls = []
+
+        class Event:
+            unified_msg_origin = "aiocqhttp:FriendMessage:operator"
+
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_sender_id(self):
+                return "operator"
+
+        class FakeAdapter:
+            async def send_group_text(self, group_id, text):
+                calls.append(("text", group_id, text))
+
+            async def send_group_at_all(self, group_id, text):
+                calls.append(("at-all", group_id, text))
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.poll_service = self.service
+        plugin.manager = types.SimpleNamespace(timezone_name="Asia/Shanghai")
+        plugin._poll_authorize_group = lambda *_args: _async_value((True, "", "班群"))
+        plugin._adapter = lambda _event: FakeAdapter()
+        result = await plugin._create_poll(
+            Event(), "班群", "投票", ["甲", "乙"],
+            semantic_fallback=False, mention_all=True,
+        )
+
+        self.assertIn("已创建投票", result)
+        self.assertEqual([call[0] for call in calls], ["at-all"])
+
     async def test_single_choice_vote_and_result_aggregation(self):
         poll = await self._create(reply_keys=["a", "b", "c"])
         receipt = await self.service.cast_vote(poll["id"], [2], "1001")

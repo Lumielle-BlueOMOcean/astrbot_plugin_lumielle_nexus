@@ -2,7 +2,7 @@
 
 > 一个面向 AstrBot + QQ 的跨会话群事务编排插件。
 
-[![Version](https://img.shields.io/badge/version-0.10.0-7c5cff.svg)](metadata.yaml)
+[![Version](https://img.shields.io/badge/version-0.11.0-7c5cff.svg)](metadata.yaml)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.25.5%2C%3C5-4b8bbe.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![Platform](https://img.shields.io/badge/platform-aiocqhttp%20%2F%20OneBot%20v11-12a594.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
@@ -11,7 +11,7 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| Version | `0.10.0` |
+| Version | `0.11.0` |
 | AstrBot | `>=4.25.5,<5` |
 | Platform | `aiocqhttp` / OneBot v11（QQ，主要面向 NapCat） |
 | License | MIT |
@@ -73,7 +73,7 @@ Poll 不依赖网页、公网端口、QQ OAuth 或浏览器 Cookie。创建后�
 也可回复：投票 P-20260918-001 15
 ```
 
-支持单选、多选、2–20 个选项、截止时间、是否允许改票、手动结束/取消和截止后自动公布结果。确定性解析永远优先；只有 Poll 明确候选且创建时保留了 Provider ID 时，才会最多调用一次受限语义判断。语义判断失败不会写入投票。
+支持单选、多选、2–50 个选项、截止时间、是否允许改票、创建公告时可选 @全体、手动结束/取消和截止后自动公布结果。确定性解析永远优先；只有 Poll 明确候选且创建时保留了 Provider ID 时，才会最多调用一次受限语义判断。语义判断失败不会写入投票。
 
 ## 🔄 Collection 工作流
 

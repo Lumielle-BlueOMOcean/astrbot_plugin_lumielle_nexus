@@ -26,6 +26,9 @@ class PollClosedError(PollError):
     """Raised when a vote arrives after the poll is no longer open."""
 
 
+POLL_MAX_OPTIONS = 50
+
+
 _REPLY_SPLITTER = re.compile(r"[\s,，、/|;；+]+")
 _FORBIDDEN_REPLY_CHARS = set(",，、/|;；+")
 _SEMANTIC_INTENTS = ("我选", "我投", "还是选", "就选", "更想", "倾向", "我觉得")
@@ -64,8 +67,8 @@ def _validated_reply_keys(options: list[str], reply_keys: list[str] | None) -> l
 
 
 def _build_options(options: list[str], reply_keys: list[str] | None) -> list[dict[str, Any]]:
-    if not isinstance(options, list) or not 2 <= len(options) <= 20:
-        raise PollError("投票必须有 2 到 20 个选项。")
+    if not isinstance(options, list) or not 2 <= len(options) <= POLL_MAX_OPTIONS:
+        raise PollError(f"投票必须有 2 到 {POLL_MAX_OPTIONS} 个选项。")
     labels: list[str] = []
     seen_labels: set[str] = set()
     for option in options:

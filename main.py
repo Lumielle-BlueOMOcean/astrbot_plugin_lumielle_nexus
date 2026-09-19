@@ -346,6 +346,7 @@ class LumielleNexus(Star):
         auto_publish_result: bool = True,
         reply_keys: list[str] | None = None,
         semantic_fallback: bool = True,
+        mention_all: bool = False,
     ) -> str:
         allowed, message, effective_group = await self._poll_authorize_group(event, group)
         if not allowed:
@@ -382,7 +383,11 @@ class LumielleNexus(Star):
             )
             announcement = self._poll_announcement(poll)
             try:
-                await self._adapter(event).send_group_text(poll["group_id"], announcement)
+                adapter = self._adapter(event)
+                if mention_all:
+                    await adapter.send_group_at_all(poll["group_id"], announcement)
+                else:
+                    await adapter.send_group_text(poll["group_id"], announcement)
                 await self.poll_service.mark_announcement_sent(poll["id"])
             except Exception as exc:
                 await self.poll_service.record_error(poll["id"], str(exc))
@@ -2898,13 +2903,14 @@ class LumielleNexus(Star):
         auto_publish_result: bool = True,
         reply_keys: list[str] | None = None,
         semantic_fallback: bool = True,
+        mention_all: bool = False,
     ) -> str:
         """创建并发布一个原生 QQ 群消息投票。只有用户明确要求创建、发起或发布投票时调用；创建后会向目标群发送选项和回复说明。只能由私聊 operator 或当前群 QQ 群主/管理员调用。
 
         Args:
             group(string): 已绑定群别名或群号；群内只能是当前群。
             title(string): 投票标题，1 到 200 个字符。
-            options(list[string]): 2 到 20 个选项。
+            options(list[string]): 2 到 50 个选项。
             description(string): 可选说明，最多 1000 个字符。
             deadline(string): 可选截止时间，按插件时区解释且必须在未来。
             multiple_choice(boolean): 是否多选，默认 false。
@@ -2913,11 +2919,12 @@ class LumielleNexus(Star):
             auto_publish_result(boolean): 截止后是否自动向群公布结果，默认 true。
             reply_keys(list[string]): 可选的自定义回复 key，与 options 一一对应；留空使用 1、2、3……。
             semantic_fallback(boolean): 确定性解析失败后是否允许最多一次受限语义判断，默认 true。
+            mention_all(boolean): 是否在发布公告时 @全体成员，默认 false。
         """
         return await self._create_poll(
             event, group, title, options, description, deadline,
             multiple_choice, max_choices, allow_change, auto_publish_result,
-            reply_keys, semantic_fallback,
+            reply_keys, semantic_fallback, mention_all,
         )
 
     @filter.llm_tool(name="nexus_list_polls")

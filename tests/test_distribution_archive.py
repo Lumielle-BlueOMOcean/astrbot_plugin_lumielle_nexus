@@ -53,6 +53,7 @@ class DistributionArchiveTests(unittest.TestCase):
         self.assertNotIn("AGENTS.md", files)
         self.assertFalse(any(path.startswith("docs/") for path in files))
         self.assertFalse(any(path.startswith("tests/") for path in files))
+        self.assertFalse(any(path.startswith(".github/") for path in files))
 
         longest_relative_path = max(files, key=len)
         github_archive_root = (
