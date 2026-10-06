@@ -354,10 +354,11 @@ class StorageMigrationTests(unittest.TestCase):
                 "qq-main", "123", "m1", "20001", "张三", "旧归档",
                 "2026-09-09T02:00:00+00:00", "2026-09-09T02:00:00+00:00",
             ))
-            self.assertIsNone(storage.insert_group_message(
+            duplicate = storage.insert_group_message(
                 "qq-main", "123", "m1", "20001", "张三", "重复归档",
                 "2026-09-09T02:00:00+00:00", "2026-09-09T02:00:00+00:00",
-            ))
+            )
+            self.assertEqual(duplicate["id"], 1)
             visible = {task["id"] for task in storage.list_tasks("qq-main")}
             all_tasks = {task["id"] for task in storage.list_tasks("qq-main", include_children=True)}
             self.assertIn("D-parent", visible)
@@ -690,10 +691,23 @@ class ArchiveSummaryRelayTests(unittest.IsolatedAsyncioTestCase):
         self.storage.close()
         self.temp_dir.cleanup()
 
-    async def test_archive_is_opt_in_and_upserts_duplicate_source_ids(self):
+    async def test_archive_defaults_on_and_explicit_off_is_persistent(self):
+        first = await self.manager.archive_group_message(
+            "qq-main", "123456789", "20001", "张三", "默认开启", source_message_id="m0",
+        )
+        self.assertIsNotNone(first)
+        status = await self.manager.archive_status("班群", "qq-main")
+        self.assertTrue(status["enabled"])
+        self.assertEqual(status["setting_source"], "default")
+
+        await self.manager.set_archive("班群", False, "qq-main")
         self.assertIsNone(await self.manager.archive_group_message(
-            "qq-main", "123456789", "20001", "张三", "未开启", source_message_id="m0",
+            "qq-main", "123456789", "20001", "张三", "关闭后不保存", source_message_id="m-off",
         ))
+        saved = await self.manager.archive_group_message(
+            "qq-main", "123456789", "20001", "张三", "关键词：实验报告", source_message_id="m1",
+        )
+        self.assertIsNone(saved)
         await self.manager.set_archive("班群", True, "qq-main")
         saved = await self.manager.archive_group_message(
             "qq-main", "123456789", "20001", "张三", "关键词：实验报告", source_message_id="m1",
@@ -702,15 +716,15 @@ class ArchiveSummaryRelayTests(unittest.IsolatedAsyncioTestCase):
         duplicate = await self.manager.archive_group_message(
             "qq-main", "123456789", "20001", "张三", "重复投递", source_message_id="m1",
         )
-        self.assertIsNone(duplicate)
-        self.assertEqual((await self.manager.archive_status("班群", "qq-main"))["count"], 1)
+        self.assertEqual(duplicate["id"], saved["id"])
+        self.assertEqual((await self.manager.archive_status("班群", "qq-main"))["count"], 2)
         await self.manager.set_archive("班群", False, "qq-main")
         await self.manager.archive_group_message(
             "qq-main", "123456789", "20002", "李四", "关闭后不保存", source_message_id="m2",
         )
         status = await self.manager.archive_status("班群", "qq-main")
         self.assertFalse(status["enabled"])
-        self.assertEqual(status["count"], 1)
+        self.assertEqual(status["count"], 2)
 
     async def test_archive_truncates_empty_messages_searches_local_time_and_prunes(self):
         await self.manager.set_archive("班群", True, "qq-main")
@@ -988,13 +1002,7 @@ class ArchiveSummaryRelayTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertLessEqual(len(context.calls), core_module.SUMMARY_MAX_CHUNKS + 1)
 
-    async def test_weekly_summary_requires_archive_and_skips_when_later_disabled(self):
-        with self.assertRaisesRegex(ValueError, "尚未开启消息归档"):
-            await self.manager.create_weekly_summary(
-                "班群", 7, "22:00", 7, "", "provider-1", "10001", "origin",
-                "qq-main", now=datetime(2026, 9, 7, 12, tzinfo=timezone.utc),
-            )
-        await self.manager.set_archive("班群", True, "qq-main")
+    async def test_weekly_summary_uses_default_history_and_skips_when_later_disabled(self):
         parent = await self.manager.create_weekly_summary(
             "班群", 7, "22:00", 7, "", "provider-1", "10001", "origin",
             "qq-main", now=datetime(2026, 9, 7, 12, tzinfo=timezone.utc),
@@ -1012,6 +1020,14 @@ class ArchiveSummaryRelayTests(unittest.IsolatedAsyncioTestCase):
         next_run = datetime.fromisoformat(self.storage.get_task(parent["id"])["run_at"])
         children = await self.manager.materialize_due_schedules(next_run + timedelta(seconds=1))
         self.assertEqual(len(children), 1)
+
+    async def test_weekly_summary_rejects_explicitly_disabled_history(self):
+        await self.manager.set_archive("班群", False, "qq-main")
+        with self.assertRaisesRegex(ValueError, "尚未开启消息归档"):
+            await self.manager.create_weekly_summary(
+                "班群", 7, "22:00", 7, "", "provider-1", "10001", "origin",
+                "qq-main", now=datetime(2026, 9, 7, 12, tzinfo=timezone.utc),
+            )
 
     async def test_update_task_result_merges_existing_summary_cache(self):
         task = self.storage.create_task(
@@ -1288,7 +1304,7 @@ class PluginContractTests(unittest.TestCase):
         metadata = (self.ROOT / "metadata.yaml").read_text(encoding="utf-8")
         config = json.loads((self.ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         self.assertIn("name: astrbot_plugin_lumielle_nexus", metadata)
-        self.assertIn('version: "0.11.0"', metadata)
+        self.assertIn('version: "0.12.0"', metadata)
         self.assertIn('astrbot_version: ">=4.25.5,<5"', metadata)
         self.assertIn("- aiocqhttp", metadata)
         self.assertEqual(config["operator_ids"]["default"], [])
@@ -1298,6 +1314,10 @@ class PluginContractTests(unittest.TestCase):
         self.assertTrue(config["collection_ack"]["default"])
         self.assertEqual(config["archive_max_message_chars"]["default"], 4000)
         self.assertEqual(config["archive_retention_days"]["default"], 90)
+        self.assertTrue(config["history_default_enabled"]["default"])
+        self.assertEqual(config["history_sync_max_pages"]["default"], 100)
+        self.assertEqual(config["history_sync_max_messages"]["default"], 5000)
+        self.assertEqual(config["history_sync_time_budget_seconds"]["default"], 10)
         self.assertFalse(config["moderation_enabled"]["default"])
         self.assertEqual(config["moderator_ids"]["default"], [])
         self.assertNotIn("poll_web_enabled", config)
@@ -1332,6 +1352,7 @@ class PluginContractTests(unittest.TestCase):
             "nexus_set_archive",
             "nexus_archive_status",
             "nexus_search_messages",
+            "nexus_search_group_history",
             "nexus_clear_archive",
             "nexus_summarize_group",
             "nexus_create_weekly_summary",
@@ -1356,7 +1377,8 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("1=Monday", main)
         self.assertIn("/nexus task", main)
         readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("0.11.0", readme)
+        self.assertIn("0.12.0 — Unreleased", readme)
+        self.assertIn("历史默认开启", readme)
         self.assertIn("默认关闭", readme)
         self.assertIn("prepare", readme)
         self.assertIn("confirm", readme)
@@ -1414,6 +1436,26 @@ class PluginContractTests(unittest.TestCase):
 
 
 class QQAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_group_history_adapter_normalizes_message_envelope(self):
+        from qq_adapter import QQAdapter
+
+        calls = []
+
+        class Client:
+            async def call_action(self, action, **kwargs):
+                calls.append((action, kwargs))
+                return {"data": {"messages": [{"message_id": 1}, "ignored"]}}
+
+        platform = SimpleNamespace(
+            meta=lambda: SimpleNamespace(name="aiocqhttp", id="qq-main"),
+            get_client=lambda: Client(),
+        )
+        adapter = QQAdapter(SimpleNamespace(get_platform_inst=lambda _id: platform), "qq-main")
+        self.assertEqual(await adapter.get_group_msg_history("123", 77, 40), [{"message_id": 1}])
+        self.assertEqual(calls, [("get_group_msg_history", {
+            "group_id": 123, "message_seq": 77, "count": 40,
+        })])
+
     async def test_adapter_routes_required_onebot_actions(self):
         from qq_adapter import QQAdapter
 

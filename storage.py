@@ -84,12 +84,17 @@ class Storage:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_id TEXT NOT NULL,
                     source_message_id TEXT,
+                    source_message_seq TEXT,
                     sender_id TEXT NOT NULL,
                     sender_name TEXT NOT NULL,
                     message_text TEXT NOT NULL,
                     sent_at TEXT NOT NULL,
                     captured_at TEXT NOT NULL,
                     deterministic_handled INTEGER NOT NULL DEFAULT 0,
+                    analysis_state TEXT NOT NULL DEFAULT 'pending',
+                    analysis_attempts INTEGER NOT NULL DEFAULT 0,
+                    last_analysis_error TEXT,
+                    analyzed_at TEXT,
                     FOREIGN KEY (task_id) REFERENCES tasks(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_workflow_messages_task
@@ -129,6 +134,8 @@ class Storage:
                     platform_id TEXT NOT NULL,
                     group_id TEXT NOT NULL,
                     source_message_id TEXT,
+                    message_seq TEXT,
+                    source TEXT NOT NULL DEFAULT 'live',
                     sender_id TEXT NOT NULL,
                     sender_name TEXT NOT NULL,
                     message_text TEXT NOT NULL,
@@ -142,6 +149,19 @@ class Storage:
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_group_messages_source
                     ON group_messages(platform_id, group_id, source_message_id)
                     WHERE source_message_id IS NOT NULL;
+
+                CREATE TABLE IF NOT EXISTS group_history_sync_state (
+                    platform_id TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    covered_from TEXT,
+                    covered_to TEXT,
+                    oldest_seq TEXT,
+                    history_exhausted INTEGER NOT NULL DEFAULT 0,
+                    coverage_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    last_sync_at TEXT,
+                    last_sync_error TEXT,
+                    PRIMARY KEY (platform_id, group_id)
+                );
 
                 CREATE TABLE IF NOT EXISTS member_sets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,7 +196,55 @@ class Storage:
                 self._conn.execute("ALTER TABLE tasks ADD COLUMN parent_id TEXT")
             if "occurrence_key" not in columns:
                 self._conn.execute("ALTER TABLE tasks ADD COLUMN occurrence_key TEXT")
+            workflow_columns = {
+                row[1] for row in self._conn.execute(
+                    "PRAGMA table_info(workflow_messages)",
+                ).fetchall()
+            }
+            workflow_migrations = {
+                "source_message_seq": "TEXT",
+                "analysis_state": "TEXT NOT NULL DEFAULT 'pending'",
+                "analysis_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "last_analysis_error": "TEXT",
+                "analyzed_at": "TEXT",
+            }
+            for column, definition in workflow_migrations.items():
+                if column not in workflow_columns:
+                    self._conn.execute(
+                        f"ALTER TABLE workflow_messages ADD COLUMN {column} {definition}",
+                    )
+            self._conn.execute(
+                "UPDATE workflow_messages SET analysis_state = 'deterministic' "
+                "WHERE deterministic_handled = 1 AND analysis_state = 'pending'",
+            )
+            group_message_columns = {
+                row[1] for row in self._conn.execute(
+                    "PRAGMA table_info(group_messages)",
+                ).fetchall()
+            }
+            for column, definition in {
+                "message_seq": "TEXT",
+                "source": "TEXT NOT NULL DEFAULT 'live'",
+            }.items():
+                if column not in group_message_columns:
+                    self._conn.execute(
+                        f"ALTER TABLE group_messages ADD COLUMN {column} {definition}",
+                    )
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id)")
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_workflow_messages_seq "
+                "ON workflow_messages(task_id, source_message_seq) "
+                "WHERE source_message_seq IS NOT NULL",
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_workflow_messages_pending "
+                "ON workflow_messages(task_id, analysis_state, sent_at, id)",
+            )
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_group_messages_seq "
+                "ON group_messages(platform_id, group_id, message_seq) "
+                "WHERE message_seq IS NOT NULL",
+            )
             self._conn.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_parent_occurrence
@@ -928,7 +996,7 @@ class Storage:
                 active = self._conn.execute(
                     """
                     SELECT id FROM tasks
-                    WHERE type = 'COLLECTION' AND status = 'ACTIVE'
+                    WHERE type = 'COLLECTION' AND status IN ('ACTIVE', 'PROCESSING')
                       AND platform_id = ? AND group_id = ?
                     LIMIT 1
                     """,
@@ -1314,6 +1382,27 @@ class Storage:
             ).fetchone()
         return self._row(row)
 
+    def get_collection_for_group(self, platform_id: str, group_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE type = 'COLLECTION' AND status IN ('ACTIVE', 'PROCESSING')
+                  AND platform_id = ? AND group_id = ?
+                ORDER BY CASE status WHEN 'ACTIVE' THEN 0 ELSE 1 END, created_at DESC
+                LIMIT 1
+                """,
+                (str(platform_id), str(group_id)),
+            ).fetchone()
+        return self._row(row)
+
+    def list_processing_collections(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tasks WHERE type = 'COLLECTION' AND status = 'PROCESSING' ORDER BY updated_at",
+            ).fetchall()
+        return self._rows(rows)
+
     def transition_collection_to_processing(
         self,
         task_id: str,
@@ -1329,11 +1418,21 @@ class Storage:
                 ).fetchone()
                 if task is None:
                     raise KeyError(f"任务不存在：{task_id}")
-                if task["type"] != "COLLECTION" or task["status"] != "ACTIVE":
+                if task["type"] != "COLLECTION" or task["status"] not in {"ACTIVE", "PROCESSING"}:
                     raise ValueError(f"任务当前不能结束：{task['status']}")
+                if task["status"] == "PROCESSING":
+                    self._conn.commit()
+                    return self._row(task)
+                try:
+                    current_result = json.loads(task["result"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    current_result = {}
+                if not isinstance(current_result, dict):
+                    current_result = {}
+                current_result["processing_cutoff"] = str(updated_at)
                 self._conn.execute(
-                    "UPDATE tasks SET status = 'PROCESSING', updated_at = ? WHERE id = ?",
-                    (updated_at, task_id),
+                    "UPDATE tasks SET status = 'PROCESSING', result = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(current_result, ensure_ascii=False), updated_at, task_id),
                 )
                 self._conn.execute(
                     """
@@ -1415,19 +1514,23 @@ class Storage:
         sent_at: str,
         captured_at: str,
         deterministic_handled: bool = False,
+        source_message_seq: str | int | None = None,
     ) -> dict[str, Any] | None:
+        analysis_state = "deterministic" if deterministic_handled else "pending"
         with self._lock:
             cursor = self._conn.execute(
                 """
                 INSERT OR IGNORE INTO workflow_messages
-                    (task_id, source_message_id, sender_id, sender_name,
-                     message_text, sent_at, captured_at, deterministic_handled)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (task_id, source_message_id, source_message_seq, sender_id, sender_name,
+                     message_text, sent_at, captured_at, deterministic_handled, analysis_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    str(task_id), source_message_id, str(sender_id),
+                    str(task_id), source_message_id,
+                    str(source_message_seq) if source_message_seq is not None else None,
+                    str(sender_id),
                     str(sender_name), str(message_text), str(sent_at),
-                    str(captured_at), int(bool(deterministic_handled)),
+                    str(captured_at), int(bool(deterministic_handled)), analysis_state,
                 ),
             )
             self._conn.commit()
@@ -1457,10 +1560,123 @@ class Storage:
             ).fetchall()
         return self._rows(rows)
 
+    def list_pending_workflow_messages(
+        self, task_id: str, cutoff: str, limit: int,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM workflow_messages
+                WHERE task_id = ? AND analysis_state IN ('pending', 'error')
+                  AND sent_at <= ?
+                ORDER BY sent_at, id LIMIT ?
+                """,
+                (str(task_id), str(cutoff), int(limit)),
+            ).fetchall()
+        return self._rows(rows)
+
+    def workflow_message_counts(self, task_id: str) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT analysis_state, COUNT(*) AS count
+                FROM workflow_messages WHERE task_id = ? GROUP BY analysis_state
+                """,
+                (str(task_id),),
+            ).fetchall()
+        return {str(row["analysis_state"]): int(row["count"]) for row in rows}
+
+    def pending_workflow_sender_ids(self, task_id: str) -> set[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT DISTINCT sender_id FROM workflow_messages
+                WHERE task_id = ? AND analysis_state IN ('pending', 'error')
+                """,
+                (str(task_id),),
+            ).fetchall()
+        return {str(row["sender_id"]) for row in rows}
+
+    def count_pending_workflow_messages(
+        self, task_id: str, cutoff: str | None = None,
+    ) -> int:
+        query = """
+            SELECT COUNT(*) AS count FROM workflow_messages
+            WHERE task_id = ? AND analysis_state IN ('pending', 'error')
+        """
+        params: list[Any] = [str(task_id)]
+        if cutoff is not None:
+            query += " AND sent_at <= ?"
+            params.append(str(cutoff))
+        with self._lock:
+            row = self._conn.execute(query, params).fetchone()
+        return int(row["count"])
+
+    def disposition_workflow_messages(
+        self,
+        message_ids: Iterable[int],
+        states_by_sender: dict[str, str],
+        errors_by_sender: dict[str, str] | None = None,
+        updated_at: str = "",
+    ) -> None:
+        ids = [int(message_id) for message_id in message_ids]
+        if not ids:
+            return
+        errors_by_sender = errors_by_sender or {}
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT id, sender_id FROM workflow_messages WHERE id IN ({','.join('?' for _ in ids)})",
+                ids,
+            ).fetchall()
+            for row in rows:
+                sender_id = str(row["sender_id"])
+                state = states_by_sender.get(sender_id, "pending")
+                if state not in {"pending", "deterministic", "resolved", "ignored", "error"}:
+                    raise ValueError(f"无效 workflow analysis_state：{state}")
+                terminal = state in {"deterministic", "resolved", "ignored"}
+                self._conn.execute(
+                    """
+                    UPDATE workflow_messages
+                    SET analysis_state = ?,
+                        analysis_attempts = analysis_attempts + 1,
+                        last_analysis_error = ?,
+                        analyzed_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        state,
+                        None if terminal else str(errors_by_sender.get(sender_id) or "")[:1000] or None,
+                        str(updated_at) if terminal else None,
+                        int(row["id"]),
+                    ),
+                )
+                if terminal:
+                    self._conn.execute(
+                        "UPDATE workflow_messages SET deterministic_handled = 1 WHERE id = ?",
+                        (int(row["id"]),),
+                    )
+            self._conn.commit()
+
+    def workflow_analysis_cursor(self, task_id: str) -> int:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, analysis_state FROM workflow_messages WHERE task_id = ? ORDER BY id",
+                (str(task_id),),
+            ).fetchall()
+        cursor = 0
+        for row in rows:
+            if row["analysis_state"] not in {"deterministic", "resolved", "ignored"}:
+                break
+            cursor = int(row["id"])
+        return cursor
+
     def mark_workflow_message_handled(self, message_id: int) -> None:
         with self._lock:
             self._conn.execute(
-                "UPDATE workflow_messages SET deterministic_handled = 1 WHERE id = ?",
+                """UPDATE workflow_messages
+                   SET deterministic_handled = 1, analysis_state = 'deterministic',
+                       analyzed_at = COALESCE(analyzed_at, captured_at)
+                   WHERE id = ?""",
                 (int(message_id),),
             )
             self._conn.commit()
@@ -1584,27 +1800,72 @@ class Storage:
         message_text: str,
         sent_at: str,
         archived_at: str,
+        message_seq: str | int | None = None,
+        source: str = "live",
     ) -> dict[str, Any] | None:
         with self._lock:
             cursor = self._conn.execute(
                 """
                 INSERT OR IGNORE INTO group_messages
-                    (platform_id, group_id, source_message_id, sender_id, sender_name,
-                     message_text, sent_at, archived_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (platform_id, group_id, source_message_id, message_seq, source,
+                     sender_id, sender_name, message_text, sent_at, archived_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(platform_id), str(group_id), source_message_id,
+                    str(message_seq) if message_seq is not None else None,
+                    str(source),
                     str(sender_id), str(sender_name), str(message_text),
                     str(sent_at), str(archived_at),
                 ),
             )
             self._conn.commit()
             if cursor.rowcount == 0:
-                return None
+                row = self._conn.execute(
+                    """
+                    SELECT * FROM group_messages
+                    WHERE platform_id = ? AND group_id = ?
+                      AND ((? IS NOT NULL AND source_message_id = ?)
+                        OR (? IS NOT NULL AND message_seq = ?))
+                    ORDER BY id LIMIT 1
+                    """,
+                    (
+                        str(platform_id), str(group_id), source_message_id,
+                        source_message_id,
+                        str(message_seq) if message_seq is not None else None,
+                        str(message_seq) if message_seq is not None else None,
+                    ),
+                ).fetchone()
+                return self._row(row)
             row = self._conn.execute(
                 "SELECT * FROM group_messages WHERE id = ?",
                 (cursor.lastrowid,),
+            ).fetchone()
+        return self._row(row)
+
+    def get_group_message_by_identity(
+        self,
+        platform_id: str,
+        group_id: str,
+        source_message_id: str | None = None,
+        message_seq: str | int | None = None,
+    ) -> dict[str, Any] | None:
+        clauses = []
+        params: list[Any] = [str(platform_id), str(group_id)]
+        if source_message_id is not None:
+            clauses.append("source_message_id = ?")
+            params.append(str(source_message_id))
+        if message_seq is not None:
+            clauses.append("message_seq = ?")
+            params.append(str(message_seq))
+        if not clauses:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM group_messages WHERE platform_id = ? AND group_id = ? AND ("
+                + " OR ".join(clauses)
+                + ") ORDER BY id LIMIT 1",
+                params,
             ).fetchone()
         return self._row(row)
 
@@ -1621,14 +1882,69 @@ class Storage:
                 """,
                 (str(platform_id), str(group_id)),
             ).fetchone()
+            sync = self._conn.execute(
+                "SELECT * FROM group_history_sync_state WHERE platform_id = ? AND group_id = ?",
+                (str(platform_id), str(group_id)),
+            ).fetchone()
         return {
-            "enabled": bool(setting and setting["enabled"]),
+            "enabled": bool(setting["enabled"]) if setting else None,
+            "setting_source": "override" if setting else "default",
             "enabled_at": setting["enabled_at"] if setting else None,
             "updated_at": setting["updated_at"] if setting else None,
             "count": int(row["count"]),
             "earliest": row["earliest"],
             "latest": row["latest"],
+            "sync": self._row(sync),
         }
+
+    def get_group_history_sync_state(
+        self, platform_id: str, group_id: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM group_history_sync_state WHERE platform_id = ? AND group_id = ?",
+                (str(platform_id), str(group_id)),
+            ).fetchone()
+        return self._row(row)
+
+    def update_group_history_sync_state(
+        self,
+        platform_id: str,
+        group_id: str,
+        *,
+        covered_from: str | None,
+        covered_to: str | None,
+        oldest_seq: str | int | None,
+        history_exhausted: bool,
+        coverage_status: str,
+        last_sync_at: str,
+        last_sync_error: str | None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO group_history_sync_state
+                    (platform_id, group_id, covered_from, covered_to, oldest_seq,
+                     history_exhausted, coverage_status, last_sync_at, last_sync_error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform_id, group_id) DO UPDATE SET
+                    covered_from = excluded.covered_from,
+                    covered_to = excluded.covered_to,
+                    oldest_seq = excluded.oldest_seq,
+                    history_exhausted = excluded.history_exhausted,
+                    coverage_status = excluded.coverage_status,
+                    last_sync_at = excluded.last_sync_at,
+                    last_sync_error = excluded.last_sync_error
+                """,
+                (
+                    str(platform_id), str(group_id), covered_from, covered_to,
+                    str(oldest_seq) if oldest_seq is not None else None,
+                    int(bool(history_exhausted)), str(coverage_status),
+                    str(last_sync_at), last_sync_error,
+                ),
+            )
+            self._conn.commit()
+        return self.get_group_history_sync_state(platform_id, group_id)
 
     def count_group_messages(
         self, platform_id: str, group_id: str, start_at: str | None = None,
@@ -1676,6 +1992,8 @@ class Storage:
         start_at: str | None,
         end_at: str | None,
         limit: int,
+        sender: str = "",
+        before_id: int | None = None,
     ) -> list[dict[str, Any]]:
         clauses = ["platform_id = ?", "group_id = ?"]
         params: list[Any] = [str(platform_id), str(group_id)]
@@ -1694,6 +2012,16 @@ class Storage:
         if end_at:
             clauses.append("sent_at <= ?")
             params.append(end_at)
+        if sender:
+            escaped_sender = (
+                str(sender).replace("\\", "\\\\")
+                .replace("%", "\\%").replace("_", "\\_")
+            )
+            clauses.append("(sender_id LIKE ? ESCAPE '\\' OR sender_name LIKE ? ESCAPE '\\')")
+            params.extend([f"%{escaped_sender}%", f"%{escaped_sender}%"])
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(int(before_id))
         params.append(int(limit))
         with self._lock:
             rows = self._conn.execute(
@@ -1708,19 +2036,54 @@ class Storage:
 
     def prune_group_messages(self, cutoff: str) -> int:
         with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM group_messages WHERE sent_at < ?", (str(cutoff),),
-            )
-            self._conn.commit()
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                affected = self._conn.execute(
+                    "SELECT DISTINCT platform_id, group_id FROM group_messages WHERE sent_at < ?",
+                    (str(cutoff),),
+                ).fetchall()
+                cursor = self._conn.execute(
+                    "DELETE FROM group_messages WHERE sent_at < ?", (str(cutoff),),
+                )
+                for row in affected:
+                    self._conn.execute(
+                        """
+                        UPDATE group_history_sync_state
+                        SET covered_from = ?, oldest_seq = NULL,
+                            history_exhausted = 0, coverage_status = 'PARTIAL'
+                        WHERE platform_id = ? AND group_id = ?
+                          AND covered_from IS NOT NULL AND covered_from < ?
+                        """,
+                        (str(cutoff), row["platform_id"], row["group_id"], str(cutoff)),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
         return int(cursor.rowcount)
 
     def clear_group_messages(self, platform_id: str, group_id: str) -> int:
         with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM group_messages WHERE platform_id = ? AND group_id = ?",
-                (str(platform_id), str(group_id)),
-            )
-            self._conn.commit()
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                cursor = self._conn.execute(
+                    "DELETE FROM group_messages WHERE platform_id = ? AND group_id = ?",
+                    (str(platform_id), str(group_id)),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE group_history_sync_state
+                    SET covered_from = NULL, covered_to = NULL, oldest_seq = NULL,
+                        history_exhausted = 0, coverage_status = 'UNKNOWN',
+                        last_sync_at = NULL, last_sync_error = NULL
+                    WHERE platform_id = ? AND group_id = ?
+                    """,
+                    (str(platform_id), str(group_id)),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
         return int(cursor.rowcount)
 
     def claim_relay(

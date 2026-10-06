@@ -75,6 +75,27 @@ class QQAdapter:
             raise QQAdapterError("OneBot 返回的群成员列表格式不可识别")
         return [member for member in result if isinstance(member, dict)]
 
+    async def get_group_msg_history(
+        self,
+        group_id: str,
+        message_seq: int = 0,
+        count: int = 100,
+    ) -> list[dict[str, Any]]:
+        result = await self._call(
+            "get_group_msg_history",
+            group_id=self._qq_id(group_id),
+            message_seq=int(message_seq),
+            count=max(1, min(int(count), 100)),
+        )
+        if isinstance(result, dict):
+            if isinstance(result.get("data"), dict):
+                result = result["data"]
+        if isinstance(result, dict):
+            result = result.get("messages")
+        if not isinstance(result, list):
+            raise QQAdapterError("OneBot 返回的群历史格式不可识别")
+        return [message for message in result if isinstance(message, dict)]
+
     async def get_group_member_info(
         self, group_id: str, user_id: str,
     ) -> dict[str, Any]:

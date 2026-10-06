@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from openpyxl import load_workbook
 
@@ -85,7 +86,68 @@ class Phase6CollectionTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(self.storage.get_task(task["id"])["payload"])
         self.assertEqual(payload["target_member_ids"], ["1001"])
 
-    async def test_checkpoint_message_cap_keeps_recent_rows_but_cursor_covers_batch(self):
+    async def test_collection_allowed_value_mapping_is_deterministic(self):
+        task = await self.manager.start_collection(
+            "班群", "返校", ["是否返校"], "", False,
+            "qq-main", "operator", "origin", now=self.now,
+        )
+        result = await self.manager.capture_collection_message(
+            task["id"], "1001", "张三", "已返校", source_message_id="return-1",
+            now=self.now + timedelta(minutes=1),
+        )
+        self.assertTrue(result["deterministic_handled"])
+        saved = self.storage.get_entry(task["id"], "1001")
+        self.assertEqual(json.loads(saved["parsed_data"]), {"是否返校": "已返校"})
+
+    async def test_pending_checkpoint_rows_are_oldest_first_and_resume_after_batch(self):
+        task = await self.manager.start_collection(
+            "班群", "返校", ["状态"], "", False,
+            "qq-main", "operator", "origin", ai_extraction=True,
+            ai_provider_id="provider-1", now=self.now,
+        )
+        for index in range(3):
+            await self.manager.capture_collection_message(
+                task["id"], "1001", "张三", f"消息 {index}",
+                source_message_id=f"resume-{index}", now=self.now + timedelta(minutes=1),
+            )
+        with mock.patch.object(core_module, "COLLECTION_CHECKPOINT_MAX_MESSAGES", 2):
+            first = await self.manager.prepare_collection_checkpoint(
+                task["id"], self.now + timedelta(minutes=1), "manual",
+            )
+            self.assertEqual([row["id"] for row in first["messages"]], [1, 2])
+            await self.manager.apply_collection_checkpoint(task["id"], first, {
+                "members": [
+                    {"user_id": "1001", "status": "no_data", "items": []},
+                ],
+            })
+            second = await self.manager.prepare_collection_checkpoint(
+                task["id"], self.now + timedelta(minutes=1), "manual",
+            )
+        self.assertEqual([row["id"] for row in second["messages"]], [3])
+        self.assertEqual(second["pending_message_count"], 1)
+
+    async def test_unresolved_rows_survive_restart_as_pending_evidence(self):
+        task = await self.manager.start_collection(
+            "班群", "返校", ["状态"], "", False,
+            "qq-main", "operator", "origin", ai_extraction=True,
+            ai_provider_id="provider-1", now=self.now,
+        )
+        captured = await self.manager.capture_collection_message(
+            task["id"], "1001", "张三", "我晚点回", source_message_id="pending-1",
+            now=self.now + timedelta(minutes=1),
+        )
+        snapshot = await self.manager.prepare_collection_checkpoint(
+            task["id"], self.now + timedelta(minutes=1), "manual",
+        )
+        await self.manager.apply_collection_checkpoint(task["id"], snapshot, {"members": []})
+        row = self.storage.list_workflow_messages(task["id"])[0]
+        self.assertEqual(row["analysis_state"], "error")
+        self.assertEqual(self.storage.count_pending_workflow_messages(task["id"]), 1)
+        self.assertEqual(self.storage.workflow_analysis_cursor(task["id"]), 0)
+        with self.assertRaisesRegex(ValueError, "未解决"):
+            await self.manager.complete_collection(task["id"], {})
+
+    async def test_checkpoint_message_cap_keeps_oldest_rows_pending_after_batch(self):
         task = await self.manager.start_collection(
             "班群", "返校", ["状态"], "", False,
             "qq-main", "operator", "origin", ai_extraction=True,
@@ -100,7 +162,50 @@ class Phase6CollectionTests(unittest.IsolatedAsyncioTestCase):
             task["id"], self.now + timedelta(minutes=1), "manual",
         )
         self.assertEqual(len(snapshot["messages"]), core_module.COLLECTION_CHECKPOINT_MAX_MESSAGES)
-        self.assertEqual(snapshot["next_cursor_id"], 501)
+        self.assertEqual(snapshot["messages"][0]["id"], 1)
+        self.assertEqual(snapshot["messages"][-1]["id"], 500)
+        self.assertEqual(snapshot["next_cursor_id"], 500)
+        self.assertEqual(snapshot["pending_message_count"], 501)
+
+    async def test_character_budget_keeps_omitted_messages_pending(self):
+        task = await self.manager.start_collection(
+            "班群", "返校", ["状态"], "", False,
+            "qq-main", "operator", "origin", ai_extraction=True,
+            ai_provider_id="provider-1", now=self.now,
+        )
+        for index in range(3):
+            await self.manager.capture_collection_message(
+                task["id"], "1001", "张三", f"{index}:" + "甲" * 17998,
+                source_message_id=f"budget-{index}",
+                now=self.now + timedelta(minutes=1),
+            )
+        snapshot = await self.manager.prepare_collection_checkpoint(
+            task["id"], self.now + timedelta(minutes=1), "manual",
+        )
+        self.assertEqual([row["id"] for row in snapshot["messages"]], [1, 2])
+        self.assertEqual(snapshot["pending_message_count"], 3)
+
+    async def test_status_tracks_pending_partial_and_complete_members(self):
+        stats = collection_member_stats(
+            [
+                {"user_id": "1001", "nickname": "张三"},
+                {"user_id": "1002", "nickname": "李四"},
+                {"user_id": "1003", "nickname": "王五"},
+                {"user_id": "1004", "nickname": "赵六"},
+            ],
+            [
+                {"sender_id": "1002", "parsed_data": '{"姓名":"李四"}'},
+                {"sender_id": "1003", "parsed_data": '{"姓名":"王五"}'},
+                {"sender_id": "1004", "parsed_data": '{"姓名":"赵六","学号":"4"}'},
+            ],
+            self_id="9000",
+            required_fields=["姓名", "学号"],
+            pending_ids={"1002"},
+        )
+        self.assertEqual(stats["no_response_ids"], {"1001"})
+        self.assertEqual(stats["pending_ids"], {"1002"})
+        self.assertEqual(stats["partial_ids"], {"1003"})
+        self.assertEqual(stats["complete_ids"], {"1004"})
 
     async def test_scoped_collection_resolution_does_not_fall_back_to_other_group(self):
         await self.manager.bind_group("社团群", "987654321", "qq-main", "operator")

@@ -146,12 +146,16 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
             async def get_login_info(self):
                 return {"user_id": "9000"}
 
+            async def get_group_msg_history(self, *_args, **_kwargs):
+                return []
+
             async def send_group_at_member_batch(self, group_id, user_ids, text):
                 self.calls.append((group_id, list(user_ids), text))
 
         plugin = object.__new__(main_module.LumielleNexus)
         plugin.context = types.SimpleNamespace()
         plugin.manager = self.manager
+        plugin.storage = self.storage
         with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
             try:
                 await plugin._execute_collection_chase(child, payload)
@@ -279,12 +283,16 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
             async def get_login_info(self):
                 return {"user_id": "9000"}
 
+            async def get_group_msg_history(self, *_args, **_kwargs):
+                return []
+
             async def send_group_at_member_batch(self, group_id, user_ids, text):
                 self.sent_batches.append((group_id, list(user_ids), text))
 
         plugin = object.__new__(main_module.LumielleNexus)
         plugin.context = types.SimpleNamespace()
         plugin.manager = self.manager
+        plugin.storage = self.storage
         plugin.data_dir = Path(self.temp_dir.name)
         with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
             await plugin._execute_collection_checkpoint(
@@ -302,6 +310,103 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("1001", stats["missing_ids"])
         self.assertEqual(FakeAdapter.sent_batches, [])
         self.assertNotEqual(json.loads(entry["parsed_data"]).get("收到确认"), "未收到")
+
+    async def test_history_reconciliation_resolves_return_reply_before_chase_and_finalize(self):
+        main_module = _load_main_module()
+        now = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=20)
+        collection = await self.manager.start_collection(
+            "班群", "返校统计", ["是否返校"], "", False,
+            "qq-main", "operator", "origin", ai_extraction=True,
+            ai_provider_id="provider-1",
+            chase_at=now + timedelta(minutes=10),
+            deadline=now + timedelta(hours=1),
+            missing_default_field="是否返校",
+            missing_default_value="未返校",
+            auto_export=True,
+            field_value_mappings={"是否返校": {"已返校": ["已返校"], "未返校": ["未返校"]}},
+            now=now,
+        )
+        chase = next(
+            child for child in self.storage.list_children(collection["id"])
+            if json.loads(child["payload"]).get("checkpoint_type") == "chase"
+        )
+        reply_at = now + timedelta(seconds=5)
+        messages = [{
+            "message_id": "history-return-a",
+            "message_seq": 200,
+            "time": reply_at.timestamp(),
+            "sender": {"user_id": "1001", "nickname": "A", "card": ""},
+            "raw_message": "已返校",
+        }]
+
+        class FakeAdapter:
+            sent_batches = []
+            uploaded = []
+
+            def __init__(self, _context, _platform_id):
+                pass
+
+            async def get_group_msg_history(self, _group_id, message_seq=0, reverse_order=True):
+                return messages if message_seq == 0 else []
+
+            async def get_login_info(self):
+                return {"user_id": "9000"}
+
+            async def get_group_member_list(self, _group_id):
+                return [
+                    {"user_id": "1001", "nickname": "A"},
+                    {"user_id": "1002", "nickname": "B"},
+                    {"user_id": "1003", "nickname": "C"},
+                    {"user_id": "9000", "nickname": "Bot"},
+                ]
+
+            async def send_group_at_member_batch(self, group_id, user_ids, text):
+                self.sent_batches.append((group_id, list(user_ids), text))
+
+            async def upload_private_file(self, user_id, path):
+                self.uploaded.append((user_id, Path(path)))
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.context = types.SimpleNamespace()
+        plugin.manager = self.manager
+        plugin.storage = self.storage
+        plugin.data_dir = Path(self.temp_dir.name)
+        chase_payload = json.loads(chase["payload"])
+        chase_payload["scheduled_run_at"] = datetime.now(timezone.utc).replace(
+            microsecond=0,
+        ).isoformat(timespec="seconds")
+        with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
+            await plugin._execute_collection_chase(chase, chase_payload)
+
+            self.assertEqual(len(FakeAdapter.sent_batches), 1)
+            self.assertEqual(FakeAdapter.sent_batches[0][1], ["1002", "1003"])
+            self.assertNotIn("1001", FakeAdapter.sent_batches[0][1])
+            entry = self.storage.get_entry(collection["id"], "1001")
+            self.assertEqual(json.loads(entry["parsed_data"]), {"是否返校": "已返校"})
+            diagnostics = json.loads(self.storage.get_task(collection["id"])["result"])
+            self.assertEqual(diagnostics["history_coverage"], "FULL")
+            self.assertEqual(diagnostics["last_chase"]["mentioned_user_ids"], ["1002", "1003"])
+
+            processing = await self.manager.stop_collection(collection["id"], "qq-main")
+            await self.manager.record_collection_diagnostics(
+                collection["id"], result_fields={"manual_stop": True, "force_export": True},
+            )
+            cutoff = self.manager._task_result(processing["task"])["processing_cutoff"]
+            await plugin._execute_collection_finalize(
+                {"id": "manual-finalize", "platform_id": "qq-main", "run_at": cutoff},
+                {
+                    "collection_task_id": collection["id"], "manual_stop": True,
+                    "force_export": True, "scheduled_run_at": cutoff,
+                },
+            )
+
+        final = await self.manager.collection_status(collection["id"], "qq-main")
+        final_entry = self.storage.get_entry(collection["id"], "1001")
+        self.assertEqual(final["task"]["status"], "COMPLETED")
+        self.assertEqual(json.loads(final_entry["parsed_data"]), {"是否返校": "已返校"})
+        self.assertNotEqual(json.loads(final_entry["parsed_data"])["是否返校"], "未返校")
+        self.assertEqual(len(FakeAdapter.uploaded), 1)
+        self.assertTrue(FakeAdapter.uploaded[0][1].exists())
 
     async def test_ambiguous_result_keeps_cursor_and_marks_incomplete(self):
         task, captured, result, saved = await self._checkpoint_with_candidate({
@@ -368,6 +473,78 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(saved["analysis_incomplete"])
         self.assertIsNone(saved["analysis_error"])
 
+    async def test_invalid_provider_status_is_repaired_once_then_resolved(self):
+        main_module = _load_main_module()
+        task = await self._ai_task()
+        await self.manager.capture_collection_message(
+            task["id"], "1001", "张三", "我7号回来", source_message_id="repair-success",
+        )
+
+        class Context:
+            def __init__(self):
+                self.responses = [
+                    {"members": [{"user_id": "1001", "status": "success", "items": []}]},
+                    {"members": [{"user_id": "1001", "status": "ok", "items": [{
+                        "field": "返校时间", "value": "7号", "evidence": "7号", "confidence": 0.99,
+                    }]}]},
+                ]
+                self.calls = []
+
+            async def llm_generate(self, **kwargs):
+                self.calls.append(kwargs)
+                return types.SimpleNamespace(
+                    completion_text=json.dumps(self.responses.pop(0), ensure_ascii=False),
+                )
+
+        context = Context()
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.context = context
+        plugin.manager = self.manager
+        plugin.storage = self.storage
+        result = await plugin._run_collection_checkpoint(
+            task["id"], datetime.now(timezone.utc), "manual",
+        )
+        self.assertEqual(len(context.calls), 2)
+        self.assertIn("FORMAT REPAIR", context.calls[1]["prompt"])
+        self.assertFalse(result["analysis_incomplete"])
+        self.assertEqual(self.storage.get_entry(task["id"], "1001")["parsed_data"], '{"返校时间": "7号"}')
+        self.assertEqual(self.storage.count_pending_workflow_messages(task["id"]), 0)
+
+    async def test_invalid_status_after_bounded_repair_preserves_evidence(self):
+        main_module = _load_main_module()
+        task = await self._ai_task()
+        captured = await self.manager.capture_collection_message(
+            task["id"], "1001", "张三", "我7号回来", source_message_id="repair-failure",
+        )
+
+        class Context:
+            def __init__(self):
+                self.calls = 0
+
+            async def llm_generate(self, **_kwargs):
+                self.calls += 1
+                return types.SimpleNamespace(completion_text=json.dumps({
+                    "members": [{"user_id": "1001", "status": "success", "items": []}],
+                }))
+
+        context = Context()
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.context = context
+        plugin.manager = self.manager
+        plugin.storage = self.storage
+        result = await plugin._run_collection_checkpoint(
+            task["id"], datetime.now(timezone.utc), "manual",
+        )
+        saved = json.loads(self.storage.get_task(task["id"])["result"])
+        row = self.storage.list_workflow_messages(task["id"])[0]
+        self.assertEqual(context.calls, 2)
+        self.assertTrue(result["analysis_incomplete"])
+        self.assertEqual(result["rejected"][0]["reason"], "invalid_status")
+        self.assertEqual(row["message_text"], "我7号回来")
+        self.assertEqual(row["analysis_state"], "error")
+        self.assertEqual(saved["analysis_cursor_id"], 0)
+        self.assertTrue(saved["analysis_incomplete"])
+
     async def test_collection_status_defaults_to_read_only(self):
         main_module = _load_main_module()
         self.assertIs(
@@ -381,7 +558,7 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
             False,
         )
 
-    async def test_incomplete_checkpoint_suppresses_chase(self):
+    async def test_chase_checkpoint_routes_to_unified_chase_path(self):
         main_module = _load_main_module()
 
         class FakeManager:
@@ -392,15 +569,12 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
 
         plugin = object.__new__(main_module.LumielleNexus)
         plugin.manager = FakeManager()
-        plugin._run_collection_checkpoint = mock.AsyncMock(return_value={
-            "analysis_incomplete": True,
-        })
         plugin._execute_collection_chase = mock.AsyncMock()
         await plugin._execute_collection_checkpoint(
             {"platform_id": "qq-main", "run_at": "2026-09-17T10:00:00+00:00"},
             {"collection_task_id": "C-1", "checkpoint_type": "chase"},
         )
-        plugin._execute_collection_chase.assert_not_awaited()
+        plugin._execute_collection_chase.assert_awaited_once()
 
     async def test_incomplete_finalize_skips_defaults_and_export(self):
         main_module = _load_main_module()
@@ -418,6 +592,15 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.default_calls = 0
                 self.completed = None
+                self.retries = []
+
+            @staticmethod
+            def _task_result(task):
+                try:
+                    result = json.loads(task.get("result") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    result = {}
+                return result if isinstance(result, dict) else {}
 
             async def collection_status(self, _task_id, _platform_id):
                 return {"task": collection, "entries": []}
@@ -433,6 +616,15 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
 
             async def complete_collection(self, _task_id, result):
                 self.completed = result
+
+            async def record_collection_diagnostics(self, *_args, **_kwargs):
+                return collection
+
+            async def schedule_collection_retry(self, *_args, **kwargs):
+                self.retries.append(kwargs)
+                return {"id": "R-retry"}
+
+            max_retry_count = 3
 
         class FakeAdapter:
             upload_calls = 0
@@ -453,6 +645,7 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
         plugin = object.__new__(main_module.LumielleNexus)
         plugin.context = types.SimpleNamespace()
         plugin.manager = manager
+        plugin.storage = self.storage
         plugin.data_dir = Path(self.temp_dir.name)
         plugin._run_collection_checkpoint = mock.AsyncMock(return_value={
             "analysis_incomplete": True,
@@ -467,7 +660,8 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(manager.default_calls, 0)
         export_mock.assert_not_called()
-        self.assertEqual(manager.completed["auto_export_skipped_reason"], "analysis_incomplete")
+        self.assertIsNone(manager.completed)
+        self.assertEqual(len(manager.retries), 1)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,29 @@
     "default": 90,
     "hint": "非 0 值运行时会限制在 7 到 3650 天之间。"
   },
+  "history_default_enabled": {
+    "type": "bool",
+    "description": "新绑定群及没有显式 archive override 的旧群是否默认保存群历史",
+    "default": true
+  },
+  "history_sync_max_pages": {
+    "type": "int",
+    "description": "单次 OneBot 群历史同步的最大页数",
+    "default": 100,
+    "hint": "运行时限制为 1 到 500 页。"
+  },
+  "history_sync_max_messages": {
+    "type": "int",
+    "description": "单次 OneBot 群历史同步最多处理的消息数",
+    "default": 5000,
+    "hint": "运行时限制为 100 到 50000 条。"
+  },
+  "history_sync_time_budget_seconds": {
+    "type": "int",
+    "description": "单次 OneBot 群历史同步的时间预算（秒）",
+    "default": 10,
+    "hint": "运行时限制为 1 到 60 秒。"
+  },
   "moderation_enabled": {
     "type": "bool",
     "description": "是否开启单成员群管理；默认关闭，开启后仍需 moderator_ids 或 AstrBot Admin",

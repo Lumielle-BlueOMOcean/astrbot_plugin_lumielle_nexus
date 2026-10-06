@@ -89,7 +89,7 @@ class Phase5StorageAndCheckpointTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await self.manager.prepare_collection_checkpoint(
             task["id"], datetime.now(timezone.utc), "manual",
         )
-        self.assertEqual(snapshot["cursor_id"], 0)
+        self.assertEqual(snapshot["cursor_id"], first["id"])
         self.assertEqual(snapshot["next_cursor_id"], second["id"])
         self.assertEqual([row["id"] for row in snapshot["messages"]], [second["id"]])
         self.assertNotEqual(first["id"], second["id"])
