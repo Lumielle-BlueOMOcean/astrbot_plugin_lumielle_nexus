@@ -145,6 +145,7 @@ class GroupHistoryTests(unittest.IsolatedAsyncioTestCase):
             }
             self.assertIn("source_message_seq", columns)
             self.assertIn("analysis_state", columns)
+            self.assertIn("no_data_recheck_attempts", columns)
             tables = {
                 row[0] for row in migrated._conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'",

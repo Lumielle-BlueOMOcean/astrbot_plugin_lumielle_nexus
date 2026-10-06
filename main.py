@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -751,6 +752,25 @@ class LumielleNexus(Star):
         return None
 
     @staticmethod
+    def _event_sent_at(event: AstrMessageEvent) -> datetime | None:
+        """Return AstrBot's source message time as aware UTC, when available."""
+        try:
+            message_obj = getattr(event, "message_obj", None)
+            raw_timestamp = (
+                message_obj.get("timestamp")
+                if isinstance(message_obj, dict)
+                else getattr(message_obj, "timestamp", None)
+            )
+            if raw_timestamp is None or isinstance(raw_timestamp, bool):
+                return None
+            timestamp = float(raw_timestamp)
+            if not math.isfinite(timestamp):
+                return None
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except Exception:
+            return None
+
+    @staticmethod
     def _event_message_seq(event: AstrMessageEvent) -> str | None:
         for attribute in ("message_seq", "seq"):
             value = getattr(event, attribute, None)
@@ -1133,7 +1153,10 @@ class LumielleNexus(Star):
         try:
             await self.manager.set_archive(group, enabled, self._platform_id(event))
             if enabled:
-                return f"已开启「{group}」消息归档。从现在开始记录新的文本消息，不会回溯开启前的历史。"
+                return (
+                    f"已开启「{group}」消息归档。实时归档从现在开始恢复；后续历史查询或 "
+                    "Collection reconciliation 仍可能通过 OneBot 有界回补此前可获取的群消息。"
+                )
             return f"已关闭「{group}」消息归档。之后不再新增归档，已有数据不会自动删除。"
         except (KeyError, ValueError) as exc:
             return f"设置归档失败：{exc}"
@@ -3007,6 +3030,7 @@ class LumielleNexus(Star):
             return
         group_id = str(event.get_group_id())
         message_text = str(event.get_message_str() or "")
+        sent_at = self._event_sent_at(event)
         try:
             await self.manager.archive_group_message(
                 self._platform_id(event),
@@ -3014,6 +3038,7 @@ class LumielleNexus(Star):
                 sender_id,
                 event.get_sender_name(),
                 message_text,
+                sent_at=sent_at,
                 source_message_id=self._event_source_message_id(event),
                 message_seq=self._event_message_seq(event),
                 source="live",
@@ -3027,6 +3052,7 @@ class LumielleNexus(Star):
                 sender_id,
                 event.get_sender_name(),
                 message_text,
+                sent_at=sent_at,
                 source_message_id=self._event_source_message_id(event),
                 source_message_seq=self._event_message_seq(event),
                 source="live",
@@ -3359,7 +3385,7 @@ class LumielleNexus(Star):
 
     @filter.llm_tool(name="nexus_stop_collection")
     async def nexus_stop_collection(self, event: AstrMessageEvent, task_id: str) -> str:
-        """结束信息收集，生成 XLSX，并尝试通过 QQ 私聊回传给任务创建者。文件回传失败不会回滚导出结果。只能由私聊 operator 或当前群 QQ 群主/管理员调用，群内只能结束当前群任务。
+        """停止接收新消息并启动最终 reconciliation/checkpoint。只有最终核对成功后 Collection 才会完成并导出 XLSX；若仍有 unresolved evidence，会保持 PROCESSING 并进行有界重试，不会强行完成。完成后尝试通过 QQ 私聊回传给任务创建者；文件回传失败不会回滚导出结果。只能由私聊 operator 或当前群 QQ 群主/管理员调用，群内只能结束当前群任务。
 
         Args:
             task_id(string): 要结束的收集任务 ID。

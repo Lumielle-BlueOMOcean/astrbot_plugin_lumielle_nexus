@@ -93,6 +93,7 @@ class Storage:
                     deterministic_handled INTEGER NOT NULL DEFAULT 0,
                     analysis_state TEXT NOT NULL DEFAULT 'pending',
                     analysis_attempts INTEGER NOT NULL DEFAULT 0,
+                    no_data_recheck_attempts INTEGER NOT NULL DEFAULT 0,
                     last_analysis_error TEXT,
                     analyzed_at TEXT,
                     FOREIGN KEY (task_id) REFERENCES tasks(id)
@@ -205,6 +206,7 @@ class Storage:
                 "source_message_seq": "TEXT",
                 "analysis_state": "TEXT NOT NULL DEFAULT 'pending'",
                 "analysis_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "no_data_recheck_attempts": "INTEGER NOT NULL DEFAULT 0",
                 "last_analysis_error": "TEXT",
                 "analyzed_at": "TEXT",
             }
@@ -1567,12 +1569,116 @@ class Storage:
             rows = self._conn.execute(
                 """
                 SELECT * FROM workflow_messages
-                WHERE task_id = ? AND analysis_state IN ('pending', 'error')
+                WHERE task_id = ? AND no_data_recheck_attempts = 0
+                  AND analysis_state IN ('pending', 'error')
                   AND sent_at <= ?
                 ORDER BY sent_at, id LIMIT ?
                 """,
                 (str(task_id), str(cutoff), int(limit)),
             ).fetchall()
+        return self._rows(rows)
+
+    def list_provisional_no_data_messages(
+        self,
+        task_id: str,
+        start_at: str,
+        cutoff: str,
+        limit: int,
+        *,
+        sender_ids: set[str] | None = None,
+        exclude_sender_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = [
+            "task_id = ?", "analysis_state = 'no_data'",
+            "no_data_recheck_attempts = 0", "sent_at >= ?", "sent_at <= ?",
+        ]
+        params: list[Any] = [str(task_id), str(start_at), str(cutoff)]
+        if sender_ids is not None:
+            normalized = sorted({str(item).strip() for item in sender_ids if str(item).strip()})
+            if not normalized:
+                return []
+            clauses.append(f"sender_id IN ({','.join('?' for _ in normalized)})")
+            params.extend(normalized)
+        excluded = sorted({str(item).strip() for item in (exclude_sender_ids or set()) if str(item).strip()})
+        if excluded:
+            clauses.append(f"sender_id NOT IN ({','.join('?' for _ in excluded)})")
+            params.extend(excluded)
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM workflow_messages WHERE {' AND '.join(clauses)} "
+                "ORDER BY sent_at, id LIMIT ?",
+                params,
+            ).fetchall()
+        return self._rows(rows)
+
+    def count_provisional_no_data_messages(
+        self,
+        task_id: str,
+        start_at: str,
+        cutoff: str,
+        *,
+        sender_ids: set[str] | None = None,
+        exclude_sender_ids: set[str] | None = None,
+    ) -> int:
+        clauses = [
+            "task_id = ?", "analysis_state = 'no_data'",
+            "no_data_recheck_attempts = 0", "sent_at >= ?", "sent_at <= ?",
+        ]
+        params: list[Any] = [str(task_id), str(start_at), str(cutoff)]
+        if sender_ids is not None:
+            normalized = sorted({str(item).strip() for item in sender_ids if str(item).strip()})
+            if not normalized:
+                return 0
+            clauses.append(f"sender_id IN ({','.join('?' for _ in normalized)})")
+            params.extend(normalized)
+        excluded = sorted({str(item).strip() for item in (exclude_sender_ids or set()) if str(item).strip()})
+        if excluded:
+            clauses.append(f"sender_id NOT IN ({','.join('?' for _ in excluded)})")
+            params.extend(excluded)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT COUNT(*) AS count FROM workflow_messages WHERE {' AND '.join(clauses)}",
+                params,
+            ).fetchone()
+        return int(row["count"])
+
+    def claim_no_data_rechecks(
+        self, message_ids: Iterable[int], claimed_at: str,
+    ) -> list[dict[str, Any]]:
+        ids = list(dict.fromkeys(int(message_id) for message_id in message_ids))
+        if not ids:
+            return []
+        claimed_ids: list[int] = []
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                for message_id in ids:
+                    cursor = self._conn.execute(
+                        """UPDATE workflow_messages
+                           SET analysis_state = 'error',
+                               no_data_recheck_attempts = 1,
+                               deterministic_handled = 0,
+                               last_analysis_error = 'no_data_recheck_in_progress',
+                               analyzed_at = ?
+                           WHERE id = ? AND analysis_state = 'no_data'
+                             AND no_data_recheck_attempts = 0""",
+                        (str(claimed_at), message_id),
+                    )
+                    if cursor.rowcount:
+                        claimed_ids.append(message_id)
+                if claimed_ids:
+                    rows = self._conn.execute(
+                        f"SELECT * FROM workflow_messages WHERE id IN "
+                        f"({','.join('?' for _ in claimed_ids)}) ORDER BY sent_at, id",
+                        claimed_ids,
+                    ).fetchall()
+                else:
+                    rows = []
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
         return self._rows(rows)
 
     def workflow_message_counts(self, task_id: str) -> dict[str, int]:
@@ -1631,9 +1737,9 @@ class Storage:
             for row in rows:
                 sender_id = str(row["sender_id"])
                 state = states_by_sender.get(sender_id, "pending")
-                if state not in {"pending", "deterministic", "resolved", "ignored", "error"}:
+                if state not in {"pending", "deterministic", "resolved", "no_data", "ignored", "error"}:
                     raise ValueError(f"无效 workflow analysis_state：{state}")
-                terminal = state in {"deterministic", "resolved", "ignored"}
+                terminal = state in {"deterministic", "resolved", "no_data", "ignored"}
                 self._conn.execute(
                     """
                     UPDATE workflow_messages
@@ -1665,7 +1771,7 @@ class Storage:
             ).fetchall()
         cursor = 0
         for row in rows:
-            if row["analysis_state"] not in {"deterministic", "resolved", "ignored"}:
+            if row["analysis_state"] not in {"deterministic", "resolved", "no_data", "ignored"}:
                 break
             cursor = int(row["id"])
         return cursor

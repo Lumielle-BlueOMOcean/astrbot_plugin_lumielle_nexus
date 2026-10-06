@@ -101,6 +101,48 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
         )
         return task, captured, result, json.loads(self.storage.get_task(task["id"])["result"])
 
+    def _group_listener(self, main_module):
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.manager = self.manager
+        plugin.storage = self.storage
+        plugin.collection_ack = False
+        plugin._handle_poll_message = mock.AsyncMock(return_value={"handled": False})
+        return plugin
+
+    @staticmethod
+    def _group_event(message, timestamp, message_id="timestamp-message"):
+        class Event:
+            unified_msg_origin = "aiocqhttp:GroupMessage:123456789"
+
+            def __init__(self):
+                self.message = message
+                self.message_obj = types.SimpleNamespace(
+                    timestamp=timestamp, message_id=message_id,
+                )
+
+            def get_sender_id(self):
+                return "1001"
+
+            def get_sender_name(self):
+                return "张三"
+
+            def get_self_id(self):
+                return "9000"
+
+            def get_group_id(self):
+                return "123456789"
+
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_message_str(self):
+                return self.message
+
+            def plain_result(self, value):
+                return value
+
+        return Event()
+
     async def test_new_checkpoint_child_persists_default_message(self):
         now = datetime(2026, 9, 17, 10, 0, tzinfo=timezone.utc)
         task = await self.manager.start_collection(
@@ -196,13 +238,298 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["deterministic_handled"])
         self.assertIsNone(self.storage.get_entry(task["id"], "1001"))
 
-    async def test_no_data_is_terminal_and_advances_cursor(self):
+    async def test_first_no_data_is_provisional_and_recheckable(self):
         task, captured, result, saved = await self._checkpoint_with_candidate({
             "members": [{"user_id": "1001", "status": "no_data", "items": []}],
-        })
+        }, message="我昨天晚上已经回学校了")
         self.assertEqual(result["rejected"], [])
         self.assertEqual(saved["analysis_cursor_id"], captured["id"])
         self.assertFalse(saved["analysis_incomplete"])
+        row = self.storage.list_workflow_messages(task["id"])[0]
+        self.assertEqual(row["analysis_state"], "no_data")
+        self.assertEqual(row["message_text"], "我昨天晚上已经回学校了")
+        self.assertIsNone(self.storage.get_entry(task["id"], "1001"))
+
+        recheck = await self.manager.prepare_collection_checkpoint(
+            task["id"], datetime.now(timezone.utc), "chase",
+        )
+        self.assertEqual([item["id"] for item in recheck["messages"]], [captured["id"]])
+        self.assertEqual(recheck["messages_by_user"]["1001"], ["我昨天晚上已经回学校了"])
+        claimed = self.storage.list_workflow_messages(task["id"])[0]
+        self.assertEqual(claimed["no_data_recheck_attempts"], 1)
+
+    async def test_chase_recheck_recovers_no_data_false_negative(self):
+        main_module = _load_main_module()
+        now = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=5)
+        collection = await self.manager.start_collection(
+            "班群", "返校统计", ["是否返校"], "", False,
+            "qq-main", "operator", "origin", ai_extraction=True,
+            ai_provider_id="provider-1", chase_at=now + timedelta(minutes=10),
+            deadline=now + timedelta(hours=1),
+            field_value_mappings={"是否返校": {"已返校": ["已返校"], "未返校": ["未返校"]}},
+            now=now,
+        )
+        await self.manager.capture_collection_message(
+            collection["id"], "1001", "张三", "我昨天晚上已经回学校了",
+            source_message_id="false-negative-reply", now=now + timedelta(seconds=1),
+        )
+
+        class Context:
+            def __init__(self):
+                self.responses = [
+                    {"members": [{"user_id": "1001", "status": "no_data", "items": []}]},
+                    {"members": [{"user_id": "1001", "status": "ok", "items": [{
+                        "field": "是否返校", "value": "已返校",
+                        "evidence": "已经回学校了", "confidence": 0.99,
+                    }]}]},
+                ]
+                self.calls = 0
+
+            async def llm_generate(self, **_kwargs):
+                self.calls += 1
+                return types.SimpleNamespace(
+                    completion_text=json.dumps(self.responses.pop(0), ensure_ascii=False),
+                )
+
+        class FakeAdapter:
+            sent_batches = []
+
+            def __init__(self, *_args):
+                pass
+
+            async def get_group_member_list(self, _group_id):
+                return [
+                    {"user_id": "1001", "nickname": "张三"},
+                    {"user_id": "1002", "nickname": "李四"},
+                    {"user_id": "9000", "nickname": "Bot"},
+                ]
+
+            async def send_group_at_member_batch(self, group_id, user_ids, text):
+                self.sent_batches.append((group_id, list(user_ids), text))
+
+        context = Context()
+        plugin = self._group_listener(main_module)
+        plugin.context = context
+        plugin._reconcile_collection_history = mock.AsyncMock(return_value=(
+            FakeAdapter(), "9000", {"coverage_status": "FULL"},
+        ))
+        await plugin._run_collection_checkpoint(
+            collection["id"], now + timedelta(minutes=1), "manual",
+        )
+        self.assertEqual(
+            self.storage.list_workflow_messages(collection["id"])[0]["analysis_state"],
+            "no_data",
+        )
+        chase = next(
+            child for child in self.storage.list_children(collection["id"])
+            if json.loads(child["payload"]).get("checkpoint_type") == "chase"
+        )
+        chase_payload = json.loads(chase["payload"])
+        chase_payload["scheduled_run_at"] = (now + timedelta(minutes=2)).isoformat()
+        with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
+            await plugin._execute_collection_chase(chase, chase_payload)
+
+        entry = self.storage.get_entry(collection["id"], "1001")
+        self.assertEqual(json.loads(entry["parsed_data"]), {"是否返校": "已返校"})
+        self.assertEqual(context.calls, 2)
+        self.assertTrue(FakeAdapter.sent_batches)
+        self.assertNotIn("1001", [
+            user_id for _group_id, user_ids, _text in FakeAdapter.sent_batches
+            for user_id in user_ids
+        ])
+
+    async def test_second_no_data_is_bounded_and_finalize_can_apply_default(self):
+        main_module = _load_main_module()
+        now = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=5)
+        collection = await self.manager.start_collection(
+            "班群", "返校统计", ["是否返校"], "", False,
+            "qq-main", "operator", "origin", ai_extraction=True,
+            ai_provider_id="provider-1", missing_default_field="是否返校",
+            missing_default_value="未返校",
+            field_value_mappings={"是否返校": {"已返校": ["已返校"], "未返校": ["未返校"]}},
+            now=now,
+        )
+        await self.manager.capture_collection_message(
+            collection["id"], "1001", "张三", "今晚吃什么",
+            source_message_id="irrelevant-reply", now=now + timedelta(seconds=1),
+        )
+
+        class Context:
+            calls = 0
+
+            async def llm_generate(self, **_kwargs):
+                self.calls += 1
+                return types.SimpleNamespace(completion_text=json.dumps({
+                    "members": [{"user_id": "1001", "status": "no_data", "items": []}],
+                }))
+
+        class FakeAdapter:
+            def __init__(self, *_args):
+                pass
+
+            async def get_group_member_list(self, _group_id):
+                return [{"user_id": "1001", "nickname": "张三"},
+                        {"user_id": "9000", "nickname": "Bot"}]
+
+            async def get_login_info(self):
+                return {"user_id": "9000"}
+
+        context = Context()
+        plugin = self._group_listener(main_module)
+        plugin.context = context
+        plugin._reconcile_collection_history = mock.AsyncMock(return_value=(
+            FakeAdapter(), "9000", {"coverage_status": "FULL"},
+        ))
+        await plugin._run_collection_checkpoint(
+            collection["id"], now + timedelta(minutes=1), "manual",
+        )
+        stopped = await self.manager.stop_collection(collection["id"], "qq-main")
+        cutoff = self.manager._task_result(stopped["task"])["processing_cutoff"]
+        with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
+            await plugin._execute_collection_finalize(
+                {"id": "finalize", "platform_id": "qq-main", "run_at": cutoff},
+                {"collection_task_id": collection["id"], "manual_stop": True,
+                 "scheduled_run_at": cutoff},
+            )
+
+        self.assertEqual(context.calls, 2)
+        self.assertEqual(self.storage.get_task(collection["id"])["status"], "COMPLETED")
+        entry = self.storage.get_entry(collection["id"], "1001")
+        self.assertEqual(json.loads(entry["parsed_data"]), {"是否返校": "未返校"})
+        row = self.storage.list_workflow_messages(collection["id"])[0]
+        self.assertEqual(row["analysis_state"], "no_data")
+        self.assertEqual(row["no_data_recheck_attempts"], 1)
+
+    async def test_ambiguous_no_data_recheck_keeps_finalize_processing(self):
+        main_module = _load_main_module()
+        now = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=5)
+        collection = await self.manager.start_collection(
+            "班群", "返校统计", ["是否返校"], "", False,
+            "qq-main", "operator", "origin", ai_extraction=True,
+            ai_provider_id="provider-1", missing_default_field="是否返校",
+            missing_default_value="未返校", now=now,
+        )
+        await self.manager.capture_collection_message(
+            collection["id"], "1001", "张三", "我应该已经回去了吧",
+            source_message_id="ambiguous-after-no-data", now=now + timedelta(seconds=1),
+        )
+
+        class Context:
+            def __init__(self):
+                self.responses = [
+                    {"members": [{"user_id": "1001", "status": "no_data", "items": []}]},
+                    {"members": [{"user_id": "1001", "status": "ambiguous", "items": []}]},
+                ]
+                self.calls = 0
+
+            async def llm_generate(self, **_kwargs):
+                self.calls += 1
+                response = self.responses.pop(0) if self.responses else {
+                    "members": [{"user_id": "1001", "status": "no_data", "items": []}],
+                }
+                return types.SimpleNamespace(completion_text=json.dumps(response))
+
+        class FakeAdapter:
+            def __init__(self, *_args):
+                pass
+
+            async def get_group_member_list(self, _group_id):
+                raise AssertionError(
+                    "ambiguous evidence must stop before member/default processing",
+                )
+
+        context = Context()
+        plugin = self._group_listener(main_module)
+        plugin.context = context
+        plugin._reconcile_collection_history = mock.AsyncMock(return_value=(
+            FakeAdapter(), "9000", {"coverage_status": "FULL"},
+        ))
+        await plugin._run_collection_checkpoint(
+            collection["id"], now + timedelta(minutes=1), "manual",
+        )
+        stopped = await self.manager.stop_collection(collection["id"], "qq-main")
+        cutoff = self.manager._task_result(stopped["task"])["processing_cutoff"]
+        with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
+            for task_id in ("finalize-1", "finalize-2"):
+                await plugin._execute_collection_finalize(
+                    {"id": task_id, "platform_id": "qq-main", "run_at": cutoff},
+                    {"collection_task_id": collection["id"], "manual_stop": True,
+                     "scheduled_run_at": cutoff},
+                )
+
+        row = self.storage.list_workflow_messages(collection["id"])[0]
+        self.assertEqual(context.calls, 2)
+        self.assertEqual(self.storage.get_task(collection["id"])["status"], "PROCESSING")
+        self.assertEqual(row["analysis_state"], "error")
+        self.assertEqual(row["no_data_recheck_attempts"], 1)
+        self.assertEqual(row["message_text"], "我应该已经回去了吧")
+        self.assertIsNone(self.storage.get_entry(collection["id"], "1001"))
+
+    async def test_delayed_event_timestamp_before_deadline_is_preserved(self):
+        main_module = _load_main_module()
+        processing_at = datetime.now(timezone.utc).replace(microsecond=0)
+        deadline = processing_at - timedelta(seconds=1)
+        event_at = deadline - timedelta(seconds=1)
+        collection = await self.manager.start_collection(
+            "班群", "返校", ["返校时间"], "", False,
+            "qq-main", "operator", "origin", ai_extraction=True,
+            ai_provider_id="provider-1", now=event_at - timedelta(minutes=1),
+            deadline=deadline,
+        )
+        plugin = self._group_listener(main_module)
+        event = self._group_event("我刚回来了", event_at.timestamp())
+        with mock.patch.object(core_module.TaskManager, "_now_utc", return_value=processing_at):
+            _ = [item async for item in plugin.on_group_message(event)]
+
+        workflow = self.storage.list_workflow_messages(collection["id"])
+        archived = self.storage.search_group_messages(
+            "qq-main", "123456789", "", None, None, 10,
+        )
+        expected = event_at.isoformat(timespec="seconds")
+        self.assertEqual(workflow[0]["sent_at"], expected)
+        self.assertEqual(archived[0]["sent_at"], expected)
+
+    async def test_late_event_timestamp_is_rejected_even_if_handler_clock_is_early(self):
+        main_module = _load_main_module()
+        deadline = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=2)
+        processing_at = deadline - timedelta(seconds=1)
+        event_at = deadline + timedelta(seconds=1)
+        collection = await self.manager.start_collection(
+            "班群", "返校", ["返校时间"], "", False,
+            "qq-main", "operator", "origin", ai_extraction=True,
+            ai_provider_id="provider-1", now=deadline - timedelta(minutes=1),
+            deadline=deadline,
+        )
+        plugin = self._group_listener(main_module)
+        event = self._group_event("我刚回来了", str(event_at.timestamp()))
+        with mock.patch.object(core_module.TaskManager, "_now_utc", return_value=processing_at):
+            _ = [item async for item in plugin.on_group_message(event)]
+
+        self.assertEqual(self.storage.list_workflow_messages(collection["id"]), [])
+
+    async def test_missing_event_timestamp_falls_back_to_processing_time(self):
+        main_module = _load_main_module()
+        processing_at = datetime.now(timezone.utc).replace(microsecond=0)
+        self.assertIsNone(main_module.LumielleNexus._event_sent_at(
+            self._group_event("无效时间戳消息", "not-a-unix-time"),
+        ))
+        collection = await self.manager.start_collection(
+            "班群", "返校", ["返校时间"], "", False,
+            "qq-main", "operator", "origin", ai_extraction=True,
+            ai_provider_id="provider-1", now=processing_at - timedelta(minutes=1),
+        )
+        plugin = self._group_listener(main_module)
+        event = self._group_event("我刚回来了", None)
+        with mock.patch.object(core_module.TaskManager, "_now_utc", return_value=processing_at):
+            _ = [item async for item in plugin.on_group_message(event)]
+
+        workflow = self.storage.list_workflow_messages(collection["id"])
+        archived = self.storage.search_group_messages(
+            "qq-main", "123456789", "", None, None, 10,
+        )
+        expected = processing_at.isoformat(timespec="seconds")
+        self.assertEqual(workflow[0]["sent_at"], expected)
+        self.assertEqual(archived[0]["sent_at"], expected)
 
     async def test_ok_empty_items_is_unresolved_and_keeps_cursor(self):
         task, captured, result, saved = await self._checkpoint_with_candidate({

@@ -2823,23 +2823,51 @@ class TaskManager:
                 current_cutoff = min(current_cutoff, _as_utc(payload["deadline"]))
             cursor_id = self.storage.workflow_analysis_cursor(task["id"])
             cutoff_iso = current_cutoff.isoformat(timespec="seconds")
-            pending_count = self.storage.count_pending_workflow_messages(
-                task["id"], cutoff_iso,
+            pending_count = self._checkpoint_backlog_count(
+                task["id"], task, payload, cutoff_iso, str(reason),
             )
             pending_rows = self.storage.list_pending_workflow_messages(
                 task["id"], cutoff_iso, COLLECTION_CHECKPOINT_MAX_MESSAGES,
             )
-            messages: list[dict[str, Any]] = []
+            recheck_rows: list[dict[str, Any]] = []
+            if str(reason) in {"chase", "finalize"}:
+                capture_start, sender_ids, excluded_sender_ids = self._no_data_recheck_scope(
+                    task["id"], task, payload,
+                )
+                recheck_rows = self.storage.list_provisional_no_data_messages(
+                    task["id"], capture_start, cutoff_iso,
+                    COLLECTION_CHECKPOINT_MAX_MESSAGES,
+                    sender_ids=sender_ids,
+                    exclude_sender_ids=excluded_sender_ids,
+                )
+            recheck_ids = {int(row["id"]) for row in recheck_rows}
+            candidates = sorted(
+                [*pending_rows, *recheck_rows],
+                key=lambda row: (str(row.get("sent_at") or ""), int(row["id"])),
+            )
+            selected: list[dict[str, Any]] = []
             total_chars = 0
             budget_blocked = False
-            for row in pending_rows:
+            for row in candidates[:COLLECTION_CHECKPOINT_MAX_MESSAGES]:
                 bounded_row = dict(row)
                 row_chars = len(str(bounded_row.get("message_text") or "")) + 64
                 if total_chars + row_chars > COLLECTION_CHECKPOINT_MAX_TOTAL_CHARS:
-                    budget_blocked = not messages
+                    budget_blocked = not selected
                     break
-                messages.append(bounded_row)
+                selected.append(bounded_row)
                 total_chars += row_chars
+            selected_recheck_ids = [
+                int(row["id"]) for row in selected if int(row["id"]) in recheck_ids
+            ]
+            claimed_rechecks = self.storage.claim_no_data_rechecks(
+                selected_recheck_ids, utc_now_iso(),
+            )
+            claimed_recheck_ids = {int(row["id"]) for row in claimed_rechecks}
+            messages = [
+                row for row in selected
+                if int(row["id"]) not in recheck_ids
+                or int(row["id"]) in claimed_recheck_ids
+            ]
             next_cursor_id = max(
                 [cursor_id, *[int(row["id"]) for row in messages]],
             )
@@ -2865,7 +2893,7 @@ class TaskManager:
                 "next_cursor_id": next_cursor_id,
                 "messages": messages,
                 "pending_message_count": pending_count,
-                "pending_user_ids": sorted({str(row["sender_id"]) for row in pending_rows}),
+                "pending_user_ids": sorted({str(row["sender_id"]) for row in candidates}),
                 "budget_blocked": budget_blocked,
                 "messages_by_user": grouped,
                 "identities": identities,
@@ -2879,6 +2907,62 @@ class TaskManager:
         except (TypeError, json.JSONDecodeError):
             result = {}
         return result if isinstance(result, dict) else {}
+
+    @staticmethod
+    def _complete_entry_senders(
+        entries: list[dict[str, Any]], fields: list[str],
+    ) -> set[str]:
+        complete: set[str] = set()
+        for entry in entries:
+            sender_id = str(entry.get("sender_id") or "").strip()
+            try:
+                parsed = json.loads(entry.get("parsed_data") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not sender_id or not isinstance(parsed, dict):
+                continue
+            if fields and all(str(parsed.get(field) or "").strip() for field in fields):
+                complete.add(sender_id)
+        return complete
+
+    def _no_data_recheck_scope(
+        self, task_id: str, task: dict[str, Any], payload: dict[str, Any],
+    ) -> tuple[str, set[str] | None, set[str]]:
+        fields = [str(field) for field in payload.get("fields", [])]
+        complete_ids = self._complete_entry_senders(
+            self.storage.list_entries(task_id), fields,
+        )
+        target_ids = payload.get("target_member_ids")
+        if target_ids is None:
+            sender_ids = None
+            excluded_sender_ids = complete_ids
+        else:
+            sender_ids = {
+                str(user_id).strip() for user_id in target_ids if str(user_id).strip()
+            } - complete_ids
+            excluded_sender_ids = set()
+        capture_start = str(payload.get("capture_start") or task["created_at"])
+        return capture_start, sender_ids, excluded_sender_ids
+
+    def _checkpoint_backlog_count(
+        self,
+        task_id: str,
+        task: dict[str, Any],
+        payload: dict[str, Any],
+        cutoff: str,
+        reason: str,
+    ) -> int:
+        count = self.storage.count_pending_workflow_messages(task_id, cutoff)
+        if reason not in {"chase", "finalize"}:
+            return count
+        capture_start, sender_ids, excluded_sender_ids = self._no_data_recheck_scope(
+            task_id, task, payload,
+        )
+        return count + self.storage.count_provisional_no_data_messages(
+            task_id, capture_start, cutoff,
+            sender_ids=sender_ids,
+            exclude_sender_ids=excluded_sender_ids,
+        )
 
     async def advance_collection_checkpoint(
         self, task_id: str, snapshot: dict[str, Any], *, analysis_error: str = "",
@@ -2900,8 +2984,9 @@ class TaskManager:
                 self.storage.disposition_workflow_messages(
                     message_ids, states, errors, utc_now_iso(),
                 )
-            pending_count = self.storage.count_pending_workflow_messages(
-                task_id, str(snapshot.get("cutoff") or ""),
+            pending_count = self._checkpoint_backlog_count(
+                task_id, task, json.loads(task["payload"] or "{}"),
+                str(snapshot.get("cutoff") or ""), str(snapshot.get("reason") or "manual"),
             )
             incomplete = bool(error_text or pending_count)
             rejection = (
@@ -2984,7 +3069,7 @@ class TaskManager:
             rejected = validation["rejected"]
             states_by_sender = {
                 str(user_id): (
-                    "ignored"
+                    "no_data"
                     if validation.get("terminal_states", {}).get(user_id) == "no_data"
                     else "resolved"
                 )
@@ -3000,8 +3085,9 @@ class TaskManager:
             self.storage.disposition_workflow_messages(
                 message_ids, states_by_sender, errors_by_sender, utc_now_iso(),
             )
-            pending_count = self.storage.count_pending_workflow_messages(
-                task_id, str(snapshot.get("cutoff") or ""),
+            pending_count = self._checkpoint_backlog_count(
+                task_id, task, payload,
+                str(snapshot.get("cutoff") or ""), str(snapshot.get("reason") or "manual"),
             )
             analysis_incomplete = bool(
                 rejected or validation["unresolved_user_ids"] or pending_count
