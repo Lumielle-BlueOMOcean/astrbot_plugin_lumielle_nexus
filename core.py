@@ -540,17 +540,18 @@ def parse_collection_submission(
         if (normalized_key := str(field).strip().casefold()) in normalized
     }
 
-    def mapped_value(field: str, value: str) -> str | None:
+    def mapped_values(field: str, value: str) -> set[str] | None:
         mapping = mappings_by_field.get(field.casefold())
         if mapping is None:
-            return value
+            return None
         normalized_value = value.strip().casefold()
+        matches: set[str] = set()
         for canonical, aliases in mapping.items():
             if str(canonical).strip().casefold() == normalized_value:
-                return str(canonical).strip()
-            if any(str(alias).strip().casefold() == normalized_value for alias in aliases):
-                return str(canonical).strip()
-        return None
+                matches.add(str(canonical).strip())
+            elif any(str(alias).strip().casefold() == normalized_value for alias in aliases):
+                matches.add(str(canonical).strip())
+        return matches
 
     result: dict[str, str] = {}
     for line in raw_message.splitlines():
@@ -560,20 +561,231 @@ def parse_collection_submission(
         label = match.group(1).strip().casefold()
         value = match.group(2).strip()
         if label in normalized and value:
-            canonical = mapped_value(normalized[label], value)
-            if canonical is not None:
+            matches = mapped_values(normalized[label], value)
+            if matches is None:
+                canonical = value
+            else:
+                canonical = next(iter(matches)) if len(matches) == 1 else None
+            if canonical:
                 result[normalized[label]] = canonical
-    if not result and len(normalized) == 1:
-        field = next(iter(normalized.values()))
-        if field.casefold() in mappings_by_field:
-            canonical = mapped_value(field, str(raw_message).strip())
-            if canonical is not None:
-                result[field] = canonical
-        elif field.casefold() in CONFIRMATION_FIELDS:
-            reply = re.sub(r"[。.!！!?？,，;；、]+$", "", str(raw_message).strip())
-            if reply in CONFIRMATION_REPLIES:
-                result[field] = "已收到"
+    if not result:
+        bare_value = str(raw_message or "").strip()
+        bare_matches = {
+            (normalized[field_key], canonical)
+            for field_key in mappings_by_field
+            for canonical in (mapped_values(field_key, bare_value) or set())
+        }
+        if len(bare_matches) == 1:
+            field, canonical = next(iter(bare_matches))
+            result[field] = canonical
+        elif len(bare_matches) > 1:
+            return {}
+        elif len(normalized) == 1:
+            field = next(iter(normalized.values()))
+            if field.casefold() not in mappings_by_field and field.casefold() in CONFIRMATION_FIELDS:
+                reply = re.sub(r"[。.!！!?？,，;；、]+$", "", bare_value)
+                if reply in CONFIRMATION_REPLIES:
+                    result[field] = "已收到"
     return result
+
+
+def validate_required_when(
+    fields: list[str],
+    required_when: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """Validate and canonicalize the bounded conditional-required rules."""
+    if required_when is None:
+        required_when = {}
+    if not isinstance(required_when, dict):
+        raise ValueError("required_when 必须是对象")
+    field_by_key = {str(field).strip().casefold(): str(field).strip() for field in fields}
+    normalized_rules: dict[str, dict[str, Any]] = {}
+    for target, rule in required_when.items():
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("required_when 的目标字段必须是非空文本")
+        target_field = field_by_key.get(target.strip().casefold())
+        if target_field is None:
+            raise ValueError("required_when 目标字段必须属于 Collection fields")
+        if target_field.casefold() in normalized_rules:
+            raise ValueError("required_when 不能重复声明同一个目标字段")
+        if not isinstance(rule, dict):
+            raise ValueError("required_when 每条规则都必须是对象")
+        control = rule.get("field")
+        if not isinstance(control, str) or not control.strip():
+            raise ValueError("required_when.field 必须是非空控制字段")
+        control_field = field_by_key.get(control.strip().casefold())
+        if control_field is None:
+            raise ValueError("required_when 控制字段必须属于 Collection fields")
+        if control_field.casefold() == target_field.casefold():
+            raise ValueError("required_when 目标字段不能依赖自身")
+        equals = rule.get("equals")
+        if not isinstance(equals, list) or not equals:
+            raise ValueError("required_when.equals 必须是非空字符串列表")
+        clean_equals: list[str] = []
+        seen_equals: set[str] = set()
+        for value in equals:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("required_when.equals 中每项都必须是非空字符串")
+            clean_value = value.strip()
+            key = clean_value.casefold()
+            if key not in seen_equals:
+                clean_equals.append(clean_value)
+                seen_equals.add(key)
+        normalized_rules[target_field] = {
+            "field": control_field,
+            "equals": clean_equals,
+        }
+    if normalized_rules and not any(
+        field.casefold() not in {target.casefold() for target in normalized_rules}
+        for field in field_by_key.values()
+    ):
+        raise ValueError("至少需要一个始终必填的 Collection 字段")
+    return normalized_rules
+
+
+def collection_required_fields(
+    fields: list[str],
+    values: dict[str, Any],
+    required_when: dict[str, dict[str, Any]] | None = None,
+) -> set[str]:
+    """Return unconditional fields plus conditions matching canonical values."""
+    clean_fields = [str(field).strip() for field in fields if str(field).strip()]
+    value_by_key = {
+        str(field).strip().casefold(): str(value or "").strip()
+        for field, value in values.items()
+    }
+    rules = required_when if isinstance(required_when, dict) else {}
+    target_by_key = {str(target).strip().casefold() for target in rules}
+    required = {
+        field for field in clean_fields if field.casefold() not in target_by_key
+    }
+    field_by_key = {field.casefold(): field for field in clean_fields}
+    for target, rule in rules.items():
+        if not isinstance(rule, dict):
+            continue
+        target_field = field_by_key.get(str(target).strip().casefold())
+        control_key = str(rule.get("field") or "").strip().casefold()
+        control_value = value_by_key.get(control_key, "").casefold()
+        equals = rule.get("equals")
+        if target_field and isinstance(equals, list) and any(
+            isinstance(value, str) and control_value == value.strip().casefold()
+            for value in equals
+        ):
+            required.add(target_field)
+    return required
+
+
+def collection_entry_completion(
+    fields: list[str],
+    values: dict[str, Any],
+    required_when: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    """Return the single authoritative COMPLETE/PARTIAL/NO_RESPONSE state."""
+    clean_fields = [str(field).strip() for field in fields if str(field).strip()]
+    if not clean_fields:
+        return "COMPLETE"
+    required = collection_required_fields(clean_fields, values, required_when)
+    field_keys = {field.casefold() for field in clean_fields}
+    populated = {
+        str(key).strip().casefold()
+        for key, value in values.items()
+        if str(value or "").strip() and str(key).strip().casefold() in field_keys
+    }
+    missing = {field for field in required if field.casefold() not in populated}
+    if not missing:
+        return "COMPLETE"
+    if populated:
+        return "PARTIAL"
+    return "NO_RESPONSE"
+
+
+def build_collection_submission_guide(
+    fields: list[str],
+    field_value_mappings: dict[str, dict[str, list[str]]] | None = None,
+    required_when: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    """Create a concise, bounded deterministic submission guide."""
+    clean_fields = [str(field).strip() for field in fields if str(field).strip()]
+    mappings = field_value_mappings if isinstance(field_value_mappings, dict) else {}
+    rules = required_when if isinstance(required_when, dict) else {}
+    field_by_key = {field.casefold(): field for field in clean_fields}
+    mapping_groups: list[tuple[str, list[str]]] = []
+    pair_count = 0
+    for raw_field, values in mappings.items():
+        field = field_by_key.get(str(raw_field).strip().casefold())
+        if not field or not isinstance(values, dict):
+            continue
+        pairs: list[str] = []
+        for canonical, aliases in values.items():
+            canonical_text = str(canonical).strip()
+            if not canonical_text:
+                continue
+            aliases = aliases if isinstance(aliases, list) else []
+            alias = next((
+                str(item).strip() for item in aliases
+                if isinstance(item, str) and item.strip()
+                and item.strip().casefold() != canonical_text.casefold()
+            ), canonical_text)
+            pairs.append(f"{alias} = {canonical_text}")
+            pair_count += 1
+        if pairs:
+            mapping_groups.append((field, pairs))
+
+    conditional_groups: dict[tuple[str, tuple[str, ...]], list[str]] = {}
+    for target, rule in rules.items():
+        target_field = field_by_key.get(str(target).strip().casefold())
+        if not target_field or not isinstance(rule, dict):
+            continue
+        control_field = field_by_key.get(str(rule.get("field") or "").strip().casefold())
+        equals = rule.get("equals")
+        if not control_field or not isinstance(equals, list) or not equals:
+            continue
+        values = tuple(str(value).strip() for value in equals if str(value).strip())
+        if values:
+            conditional_groups.setdefault((control_field, values), []).append(target_field)
+
+    too_complex = (
+        len(clean_fields) > 12
+        or pair_count > 8
+        or sum(len(targets) for targets in conditional_groups.values()) > 8
+    )
+    if too_complex:
+        fallback_lines = ["请按“字段：值”格式提交；符合条件时补充对应字段："]
+        for field in clean_fields[:8]:
+            candidate = f"{field}："
+            if sum(map(len, fallback_lines)) + len(candidate) + len(fallback_lines) > 650:
+                break
+            fallback_lines.append(candidate)
+        if len(fallback_lines) - 1 < len(clean_fields):
+            fallback_lines.append("其余字段和条件要求以任务说明为准。")
+        return "\n".join(fallback_lines)
+
+    conditional_targets = {target.casefold() for targets in conditional_groups.values() for target in targets}
+    unconditional_fields = [field for field in clean_fields if field.casefold() not in conditional_targets]
+    lines = ["请直接回复以下内容："]
+    for field, pairs in mapping_groups:
+        lines.append(f"{field}：" + "；".join(pairs))
+    for field in unconditional_fields:
+        if not any(mapped_field.casefold() == field.casefold() for mapped_field, _ in mapping_groups):
+            lines.append(f"{field}：")
+    for (control_field, equals), targets in conditional_groups.items():
+        conditions = " / ".join(f"「{value}」" for value in equals)
+        lines.append(f"如果「{control_field}」为{conditions}，还需要填写：")
+        lines.extend(f"{target}：" for target in targets)
+    if clean_fields:
+        example_field = unconditional_fields[0] if unconditional_fields else clean_fields[0]
+        example_value = next((
+            str(canonical).strip()
+            for mapping_field, values in mappings.items()
+            if str(mapping_field).strip().casefold() == example_field.casefold()
+            and isinstance(values, dict) and values
+            for canonical in values
+        ), "内容")
+        lines.append(f"也可使用标准格式，例如：{example_field}：{example_value}")
+    guide = "\n".join(lines)
+    if len(guide) <= 700:
+        return guide
+    return "请按“字段：值”格式提交；条件必填字段请按任务说明补充。"
 
 
 def parse_ai_submission_trigger(raw_message: str) -> dict[str, str] | None:
@@ -1099,6 +1311,7 @@ def collection_member_stats(
     target_ids: list[str] | set[str] | None = None,
     required_fields: list[str] | None = None,
     pending_ids: set[str] | list[str] | None = None,
+    required_when: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return per-member evidence and required-field completion states."""
     excluded_id = str(self_id or "").strip()
@@ -1139,13 +1352,11 @@ def collection_member_stats(
             values = {}
         if not isinstance(values, dict):
             values = {}
-        populated = {str(key) for key, value in values.items() if str(value or "").strip()}
-        if fields and all(field in populated for field in fields):
+        completion = collection_entry_completion(fields, values, required_when)
+        if completion == "COMPLETE":
             complete_ids.add(user_id)
-        elif fields and populated:
+        elif completion == "PARTIAL":
             partial_ids.add(user_id)
-        elif not fields:
-            complete_ids.add(user_id)
         else:
             no_response_ids.add(user_id)
     submitted_ids = complete_ids
@@ -2445,6 +2656,7 @@ class TaskManager:
         missing_default_value: str = "",
         auto_export: bool = False,
         field_value_mappings: dict[str, dict[str, list[str]]] | None = None,
+        required_when: dict[str, dict[str, Any]] | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         title = str(title or "").strip()
@@ -2455,6 +2667,7 @@ class TaskManager:
             raise ValueError("至少需要一个统计字段")
         if len(set(field.casefold() for field in clean_fields)) != len(clean_fields):
             raise ValueError("统计字段不能重复")
+        clean_required_when = validate_required_when(clean_fields, required_when)
         if not isinstance(ai_extraction, bool):
             raise ValueError("ai_extraction 必须是布尔值")
         ai_extraction = bool(ai_extraction)
@@ -2526,6 +2739,7 @@ class TaskManager:
                 "missing_default_value": clean_default_value,
                 "auto_export": auto_export,
                 "field_value_mappings": mappings,
+                "required_when": clean_required_when,
             }
             if ai_extraction:
                 payload["ai_provider_id"] = ai_provider_id
@@ -2675,7 +2889,11 @@ class TaskManager:
                     task["platform_id"], task["group_id"], str(sender_id),
                     parsed, "self_submission", str(sender_id), current.isoformat(timespec="seconds"),
                 )
-            missing = [field for field in payload["fields"] if not merged.get(field)] if parsed else []
+            required_fields = collection_required_fields(
+                payload["fields"], merged, payload.get("required_when"),
+            )
+            missing = [field for field in payload["fields"]
+                       if field in required_fields and not merged.get(field)] if parsed else []
             return {
                 "id": workflow["id"],
                 "task": task,
@@ -2910,7 +3128,9 @@ class TaskManager:
 
     @staticmethod
     def _complete_entry_senders(
-        entries: list[dict[str, Any]], fields: list[str],
+        entries: list[dict[str, Any]],
+        fields: list[str],
+        required_when: dict[str, dict[str, Any]] | None = None,
     ) -> set[str]:
         complete: set[str] = set()
         for entry in entries:
@@ -2921,7 +3141,7 @@ class TaskManager:
                 continue
             if not sender_id or not isinstance(parsed, dict):
                 continue
-            if fields and all(str(parsed.get(field) or "").strip() for field in fields):
+            if collection_entry_completion(fields, parsed, required_when) == "COMPLETE":
                 complete.add(sender_id)
         return complete
 
@@ -2931,6 +3151,7 @@ class TaskManager:
         fields = [str(field) for field in payload.get("fields", [])]
         complete_ids = self._complete_entry_senders(
             self.storage.list_entries(task_id), fields,
+            payload.get("required_when"),
         )
         target_ids = payload.get("target_member_ids")
         if target_ids is None:
@@ -3291,7 +3512,11 @@ class TaskManager:
                 task["id"], sender_id, str(sender_name or sender_id),
                 str(raw_message), merged, utc_now_iso(),
             )
-            missing = [field for field in payload["fields"] if not merged.get(field)]
+            required_fields = collection_required_fields(
+                payload["fields"], merged, payload.get("required_when"),
+            )
+            missing = [field for field in payload["fields"]
+                       if field in required_fields and not merged.get(field)]
             entry["parsed_data"] = merged
             return {
                 "status": "saved",
@@ -3312,7 +3537,21 @@ class TaskManager:
             if task["type"] != "COLLECTION":
                 raise ValueError(f"该任务不是信息收集任务：{task_id}")
             entries = self.storage.list_entries(task["id"])
-            return {"task": task, "entries": entries, "submitted_count": len(entries)}
+            try:
+                payload = json.loads(task.get("payload") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            fields = [str(field) for field in payload.get("fields", [])]
+            complete_ids = self._complete_entry_senders(
+                entries, fields, payload.get("required_when"),
+            )
+            complete_ids -= self.storage.pending_workflow_sender_ids(task["id"])
+            return {
+                "task": task,
+                "entries": entries,
+                "submitted_count": len(entries),
+                "complete_count": len(complete_ids),
+            }
 
     async def resolve_collection_reference(
         self,

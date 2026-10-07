@@ -50,8 +50,11 @@
 
 - 按字段收集群成员信息，重复提交自动更新。
 - 可按成员集合定向收集，并在创建时固定目标快照。
-- 标准字段消息立即确定性写入；自然语言填写由持久化 workflow capture 和增量 checkpoint 处理。
+- 标准字段消息立即确定性写入；有限值映射支持单字段和无歧义的多字段裸回复。重用别名时，裸回复会 fail closed，改用“字段：值”明确指定。
+- 可配置 `required_when` 条件必填：例如返校情况为“已返校”时只要求状态；为“未返校”时再要求返校时间和原因。条件比较使用映射后的 canonical value。
+- 自然语言填写由持久化 workflow capture 和增量 checkpoint 处理；默认公告会说明映射选项和条件字段。
 - checkpoint 催办、deadline finalize、missing default 和 XLSX 导出。
+- 提交确认默认关闭以避免刷屏；可通过 `collection_ack` 显式开启。
 
 ### 🧠 群消息事实与 AI
 
@@ -74,6 +77,10 @@ Coverage 含义：
 | `PARTIAL` | 回补遇到页数/消息/时间预算、cursor 卡住、接口错误或不可解析页；命中结果不代表没有其他消息 |
 | `LOCAL_ONLY` | 当前只使用本地留存，未从远端证明完整覆盖 |
 | `UNKNOWN` | 尚无足够信息判断覆盖范围 |
+
+`FULL` 说明请求时间窗的覆盖证据完整，不表示返回了 100 条、数据库只有 100 条，或 Agent 已读完所有历史。历史查询 `limit` 默认 50、范围 1–100：精确问题建议 10–30，普通浏览 30–50，全面核对最多 100；若仍有更多且用户要求完整核对，可用 `before_id` 继续分页。`limit` 是最终返回条数，不是 OneBot 同步页数。
+
+实时写 SQLite、OneBot 拉取、去重、coverage reconciliation 和本地 sender/keyword/time filtering 本身不产生 LLM token；但 Agent 对话、工具调用、返回给模型的消息文本及 Collection checkpoint 语义分析会使用 token。拉取 100 条不等于 LLM 阅读 100 条，最终 token 消耗取决于实际进入模型上下文的内容，不能承诺绝对零 token。
 
 `/nexus archive <群> on|off` 现在是显式覆盖默认值；新绑定群及没有历史设置的旧群默认开启。开启后实时归档从现在开始恢复；后续历史查询和 Collection reconciliation 仍可能通过 OneBot 有界回补此前可获取的群消息。关闭后停止保存和查询，但不会自动删除已有历史。
 
@@ -148,6 +155,14 @@ flowchart LR
 ```
 
 成员可以提交 `我7号下午三点回来`，也可以使用 `返校时间：10月7日下午3点`。标准格式会立即确定性写入；自然语言会在 checkpoint 批量理解。
+
+Collection 有三类输入路径：
+
+1. **标准字段格式**（如 `返校情况：未返校`）：立即确定性解析和持久化，不调用 LLM。
+2. **有限值裸回复**（如映射中 `1 = 已返校`）：只有唯一字段能解释该值时才确定性记录；如果多个字段重复使用同一别名，则不猜测，需改用 `字段：值`。
+3. **自由自然语言**（如 `我还没回学校，预计明天下午到，因为车票改签`）：只有创建 Collection 时开启 `ai_extraction` 才会由有界 checkpoint 批量分析；原文先持久化，普通群消息不会逐条调用 LLM。
+
+条件必填可表达为 `required_when`，例如“返校情况”为“未返校”时才要求返校时间和原因。未配置该规则的旧 Collection 仍要求所有字段。状态、chase、最终统计、no-data recheck 和 XLSX missing sheet 共用同一完成判定：已返校只填状态即完整；未返校则需补充条件字段。条件按有限值映射后的 canonical value 比较。
 
 ```text
 17:00 ─────────── 19:00 ─────────── 20:00
@@ -246,7 +261,7 @@ python -m pip install -r requirements.txt
 | `timezone` | `Asia/Shanghai` | 时间解析时区 |
 | `scheduler_interval_seconds` | `15` | scheduler 检查间隔，运行时限制 `5–60` 秒 |
 | `max_retry_count` | `3` | 普通提醒发送失败后的最大重试次数 |
-| `collection_ack` | `true` | 是否确认确定性群成员提交 |
+| `collection_ack` | `false` | 是否确认确定性群成员提交；默认关闭，显式设为 `true` 时仍会确认 |
 | `archive_max_message_chars` | `4000` | 单条归档文本上限，运行时限制 `256–20000` |
 | `archive_retention_days` | `90` | 归档保留天数；`0` 表示不自动清理 |
 | `history_default_enabled` | `true` | 已绑定群默认保存/允许查询历史；单群显式 on/off 覆盖此值 |

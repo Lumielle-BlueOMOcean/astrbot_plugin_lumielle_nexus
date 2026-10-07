@@ -126,6 +126,8 @@ def export_collection(
         missing_sheet.append(_safe_row(["QQ", "群昵称"]))
         stats = collection_member_stats(
             members, entries, self_id=self_id, target_ids=target_ids,
+            required_fields=fields,
+            required_when=payload.get("required_when"),
         )
         for member_id in sorted(stats["missing_ids"]):
             member = stats["eligible_members"][member_id]

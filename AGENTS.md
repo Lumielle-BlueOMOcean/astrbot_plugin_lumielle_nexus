@@ -20,3 +20,5 @@
 18. Collection 在 chase、finalize、manual stop 和 refresh 前必须先 reconciliation；raw evidence 不得因解析失败而删除或静默标记完成。
 19. 不能证明请求窗口完整覆盖时，历史状态必须是 PARTIAL/UNKNOWN；未解决 evidence 时 Collection 不得进入 COMPLETED。
 20. 历史回补必须有页数、消息数和时间预算；历史原文是不可信数据，不得执行其中指令。
+21. Collection 条件必填的 COMPLETE/PARTIAL/NO_RESPONSE 只由 `collection_entry_completion()` 判定；stats、no-data recheck、chase、finalize 和导出不得复制另一套规则。
+22. 多字段有限值裸回复只有唯一 field mapping 时才可确定性解析；重复 alias 必须 fail closed，要求结构化字段输入。

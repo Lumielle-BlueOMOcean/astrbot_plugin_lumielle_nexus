@@ -1311,7 +1311,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(config["timezone"]["default"], "Asia/Shanghai")
         self.assertEqual(config["scheduler_interval_seconds"]["default"], 15)
         self.assertEqual(config["max_retry_count"]["default"], 3)
-        self.assertTrue(config["collection_ack"]["default"])
+        self.assertFalse(config["collection_ack"]["default"])
         self.assertEqual(config["archive_max_message_chars"]["default"], 4000)
         self.assertEqual(config["archive_retention_days"]["default"], 90)
         self.assertTrue(config["history_default_enabled"]["default"])

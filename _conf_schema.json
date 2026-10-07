@@ -25,8 +25,8 @@
   },
   "collection_ack": {
     "type": "bool",
-    "description": "群成员提交后是否回复简短确认",
-    "default": true
+    "description": "群成员提交后是否回复简短确认；默认关闭，避免统计期间逐条刷屏",
+    "default": false
   },
   "archive_max_message_chars": {
     "type": "int",
