@@ -1898,11 +1898,29 @@ class TaskManager:
                     stop_reason = "api_error"
                     break
                 pages += 1
-                valid_page = [
-                    self._normalize_history_message(item, platform_id, group_id)
-                    for item in response if isinstance(item, dict)
-                ]
-                page_messages = [item for item in valid_page if item is not None]
+                page_messages: list[dict[str, Any]] = []
+                page_unparseable = False
+                for raw_item in response:
+                    if not isinstance(raw_item, dict):
+                        page_unparseable = True
+                        continue
+                    normalized = self._normalize_history_message(
+                        raw_item, platform_id, group_id,
+                    )
+                    if normalized is None:
+                        sender = raw_item.get("sender") if isinstance(
+                            raw_item.get("sender"), dict,
+                        ) else {}
+                        has_sender = bool(
+                            str(sender.get("user_id") or raw_item.get("user_id") or "").strip()
+                        )
+                        has_timestamp = self._history_message_datetime(raw_item) is not None
+                        # Valid non-text messages are outside this text archive. Any
+                        # other normalization failure makes page coverage uncertain.
+                        if not has_sender or not has_timestamp or self._history_message_text(raw_item):
+                            page_unparseable = True
+                        continue
+                    page_messages.append(normalized)
                 fetched_count += len(page_messages)
                 if (
                     pages == 1
@@ -1950,6 +1968,9 @@ class TaskManager:
                         )
                         if prior is None and stored is not None:
                             inserted_count += 1
+                if page_unparseable:
+                    stop_reason = "unparseable_page"
+                    break
                 minimum_seq = min(page_sequences) if page_sequences else None
                 oldest_time = min(_as_utc(item["sent_at"]) for item in page_messages)
                 if oldest_time <= start_dt:
@@ -1989,6 +2010,7 @@ class TaskManager:
             local_from = start_dt
         fetched_covered = bool(
             window_end_proven
+            and stop_reason != "unparseable_page"
             and (
                 (fetched_from is not None and fetched_from <= start_dt)
                 or exhausted
@@ -2868,6 +2890,15 @@ class TaskManager:
             )
             if workflow is None:
                 return None
+            if not parsed and not payload.get("ai_extraction"):
+                # Deterministic-only Collections accept structured submissions, not
+                # arbitrary chat. Keep the raw row for audit without blocking finalize.
+                self.storage.disposition_workflow_messages(
+                    [int(workflow["id"])],
+                    {str(sender_id): "ignored"},
+                    updated_at=current.isoformat(timespec="seconds"),
+                )
+                workflow["analysis_state"] = "ignored"
             entry = None
             merged: dict[str, str] = {}
             if parsed:
@@ -3041,6 +3072,14 @@ class TaskManager:
                 current_cutoff = min(current_cutoff, _as_utc(payload["deadline"]))
             cursor_id = self.storage.workflow_analysis_cursor(task["id"])
             cutoff_iso = current_cutoff.isoformat(timespec="seconds")
+            if not bool(payload.get("ai_extraction")):
+                # Older releases persisted unmatched deterministic-only chat as
+                # pending/error. It is not a submission; retain it as audit evidence
+                # but do not let it consume the AI checkpoint size budget or stall.
+                self.storage.ignore_pending_workflow_messages(
+                    task["id"], cutoff_iso,
+                    self._now_utc().isoformat(timespec="seconds"),
+                )
             pending_count = self._checkpoint_backlog_count(
                 task["id"], task, payload, cutoff_iso, str(reason),
             )
@@ -3196,17 +3235,23 @@ class TaskManager:
             error_text = str(analysis_error or "").strip()
             rows = snapshot.get("messages") or []
             message_ids = [int(row["id"]) for row in rows if row.get("id") is not None]
+            payload = json.loads(task["payload"] or "{}")
+            deterministic_only = not bool(payload.get("ai_extraction")) and not error_text
             if message_ids:
-                states = {str(row["sender_id"]): "error" for row in rows}
-                errors = {
-                    sender_id: error_text or "analysis_not_enabled"
-                    for sender_id in states
+                states = {
+                    str(row["sender_id"]): (
+                        "ignored" if deterministic_only else "error"
+                    )
+                    for row in rows
+                }
+                errors = {} if deterministic_only else {
+                    sender_id: error_text for sender_id in states
                 }
                 self.storage.disposition_workflow_messages(
                     message_ids, states, errors, utc_now_iso(),
                 )
             pending_count = self._checkpoint_backlog_count(
-                task_id, task, json.loads(task["payload"] or "{}"),
+                task_id, task, payload,
                 str(snapshot.get("cutoff") or ""), str(snapshot.get("reason") or "manual"),
             )
             incomplete = bool(error_text or pending_count)

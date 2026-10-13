@@ -384,6 +384,62 @@ class GroupHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["stop_reason"], "unparseable_page")
         self.assertFalse(result["history_exhausted"])
 
+    async def test_mixed_valid_and_unattributable_history_page_stays_partial(self):
+        start = self.now - timedelta(hours=2)
+
+        async def fetch(_group_id, message_seq=0):
+            if message_seq == 0:
+                return [
+                    self._message(90, (self.now - timedelta(minutes=30)).isoformat(), "可解析文本"),
+                    {
+                        "message_id": "missing-sender",
+                        "message_seq": 91,
+                        "time": self.now.timestamp(),
+                        "raw_message": "无法归属成员的文本",
+                    },
+                ]
+            return []
+
+        result = await self.manager.ensure_group_history(
+            "班群", "qq-main", start.isoformat(), self.now.isoformat(), fetch,
+            now=self.now,
+        )
+
+        self.assertEqual(result["coverage_status"], "PARTIAL")
+        self.assertEqual(result["stop_reason"], "unparseable_page")
+        self.assertFalse(result["history_exhausted"])
+        self.assertEqual(result["local_count"], 1)
+        rows = await self.manager.search_messages(
+            "班群", start_time=start.isoformat(), end_time=self.now.isoformat(),
+            platform_id="qq-main",
+        )
+        self.assertEqual([row["message_text"] for row in rows], ["可解析文本"])
+
+    async def test_unparseable_item_blocks_full_coverage_even_if_valid_item_crosses_start(self):
+        start = self.now - timedelta(hours=2)
+
+        async def fetch(_group_id, message_seq=0):
+            return [
+                self._message(
+                    90, (start - timedelta(minutes=1)).isoformat(), "起点之前的可解析文本",
+                ),
+                {
+                    "message_id": "missing-sender-in-window",
+                    "message_seq": 91,
+                    "time": (self.now - timedelta(minutes=20)).timestamp(),
+                    "raw_message": "无法归属成员的群消息",
+                },
+            ]
+
+        result = await self.manager.ensure_group_history(
+            "班群", "qq-main", start.isoformat(), self.now.isoformat(), fetch,
+            now=self.now,
+        )
+
+        self.assertEqual(result["coverage_status"], "PARTIAL")
+        self.assertEqual(result["stop_reason"], "unparseable_page")
+        self.assertFalse(result["history_exhausted"])
+
     async def test_private_operator_can_query_multiple_bound_groups_across_sessions(self):
         from test_poll import _load_main_module
 

@@ -990,6 +990,227 @@ class CollectionIncidentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(manager.completed)
         self.assertEqual(len(manager.retries), 1)
 
+    async def test_history_disabled_chase_fails_closed_on_local_only_coverage(self):
+        main_module = _load_main_module()
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        collection = await self.manager.start_collection(
+            "班群", "活动确认", ["是否参加"], "", False,
+            "qq-main", "operator", "private:operator", now=now,
+        )
+        await self.manager.set_archive("班群", False, "qq-main")
+        chase = await self.manager.schedule_collection_chase(
+            collection["id"], now, "请尚未回复的成员提交。", 0,
+            "qq-main", "operator", "private:operator",
+        )
+        sent_batches = []
+
+        class FakeAdapter:
+            def __init__(self, *_args):
+                pass
+
+            async def get_group_member_list(self, _group_id):
+                return [
+                    {"user_id": "1001", "nickname": "张三"},
+                    {"user_id": "9000", "nickname": "Bot"},
+                ]
+
+            async def send_group_at_member_batch(self, group_id, user_ids, text):
+                sent_batches.append((group_id, list(user_ids), text))
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.context = types.SimpleNamespace()
+        plugin.manager = self.manager
+        plugin.storage = self.storage
+        plugin._reconcile_collection_history = mock.AsyncMock(return_value=(
+            FakeAdapter(), "9000", {"coverage_status": "LOCAL_ONLY"},
+        ))
+        plugin._run_collection_checkpoint = mock.AsyncMock(return_value={
+            "analysis_incomplete": False,
+        })
+        with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
+            await plugin._execute_collection_chase(
+                chase,
+                {**json.loads(chase["payload"]), "scheduled_run_at": now.isoformat()},
+            )
+
+        self.assertEqual(sent_batches, [])
+        result = self.manager._task_result(self.storage.get_task(collection["id"]))
+        self.assertEqual(result.get("chase_suppressed_reason"), "history_coverage_incomplete")
+
+    async def test_history_disabled_finalize_keeps_missing_default_unapplied(self):
+        main_module = _load_main_module()
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        collection = await self.manager.start_collection(
+            "班群", "活动确认", ["是否参加"], "", False,
+            "qq-main", "operator", "private:operator", now=now,
+            missing_default_field="是否参加", missing_default_value="未回复",
+        )
+        await self.manager.set_archive("班群", False, "qq-main")
+
+        class FakeAdapter:
+            def __init__(self, *_args):
+                pass
+
+            async def get_group_member_list(self, _group_id):
+                return [{"user_id": "1001", "nickname": "张三"}]
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.context = types.SimpleNamespace()
+        plugin.manager = self.manager
+        plugin.storage = self.storage
+        plugin.data_dir = Path(self.temp_dir.name)
+        plugin._reconcile_collection_history = mock.AsyncMock(return_value=(
+            FakeAdapter(), "9000", {"coverage_status": "LOCAL_ONLY"},
+        ))
+        plugin._run_collection_checkpoint = mock.AsyncMock(return_value={
+            "analysis_incomplete": False,
+        })
+        with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
+            await plugin._execute_collection_finalize(
+                {"id": "finalize-local-only", "platform_id": "qq-main", "run_at": now.isoformat()},
+                {"collection_task_id": collection["id"], "manual_stop": True,
+                 "scheduled_run_at": now.isoformat()},
+            )
+
+        task = self.storage.get_task(collection["id"])
+        self.assertEqual(task["status"], "PROCESSING")
+        self.assertIsNone(self.storage.get_entry(collection["id"], "1001"))
+        retries = [
+            child for child in self.storage.list_children(collection["id"])
+            if json.loads(child["payload"]).get("kind") == "collection_finalize"
+            and json.loads(child["payload"]).get("retry") is True
+        ]
+        self.assertTrue(retries)
+
+        # Once history is explicitly re-enabled and the same window is proven
+        # complete, the bounded retry path must be able to finish safely.
+        await self.manager.set_archive("班群", True, "qq-main")
+        plugin._reconcile_collection_history = mock.AsyncMock(return_value=(
+            FakeAdapter(), "9000", {"coverage_status": "FULL"},
+        ))
+        with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
+            await plugin._execute_collection_finalize(
+                {"id": "finalize-after-history-enabled", "platform_id": "qq-main",
+                 "run_at": now.isoformat()},
+                {"collection_task_id": collection["id"], "manual_stop": True,
+                 "scheduled_run_at": now.isoformat()},
+            )
+
+        task = self.storage.get_task(collection["id"])
+        self.assertEqual(task["status"], "COMPLETED")
+        self.assertEqual(
+            json.loads(self.storage.get_entry(collection["id"], "1001")["parsed_data"]),
+            {"是否参加": "未回复"},
+        )
+
+    async def test_non_ai_collection_audits_unmatched_chat_without_blocking_checkpoint(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        collection = await self.manager.start_collection(
+            "班群", "活动信息", ["姓名", "参加日期"], "", False,
+            "qq-main", "operator", "private:operator", now=now,
+            ai_extraction=False,
+        )
+
+        captured = await self.manager.capture_collection_message(
+            collection["id"], "1001", "张三", "今天用1号实验室",
+            sent_at=now + timedelta(seconds=1),
+            source_message_id="unmatched-non-ai-chat",
+        )
+
+        self.assertIsNotNone(captured)
+        self.assertFalse(captured["deterministic_handled"])
+        rows = self.storage.list_workflow_messages(collection["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["message_text"], "今天用1号实验室")
+        self.assertEqual(rows[0]["analysis_state"], "ignored")
+        checkpoint = await self.manager.prepare_collection_checkpoint(
+            collection["id"], now + timedelta(minutes=1), "manual",
+        )
+        self.assertEqual(checkpoint["messages"], [])
+        self.assertEqual(checkpoint["pending_message_count"], 0)
+
+        main_module = _load_main_module()
+
+        class FakeAdapter:
+            def __init__(self, *_args):
+                pass
+
+            async def get_group_member_list(self, _group_id):
+                return [{"user_id": "9000", "nickname": "Bot"}]
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.context = types.SimpleNamespace()
+        plugin.manager = self.manager
+        plugin.storage = self.storage
+        plugin.data_dir = Path(self.temp_dir.name)
+        plugin._reconcile_collection_history = mock.AsyncMock(return_value=(
+            FakeAdapter(), "9000", {"coverage_status": "FULL"},
+        ))
+        with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
+            await plugin._execute_collection_finalize(
+                {"id": "finalize-non-ai-chat", "platform_id": "qq-main",
+                 "run_at": (now + timedelta(minutes=1)).isoformat()},
+                {"collection_task_id": collection["id"], "manual_stop": True,
+                 "scheduled_run_at": (now + timedelta(minutes=1)).isoformat()},
+            )
+
+        task = self.storage.get_task(collection["id"])
+        self.assertEqual(task["status"], "COMPLETED")
+        self.assertIsNone(self.storage.get_entry(collection["id"], "1001"))
+        retained = self.storage.list_workflow_messages(collection["id"])
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0]["message_text"], "今天用1号实验室")
+        self.assertEqual(retained[0]["analysis_state"], "ignored")
+
+    async def test_non_ai_legacy_pending_chat_is_ignored_without_stalling_finalize(self):
+        main_module = _load_main_module()
+        now = (datetime.now(timezone.utc) - timedelta(minutes=1)).replace(microsecond=0)
+        collection = await self.manager.start_collection(
+            "班群", "活动信息", ["姓名", "参加日期"], "", False,
+            "qq-main", "operator", "private:operator", now=now,
+            ai_extraction=False,
+        )
+        # Simulate a pending row captured by a pre-fix version. New captures are
+        # already recorded as ignored when deterministic parsing finds no fields.
+        legacy_text = "今天用1号实验室" + ("补充内容" * 13000)
+        self.storage.insert_workflow_message(
+            collection["id"], "legacy-pending-chat", "1001", "张三",
+            legacy_text, (now + timedelta(seconds=1)).isoformat(),
+            (now + timedelta(seconds=1)).isoformat(), False,
+        )
+
+        class FakeAdapter:
+            def __init__(self, *_args):
+                pass
+
+            async def get_group_member_list(self, _group_id):
+                return [{"user_id": "9000", "nickname": "Bot"}]
+
+        plugin = object.__new__(main_module.LumielleNexus)
+        plugin.context = types.SimpleNamespace()
+        plugin.manager = self.manager
+        plugin.storage = self.storage
+        plugin.data_dir = Path(self.temp_dir.name)
+        plugin._reconcile_collection_history = mock.AsyncMock(return_value=(
+            FakeAdapter(), "9000", {"coverage_status": "FULL"},
+        ))
+        with mock.patch.object(main_module, "QQAdapter", FakeAdapter):
+            await plugin._execute_collection_finalize(
+                {"id": "finalize-legacy-non-ai-chat", "platform_id": "qq-main",
+                 "run_at": (now + timedelta(minutes=1)).isoformat()},
+                {"collection_task_id": collection["id"], "manual_stop": True,
+                 "scheduled_run_at": (now + timedelta(minutes=1)).isoformat()},
+            )
+
+        task = self.storage.get_task(collection["id"])
+        self.assertEqual(task["status"], "COMPLETED")
+        self.assertFalse(self.manager._task_result(task).get("analysis_incomplete"))
+        retained = self.storage.list_workflow_messages(collection["id"])
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0]["message_text"], legacy_text)
+        self.assertEqual(retained[0]["analysis_state"], "ignored")
+        self.assertEqual(self.storage.count_pending_workflow_messages(collection["id"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

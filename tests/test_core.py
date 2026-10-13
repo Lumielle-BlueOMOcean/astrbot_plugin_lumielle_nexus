@@ -1444,7 +1444,7 @@ class QQAdapterTests(unittest.IsolatedAsyncioTestCase):
         class Client:
             async def call_action(self, action, **kwargs):
                 calls.append((action, kwargs))
-                return {"data": {"messages": [{"message_id": 1}, "ignored"]}}
+                return {"data": {"messages": [{"message_id": 1}]}}
 
         platform = SimpleNamespace(
             meta=lambda: SimpleNamespace(name="aiocqhttp", id="qq-main"),
@@ -1455,6 +1455,21 @@ class QQAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [("get_group_msg_history", {
             "group_id": 123, "message_seq": 77, "count": 40,
         })])
+
+    async def test_group_history_adapter_rejects_malformed_entries(self):
+        from qq_adapter import QQAdapter, QQAdapterError
+
+        class Client:
+            async def call_action(self, action, **kwargs):
+                return {"data": {"messages": [{"message_id": 1}, "malformed"]}}
+
+        platform = SimpleNamespace(
+            meta=lambda: SimpleNamespace(name="aiocqhttp", id="qq-main"),
+            get_client=lambda: Client(),
+        )
+        adapter = QQAdapter(SimpleNamespace(get_platform_inst=lambda _id: platform), "qq-main")
+        with self.assertRaisesRegex(QQAdapterError, "群历史格式不可识别"):
+            await adapter.get_group_msg_history("123")
 
     async def test_adapter_routes_required_onebot_actions(self):
         from qq_adapter import QQAdapter

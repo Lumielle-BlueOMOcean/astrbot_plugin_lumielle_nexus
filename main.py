@@ -1814,11 +1814,10 @@ class LumielleNexus(Star):
                     payload.get("required_when"),
                 )
             )
-            if payload.get("ai_extraction"):
+            if payload.get("ai_extraction") and not payload.get("announcement"):
                 notice += (
-                    "\n\n也可以直接用自然语言描述自己的情况；"
-                    "checkpoint 会批量分析新增消息。\n"
-                    "例如：我还没回学校，预计明天下午到，因为车票改签。"
+                    "\n\n也可以使用自然语言描述情况，系统将在后续统计时尝试识别；"
+                    "按上述格式填写更便于准确记录。"
                 )
             if payload.get("chase_at"):
                 notice += f"\n计划催办时间：{format_local_time(payload['chase_at'], self.manager.timezone_name, 'minutes')}。"
@@ -2300,10 +2299,11 @@ class LumielleNexus(Star):
             return {"snapshot": snapshot, "llm_called": False, "applied": [], "rejected": [],
                     "analysis_incomplete": False, "analysis_error": None}
         if not snapshot["payload"].get("ai_extraction"):
-            error = "发现自然语言群消息，但该 Collection 未开启批量自然语言分析；证据仍保留待复核。"
-            await self.manager.advance_collection_checkpoint(task_id, snapshot, analysis_error=error)
+            # Deterministic-only collections retain unmatched text as audit evidence,
+            # but it is not an unresolved submission and must not block finalization.
+            await self.manager.advance_collection_checkpoint(task_id, snapshot)
             return {"snapshot": snapshot, "llm_called": False, "applied": [], "rejected": [],
-                    "analysis_incomplete": True, "analysis_error": error}
+                    "analysis_incomplete": False, "analysis_error": None}
         try:
             candidate = await self._generate_collection_checkpoint_candidate(snapshot)
         except Exception as exc:
@@ -2484,12 +2484,8 @@ class LumielleNexus(Star):
                 pending_ids=self.storage.pending_workflow_sender_ids(collection["id"]),
                 required_when=collection_payload.get("required_when"),
             )
-        archive_status = await self.manager.archive_status(
-            collection["group_alias"], task["platform_id"],
-        )
         if (
-            archive_status.get("enabled")
-            and history.get("coverage_status") != "FULL"
+            history.get("coverage_status") != "FULL"
             and (stats is None or stats["missing_ids"])
         ):
             error = "群历史 reconciliation coverage 不完整，存在可能漏掉的回复；Collection 保持 PROCESSING。"
@@ -2713,10 +2709,7 @@ class LumielleNexus(Star):
                 history,
             )
             return
-        archive_status = await self.manager.archive_status(
-            collection["group_alias"], task["platform_id"],
-        )
-        if archive_status.get("enabled") and history.get("coverage_status") != "FULL":
+        if history.get("coverage_status") != "FULL":
             await self.manager.record_collection_diagnostics(
                 collection["id"], history=history,
                 analysis_error="群历史 coverage 不完整，已抑制催办以避免将有证据成员误判为未回复。",

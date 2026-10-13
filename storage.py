@@ -1578,6 +1578,27 @@ class Storage:
             ).fetchall()
         return self._rows(rows)
 
+    def ignore_pending_workflow_messages(
+        self, task_id: str, cutoff: str, updated_at: str,
+    ) -> int:
+        """Mark unmatched evidence in deterministic-only Collections as terminal, retaining text."""
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE workflow_messages
+                SET analysis_state = 'ignored',
+                    deterministic_handled = 1,
+                    analysis_attempts = analysis_attempts + 1,
+                    last_analysis_error = NULL,
+                    analyzed_at = ?
+                WHERE task_id = ? AND sent_at <= ?
+                  AND analysis_state IN ('pending', 'error')
+                """,
+                (str(updated_at), str(task_id), str(cutoff)),
+            )
+            self._conn.commit()
+        return int(cursor.rowcount)
+
     def list_provisional_no_data_messages(
         self,
         task_id: str,

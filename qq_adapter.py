@@ -92,9 +92,11 @@ class QQAdapter:
                 result = result["data"]
         if isinstance(result, dict):
             result = result.get("messages")
-        if not isinstance(result, list):
+        if not isinstance(result, list) or any(
+            not isinstance(message, dict) for message in result
+        ):
             raise QQAdapterError("OneBot 返回的群历史格式不可识别")
-        return [message for message in result if isinstance(message, dict)]
+        return result
 
     async def get_group_member_info(
         self, group_id: str, user_id: str,

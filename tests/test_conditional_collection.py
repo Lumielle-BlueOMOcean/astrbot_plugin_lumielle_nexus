@@ -59,6 +59,64 @@ class ConditionalCollectionTests(unittest.IsolatedAsyncioTestCase):
             now=self.now, field_value_mappings=MAPPINGS, **kwargs,
         )
 
+    async def _start_collection_notice(
+        self,
+        *,
+        title,
+        fields,
+        announcement="",
+        ai_extraction=False,
+        field_value_mappings=None,
+        required_when=None,
+    ):
+        main_module = _load_main_module()
+
+        class Event:
+            unified_msg_origin = "aiocqhttp:FriendMessage:operator"
+
+            def is_private_chat(self):
+                return True
+
+            def is_admin(self):
+                return True
+
+            def get_platform_name(self):
+                return "aiocqhttp"
+
+            def get_platform_id(self):
+                return "qq-main"
+
+            def get_sender_id(self):
+                return "operator"
+
+        class FakeAdapter:
+            def __init__(self):
+                self.messages = []
+
+            async def send_group_text(self, group_id, text):
+                self.messages.append((group_id, text))
+
+        class FakeContext:
+            async def get_current_chat_provider_id(self, _origin):
+                return "provider-42"
+
+        adapter = FakeAdapter()
+        plugin = main_module.LumielleNexus.__new__(main_module.LumielleNexus)
+        plugin.manager = self.manager
+        plugin.storage = self.storage
+        plugin.operator_ids = set()
+        plugin.context = FakeContext()
+        plugin._adapter = lambda _event: adapter
+        result = await plugin._start_collection(
+            Event(), "班群", title, fields, announcement, False,
+            ai_extraction=ai_extraction,
+            field_value_mappings=field_value_mappings,
+            required_when=required_when,
+        )
+        task_id = result.split("：", 1)[1].split("（", 1)[0]
+        task = await self.manager.get_task(task_id, "qq-main")
+        return result, adapter.messages[0][1], json.loads(task["payload"])
+
     def test_conditional_completion_helper_uses_canonical_values(self):
         required_fields = getattr(core_module, "collection_required_fields", None)
         completion = getattr(core_module, "collection_entry_completion", None)
@@ -467,6 +525,69 @@ class ConditionalCollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("2 = 未返校", notice)
         self.assertIn("返校时间：", notice)
         self.assertIn("原因：", notice)
+        self.assertLessEqual(len(notice), 1200)
+
+    async def test_default_collection_announcement_matches_its_declared_task(self):
+        result, notice, _payload = await self._start_collection_notice(
+            title="活动参与统计",
+            fields=["是否参加"],
+        )
+
+        self.assertIn("已开始收集", result)
+        self.assertIn("【活动参与统计】", notice)
+        self.assertIn("是否参加：", notice)
+        self.assertNotIn("车票", notice)
+        self.assertNotIn("返校", notice)
+        self.assertLessEqual(len(notice), 1200)
+
+    async def test_ai_collection_announcement_uses_neutral_natural_language_hint(self):
+        result, notice, payload = await self._start_collection_notice(
+            title="活动参与统计",
+            fields=["是否参加"],
+            ai_extraction=True,
+        )
+
+        self.assertIn("已开始收集", result)
+        self.assertIn("自然语言描述情况", notice)
+        self.assertIn("按上述格式填写更便于准确记录", notice)
+        self.assertNotIn("车票", notice)
+        self.assertNotIn("返校", notice)
+        self.assertNotIn("checkpoint", notice.casefold())
+        self.assertNotIn("workflow", notice.casefold())
+        self.assertEqual(payload["ai_provider_id"], "provider-42")
+        self.assertLessEqual(len(notice), 1200)
+
+    async def test_custom_collection_announcement_is_not_extended_for_ai(self):
+        custom = "请直接回复是否参加本次活动。"
+        result, notice, payload = await self._start_collection_notice(
+            title="活动参与统计",
+            fields=["是否参加"],
+            announcement=custom,
+            ai_extraction=True,
+        )
+
+        self.assertIn("已开始收集", result)
+        self.assertEqual(notice, custom)
+        self.assertEqual(payload["announcement"], custom)
+        self.assertEqual(payload["ai_provider_id"], "provider-42")
+
+    async def test_ai_announcement_preserves_conditional_submission_guide(self):
+        result, notice, _payload = await self._start_collection_notice(
+            title="返校统计",
+            fields=FIELDS,
+            ai_extraction=True,
+            field_value_mappings=MAPPINGS,
+            required_when=REQUIRED_WHEN,
+        )
+
+        self.assertIn("已开始收集", result)
+        self.assertIn("1 = 已返校", notice)
+        self.assertIn("2 = 未返校", notice)
+        self.assertIn("如果「返校情况」为「未返校」", notice)
+        self.assertIn("返校时间：", notice)
+        self.assertIn("原因：", notice)
+        self.assertNotIn("车票改签", notice)
+        self.assertNotIn("checkpoint", notice.casefold())
         self.assertLessEqual(len(notice), 1200)
 
     def test_export_missing_sheet_omits_conditionally_complete_member(self):
